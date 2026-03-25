@@ -40,6 +40,7 @@ from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
+from verl.trainer.distillation.losses import is_distillation_enabled
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
@@ -50,7 +51,14 @@ from verl.trainer.ppo.metric_utils import (
     process_validation_metrics,
 )
 from verl.trainer.ppo.reward import extract_reward
-from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
+from verl.trainer.ppo.utils import (
+    Role,
+    WorkerType,
+    need_critic,
+    need_reference_policy,
+    need_reward_model,
+    need_teacher_policy,
+)
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
@@ -62,7 +70,7 @@ from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
-from verl.workers.config import FSDPEngineConfig
+from verl.workers.config import DistillationConfig, FSDPEngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
 
@@ -199,6 +207,10 @@ def compute_advantage(
             adv_kwargs["index"] = data.non_tensor_batch["uid"]
         if "reward_baselines" in data.batch:  # optional
             adv_kwargs["reward_baselines"] = data.batch["reward_baselines"]
+        # GDPO: pass raw data for per-dimension reward extraction
+        if adv_estimator in (AdvantageEstimator.GDPO, "gdpo"):
+            adv_kwargs["non_tensor_batch"] = data.non_tensor_batch
+            adv_kwargs["batch"] = data.batch
         # Add sum_pi_squared for Optimal Token Baseline
         if adv_estimator in (AdvantageEstimator.OPTIMAL_TOKEN_BASELINE, AdvantageEstimator.TIR_OPTIMAL_TOKEN_BASELINE):
             # Check if sum_pi_squared is available
@@ -207,6 +219,8 @@ def compute_advantage(
                 "Please set actor.calculate_sum_pi_squared=True in config."
             )
             adv_kwargs["sum_pi_squared"] = data.batch["sum_pi_squared"]
+            # old_log_probs needed for path-variance proxy: w_t = 1 - 2*exp(old_log_probs) + sum_pi_squared
+            adv_kwargs["old_log_probs"] = data.batch["old_log_probs"]
             # Get pre-computed rollout IS weights if available
             rollout_is_weights = data.batch.get("rollout_is_weights", None)
             adv_kwargs["rollout_is_weights"] = rollout_is_weights
@@ -276,6 +290,7 @@ class RayPPOTrainer:
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
         self.use_reference_policy = need_reference_policy(self.config)
+        self.use_teacher_policy = need_teacher_policy(self.config)
 
         self.use_rm = need_reward_model(self.config)
 
@@ -689,6 +704,7 @@ class RayPPOTrainer:
             actor_rollout_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[actor_role],
                 config=self.config.actor_rollout_ref,
+                distillation_config=self.config.get("distillation"),
                 role=str(actor_role),
             )
             self.resource_pool_to_cls[actor_rollout_resource_pool][str(actor_role)] = actor_rollout_cls
@@ -816,6 +832,20 @@ class RayPPOTrainer:
         # Note: mode is always "async" since sync mode is deprecated
         self.async_rollout_mode = True
 
+        # initialize teacher loop manager
+        if self.use_teacher_policy:
+            from verl.experimental.teacher_loop import TeacherModelManager
+
+            teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
+            self.teacher_model_manager = TeacherModelManager(
+                config=self.config.distillation,
+                resource_pool=teacher_resource_pool,
+            )
+            self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
+        else:
+            self.teacher_model_manager = None
+            self.distillation_config = None
+
         # Support custom AgentLoopManager via config
         manager_class_fqn = self.config.actor_rollout_ref.rollout.get("agent", {}).get("agent_loop_manager_class")
         if manager_class_fqn:
@@ -830,14 +860,16 @@ class RayPPOTrainer:
 
         # if enable_agent_reward_loop, we directly pass reward_loop_workers to agent loop manager
         # to stream reward computation with actor rollout
+        # To stream teacher computation with actor rollout, we instead pass the full manager so that the
+        # teacher loop workers can sleep/wake together with rollout workers
         reward_loop_worker_handles = self.reward_loop_manager.reward_loop_workers if enable_agent_reward_loop else None
         self.async_rollout_manager = AgentLoopManager.create(
             config=self.config,
             worker_group=self.actor_rollout_wg,
             rollout_resource_pool=actor_rollout_resource_pool,
             reward_loop_worker_handles=reward_loop_worker_handles,
+            teacher_model_manager=self.teacher_model_manager,
         )
-
         checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
         self.checkpoint_manager = CheckpointEngineManager(
             config=checkpoint_engine_config,
@@ -969,8 +1001,18 @@ class RayPPOTrainer:
         # TODO: from remote not implemented yet
         dataloader_local_path = os.path.join(global_step_folder, "data.pt")
         if os.path.exists(dataloader_local_path):
-            dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
-            self.train_dataloader.load_state_dict(dataloader_state_dict)
+            steps_per_epoch = len(self.train_dataloader)
+            at_epoch_boundary = steps_per_epoch > 0 and self.global_steps % steps_per_epoch == 0
+            if at_epoch_boundary:
+                print(
+                    f"Skipping dataloader state restore: global_steps={self.global_steps} "
+                    f"is at an epoch boundary (steps_per_epoch={steps_per_epoch}). "
+                    f"The saved state marks the dataloader as exhausted. "
+                    f"Next epoch will iterate from scratch."
+                )
+            else:
+                dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
+                self.train_dataloader.load_state_dict(dataloader_state_dict)
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
@@ -1139,12 +1181,19 @@ class RayPPOTrainer:
             # gather output
             entropy = tu.get(output, "entropy")
             log_probs = tu.get(output, "log_probs")
+            routed_experts = tu.get(output, "routed_experts")
+
             old_log_prob_mfu = tu.get(output, "metrics")["mfu"]
             # step 4. No padding to padding
             entropy = no_padding_2_padding(entropy, batch_td)
             log_probs = no_padding_2_padding(log_probs, batch_td)
             # step 5: rebuild a tensordict and convert to dataproto
-            old_log_prob = tu.get_tensordict({"old_log_probs": log_probs.float(), "entropys": entropy.float()})
+            if routed_experts is not None:
+                old_log_prob = tu.get_tensordict(
+                    {"old_log_probs": log_probs.float(), "entropys": entropy.float(), "routed_experts": routed_experts}
+                )
+            else:
+                old_log_prob = tu.get_tensordict({"old_log_probs": log_probs.float(), "entropys": entropy.float()})
             old_log_prob = DataProto.from_tensordict(old_log_prob)
         else:
             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
@@ -1162,6 +1211,11 @@ class RayPPOTrainer:
             # step 2: convert from padding to no-padding
             batch_td = left_right_2_no_padding(batch_td)
             calculate_entropy = self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
+            distillation_use_topk = (
+                self.distillation_config.distillation_loss.loss_settings.use_topk
+                if is_distillation_enabled(self.config.get("distillation"))
+                else False
+            )
             ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
             ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
             ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
@@ -1170,13 +1224,14 @@ class RayPPOTrainer:
             tu.assign_non_tensor(
                 batch_td,
                 calculate_entropy=calculate_entropy,
+                distillation_use_topk=distillation_use_topk,
                 global_batch_size=ppo_mini_batch_size,
                 mini_batch_size=ppo_mini_batch_size,
                 epochs=ppo_epochs,
                 seed=seed,
                 dataloader_kwargs={"shuffle": shuffle},
+                compute_loss=True,
             )
-
             actor_output = self.actor_rollout_wg.update_actor(batch_td)
             actor_output = tu.get(actor_output, "metrics")
             actor_output = rename_dict(actor_output, "actor/")
@@ -1409,13 +1464,13 @@ class RayPPOTrainer:
                             metrics.update(old_log_prob_metrics)
                             old_log_prob.batch.pop("entropys")
                             if "routed_experts" in batch.batch and "routed_experts" in old_log_prob.batch:
-                                router_mode = getattr(
-                                    self.config.actor_rollout_ref.actor.router_replay, "mode", "disabled"
+                                raise ValueError(
+                                    "Detected conflicting router replay configuration: "
+                                    "router_replay.mode='R2' and enable_rollout_routing_replay=True "
+                                    "cannot be enabled simultaneously. "
+                                    "The enable_rollout_routing_replay option is only used in R3 mode; "
+                                    "it should not be set when using R2 mode."
                                 )
-                                if router_mode == "R2":
-                                    batch.batch.pop("routed_experts")
-                                else:
-                                    old_log_prob.batch.pop("routed_experts")
                             batch = batch.union(old_log_prob)
                             if "rollout_log_probs" in batch.batch.keys():
                                 # TODO: we may want to add diff of probs too.
@@ -1567,6 +1622,16 @@ class RayPPOTrainer:
                 )
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                # GDPO per-component reward metrics
+                gdpo_reward_keys = self.config.algorithm.get("gdpo_reward_keys", None)
+                if gdpo_reward_keys and self.config.algorithm.adv_estimator in ("gdpo", AdvantageEstimator.GDPO):
+                    for key in gdpo_reward_keys:
+                        if key in batch.non_tensor_batch:
+                            vals = np.asarray(batch.non_tensor_batch[key], dtype=np.float32)
+                            metrics[f"gdpo/{key}/mean"] = float(np.mean(vals))
+                            metrics[f"gdpo/{key}/std"] = float(np.std(vals))
+                            metrics[f"gdpo/{key}/max"] = float(np.max(vals))
+                            metrics[f"gdpo/{key}/min"] = float(np.min(vals))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
