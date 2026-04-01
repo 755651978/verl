@@ -18,8 +18,6 @@ from torch.nn import functional as F
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import StateDictType, ShardedStateDictConfig
 
-from .model.eagle3.llama_eagle3 import LlamaForCausalLMEagle3
-from .model.eagle3.qwen_eagle3 import QwenEagle
 from verl.utils.data_buffer import DataBuffer
 from verl.utils.fsdp_utils import (
     get_device_id,
@@ -33,32 +31,27 @@ from verl.utils.torch_functional import (
     get_constant_schedule_with_warmup,
     get_cosine_schedule_with_warmup,
 )
-from verl.utils.ulysses import ulysses_pad_and_slice_inputs
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
-class EagleBackgroundTrainer:
+class DrafterBaseTrainer:
     def __init__(
         self,
         config,
-        model_config,
-        actor_module_fsdp,
         world_size: int,
         rollout_dp_rank: int,
-        **kwargs
+        backend
     ):
-        self.model_config = model_config
         self.config = config
-        self.actor_module_fsdp = actor_module_fsdp
         self.world_size = world_size
         self.rollout_dp_rank = rollout_dp_rank
+        self.backend = backend
+        self.rank = dist.get_rank() if dist.is_initialized() else 0
 
         self.training_device_mesh = self._setup_device_mesh()
-        self.model, self.optimizer, self.lr_scheduler, self.train_config = self.build_draft_model()
-
-        self.rank = kwargs.get("rank", dist.get_rank() if dist.is_initialized() else 0)
+        
         self.device_id = get_device_id()
         self.copy_stream = torch.cuda.Stream()
 
@@ -77,24 +70,28 @@ class EagleBackgroundTrainer:
         # Only store hidden states in buffer if we're collecting them during generation
         collect_hidden_states_from_sgl = bool(self.config.actor_rollout_ref.drafter.train.get("collect_hidden_states_from_sgl", False))
 
-        # todo DataBuffer define
+        #DataBuffer define
         self.data_buffer = DataBuffer(max_size=buffer_max_size, store_hidden_states=collect_hidden_states_from_sgl)
 
         self.criterion = SmoothL1Loss(reduction="none")
 
-        self.eagle_model_path = self.config.actor_rollout_ref.drafter.eagle.get("spec_model_path")
-        self.checkpoint_dir = self.config.actor_rollout_ref.drafter.train.get("checkpoint_path")
         self._last_ckpt_step = -1
         # New: optional per-step barrier (default False to avoid stalls)
         self.enable_mesh_barrier = bool(self.config.actor_rollout_ref.drafter.train.get("enable_step_barrier", False))
 
         # Track the last pending async checkpoint save future
         self._pending_checkpoint_future = None
+        self.model = None
+        self.oprimizer = None
+        self.lr_scheduler = None
+        self.drafter_train_config = None
         self._frozen_param_names = {"model.embed_tokens.weight", "lm_head.weight"}
 
         # Ulysses Sequence Parallelism configuration
         self.ulysses_sequence_parallel_size = self.config.actor_rollout_ref.actor.get("ulysses_sequence_parallel_size", 1)
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
+
+        self.checkpoint_dir = self.config.actor_rollout_ref.drafter.train.get("checkpoint_path")
 
     def _setup_device_mesh(self):
         infer_tp = self.config.actor_rollout_ref.rollout.tensor_model_parallel_size
@@ -106,113 +103,41 @@ class EagleBackgroundTrainer:
 
     def build_draft_model(self):
         """build draft model"""
-        logger.info(f"[Rank {self.rollout_dp_rank}] Building Eagle drafter model...")
+        logger.info(f"[Rank {self.rollout_dp_rank}] Building drafter model...")
+        # A. 实例化模型（委托给backend）
+        raw_model = self.backend.build_model()
+        raw_model.cuda()
 
-        # 1、配置准备
-        rollout_cfg = self.config.actor_rollout_ref
-        if not (hasattr(rollout_cfg, "drafter") and hasattr(rollout_cfg.drafter, "eagle")):
-            raise ValueError("Speculative eagle config is missing")
-        
-        spec_model_path = rollout_cfg.drafter.eagle.spec_model_path
+        # B. 获取全量状态用于 FSDP 初始化
+        full_state = raw_model.state_dict()
 
-        # 复制主模型配置并修改为单层 Eagle 结构
-        config = deepcopy(self.model_config)
-        config.num_hidden_layers = 1
-        config.torch_dtype = torch.bfloat16
-        config.tie_word_embeddings = False
-        model_type = getattr(config, "model_type", "llama")
-
-        # 2、实例化模型
-        if model_type.lower() == "llama":
-            model_class = LlamaForCausalLMEagle3
-        elif model_type.lower() == "qwen2" or model_type.lower() == "qwen3":
-            model_class = QwenEagle
-        else:
-            raise ValueError(f"Unsupported model type for eagle: {model_type}")
-        
-        drafter_module = model_class(config=config).cuda()
-
-        # 3、权重加载与处理
-        if spec_model_path and os.path.exists(spec_model_path):
-            logger.info(f"Loading eagle model from checkpoint: {spec_model_path}")
-            state = self._load_checkpoint_files(spec_model_path)
-
-            # 兼容性更名
-            model_dict = drafter_module.state_dict()
-            matched_checkpoint = {}
-
-            for key, value in state.items():
-                # 处理 key 的命名空间兼容性
-                new_key = key if (key.startswith("model.") or key.startswith("lm_head")) else f"model.{key}"
-
-                if new_key in model_dict:
-                    # 【核心修复】：检查 Checkpoint 里的权重维度和当前模型是否一致
-                    if value.shape == model_dict[new_key].shape:
-                        matched_checkpoint[new_key] = value
-                    else:
-                        # 如果维度不一致（比如 32000 vs 128256），跳过这个 key，不让它报 RuntimeError
-                        logger.warning(
-                            f"Dimension mismatch for {new_key}: Checkpoint {value.shape} vs Model {model_dict[new_key].shape}. "
-                            f"Skipping this weight (it will be randomly initialized)."
-                        )
-                else:
-                    logger.debug(f"Key {new_key} not found in model_class, skipping.")
-
-            # 使用 strict=False，允许跳过刚才那些维度不匹配的词表权重
-            drafter_module.load_state_dict(matched_checkpoint, strict=False)
-            del state, matched_checkpoint
-        else:
-            logger.info("Initialized eagle model from scratch")
-
-        # 4、复用主模型的Embedding和LM_Head
-        base_module = self.actor_module_fsdp.unshard()
-        if hasattr(base_module, "lm_head"):
-            drafter_module.lm_head = base_module.lm_head
-            for param in drafter_module.lm_head.parameters():
-                param.requires_grad = False
-            logger.info("Successfully load lm_head for drafter model")
-
-        if hasattr(base_module, "model") and hasattr(base_module.model, "embed_tokens"):
-            drafter_module.embed_tokens = base_module.model.embed_tokens
-            for param in drafter_module.embed_tokens.parameters():
-                param.requires_grad = False
-            logger.info("Successfully load embed_tokens for drafter model")
-            
-        # 释放对著模型 unshared 状态的引用
-        del base_module   
-
-        # 5、Apply FSDP2
+        # C. FSDP包装
         fsdp_config = self.config.actor_rollout_ref.actor.fsdp_config
         mp_policy = MixedPrecisionPolicy(
             param_dtype=torch.bfloat16, reduce_dtype=torch.float32, cast_forward_inputs=True
         )
+
         fsdp_kwargs = {
             "mesh": self.training_device_mesh,
             "mp_policy": mp_policy,
             "offload_policy": None,
         }
         logger.info("Inside building drafter model (Before FSDP2)")
-        full_state = drafter_module.state_dict()
-        apply_fsdp2(drafter_module, fsdp_kwargs, fsdp_config)
+        
+        apply_fsdp2(raw_model, fsdp_kwargs, fsdp_config)
+
         # Load full state dict using the same mesh as used by drafter FSDP wrapping
-        fsdp2_load_full_state_dict(drafter_module, full_state, self.training_device_mesh, None)
+        fsdp2_load_full_state_dict(raw_model, full_state, self.training_device_mesh, None)
+        self.model = raw_model
         del full_state
 
-        # 6、构建训练配置、优化器和调度器
-        drafter_train_config = self._prepare_training_config(rollout_cfg)
+        # D. 构建优化器和调度器
+        drafter_train_config = self._prepare_training_config(self.config.actor_rollout_ref)
 
-        drafter_optimizer = optim.AdamW(
-            [p for p in drafter_module.parameters() if p.requires_grad],
-            lr=drafter_train_config.optim.lr,
-            betas=(0.9, 0.95),
-            weight_decay=drafter_train_config.optim.get("weight_decay", 1e-2),
-        )
-
-        drafter_lr_scheduler = self._setup_scheduler(drafter_optimizer, drafter_train_config)
-
-        logger.info("After building drafter model")
-        return drafter_module, drafter_optimizer, drafter_lr_scheduler, drafter_train_config
-
+        self.oprimizer = self.backend.setup_optimizer(self.model, drafter_train_config)
+        self.lr_scheduler = self.backend.setup_scheduler(self.oprimizer, drafter_train_config)
+        self.drafter_train_config = drafter_train_config
+        
     def _prepare_training_config(self, rollout_config):
         """
         Prepare the training configuration for drafter module.
@@ -241,57 +166,6 @@ class EagleBackgroundTrainer:
             )
 
         return drafter_train_config
-
-    def _load_checkpoint_files(self, path):
-        """内部工具：支持 safetensors 和 bin 格式"""
-        allow_patterns = ["*.safetensors", "*.bin", "*.pt"]
-        hf_weights_files = []
-        for pattern in allow_patterns:
-            files = glob.glob(os.path.join(path, pattern))
-            if files:
-                hf_weights_files = files
-                use_safetensors = (pattern == "*.safetensors")
-                break
-
-        state = {}
-        if use_safetensors:
-            # Load from safetensors files
-            for file in hf_weights_files:
-                with safetensors.safe_open(file, framework="pt", device="cpu") as f:
-                    for name in f.keys():
-                        state[name] = f.get_tensor(name)
-        else:
-            # Load from bin/pt files
-            for file in hf_weights_files:
-                file_state = torch.load(file, map_location="cpu", weights_only=True)
-                state.update(file_state)
-        return state
-
-    def _setup_scheduler(self, optimizer, train_cfg):
-        total_steps = train_cfg.optim.get("total_training_steps", 0)
-        num_warmup_steps = int(train_cfg.optim.get("lr_warmup_steps", 1000))
-        warmup_style = train_cfg.optim.get("warmup_style", "constant")
-
-        if warmup_style == "constant":
-            return get_constant_schedule_with_warmup(
-                optimizer=optimizer, num_warmup_steps=num_warmup_steps
-            )
-        elif warmup_style == "cosine":
-            return get_cosine_schedule_with_warmup(
-                optimizer=optimizer,
-                num_warmup_steps=num_warmup_steps,
-                num_training_steps=total_steps,
-                min_lr_ratio=train_cfg.optim.get("min_lr_ratio", 0.0),
-                num_cycles=train_cfg.optim.get("num_cycles", 0.5),
-            )
-        # elif warmup_style == "linear":
-        #     return get_linear_schedule_with_warmup(
-        #         optimizer=optimizer,
-        #         num_warmup_steps=num_warmup_steps,
-        #         num_training_steps=total_steps,
-        #     )
-        else:
-            raise NotImplementedError(f"Warmup style {warmup_style} is not supported")
 
     
     def _get_trainable_state_dict(self) -> dict[str, torch.Tensor]:
@@ -335,34 +209,55 @@ class EagleBackgroundTrainer:
             with FSDP.state_dict_type( 
                 self.model, 
                 state_dict_type=StateDictType.SHARDED_STATE_DICT, 
-                sharded_state_dict_config=ShardedStateDictConfig(offload_to_cpu=True) 
+                state_dict_config=ShardedStateDictConfig(offload_to_cpu=True) 
             ): 
                 state_dict = { 
                     "model": self._get_trainable_state_dict(), 
                     # "optimizer": FSDP.sharded_optim_state_dict(self.model, self.optimizer) if self.optimizer else {},
                     "step": step 
                 } 
-                    
-            return dcp.async_save( 
-                state_dict=state_dict, 
-                checkpoint_id=checkpoint_path, 
-                process_group=self.training_device_mesh.get_group(), 
-            )
+
+            logger.info(f"11111111111111111:{self.training_device_mesh}")
+
+            pg = None
+            if self.training_device_mesh is not None:
+                try:
+                    pg = self.training_device_mesh.get_group()
+                except Exception:
+                    pg = None
+
+            # 单卡保底逻辑
+            if pg is None and dist.is_initialized():
+                pg = dist.group.WORLD
+            
+            save_kwargs = {
+                "state_dict": state_dict, 
+                "checkpoint_id": checkpoint_path, 
+            }
+            if pg is not None:
+                save_kwargs["process_group"] = pg
+
+
+            return dcp.save(**save_kwargs)
 
         except Exception as e:  # noqa: BLE001
             logger.warning(f"Async checkpoint save failed on rank {self.rank}: {e}")
             return None
 
     async def activate_training_model(
-        self, device_mesh: DeviceMesh, training_ranks: list[int], base_model=None
+        self, device_mesh: DeviceMesh, training_ranks: list[int], model_config=None
     ) -> bool:
         # 将模型和优化器状态从CPU加载到GPU，激活草稿模型进入训练状态
         start_ts = time.time()
         try:        
-            logger.warning(
-                f"[EagleTrainer rank {getattr(self, 'rank', -1)}] activate_training_model enter "
+            logger.info(
+                f"[Trainer rank {getattr(self, 'rank', -1)}] activate_training_model enter "
                 f"training_ranks={training_ranks}"
             )
+
+            if self.model is None:
+                logger.info("Draft Model not initialized, calling build_draft_model during activation...")
+                self.build_draft_model(model_config)
 
             # 只有当配置了 offload 或者当前模型不在 CUDA 上时执行加载
             first_param = next(self.model.parameters(), None)
@@ -481,164 +376,50 @@ class EagleBackgroundTrainer:
             )
             return None
 
-        pad_id = int(getattr(self.model_config, "pad_token_id", 0) or 0)
         dev = next(self.model.parameters()).device
-        max_window = 512
-
-        # Collect sequences to concatenate (removing padding)
-        input_ids_list, loss_mask_list, hidden_states_list = [], [], []
-        cu_seqlens = [0] # 用于后续支持变长 Flash Attention
-
-        for item in items:
-            # 利用non_blocking异步搬运，且保持在GPU上操作
-            ids = item["input_ids"].to(dev, non_blocking=True)
-            h_states = item["hidden_states"].to(dev, dtype=torch.bfloat16, non_blocking=True)
-
-            # 统一对齐 Hidden States
-            # 统一维度：[1, L, D] -> [L, D]
-            if h_states.dim() == 1:
-                h_states = h_states.unsqueeze(0)
-            elif h_states.dim() > 2:
-                h_states = h_states.view(-1, h_states.size(-1))
-            
-            # 通过统一裁剪或填充将Hidden States与sequence length对齐
-            h_len = h_states.size(0)
-            seq_len = ids.size(0)
-            if h_len < seq_len:
-                # 批量 Padding
-                padding = torch.zeros((seq_len - h_len, h_states.size(-1)), 
-                                    device=dev, dtype=h_states.dtype)
-                h_states = torch.cat([h_states, padding], dim=0)
-            else:
-                h_states = h_states[:seq_len, :]
-
-
-            # Compute loss_mask if not present (for DataBuffer items)，在GPU上向量化生成，避免CPU循环
-            if "loss_mask" not in item:
-                item_loss_mask = torch.zeros_like(ids, dtype=torch.float32)
-                if "prompts" in item and "responses" in item:
-                    prompt_len = item["prompts"].size(0)
-                    response_len = item["responses"].size(0)
-                    for j in range(response_len):
-                        if item["responses"][j] != pad_id:
-                            item_loss_mask[prompt_len + j] = 1.0
-                elif "responses" in item:
-                    response_start = full_len - item["responses"].size(0)
-                    response_mask = (item["responses"] != pad_id).float()
-                    item_loss_mask[response_start:] = response_mask
-                else:
-                    # If no response info, assume all tokens are valid
-                    item_loss_mask[:] = 1.0
-            else:
-                item_loss_mask = item["loss_mask"]
-            
-            # Select window around response tokens
-            nonzero = torch.nonzero(item_loss_mask)
-            full_len = ids.size(0)
-
-            if nonzero.numel() > 0:
-                # 获取 Response 的起止点
-                r_start, r_end = nonzero[0, 0], nonzero[-1, 0] + 1
-                # 尽量让窗口覆盖 Response 区域
-                start = torch.clamp(r_start - (max_window // 2), min=0, max=full_len - max_window).item()
-                end = min(start + max_window, full_len)
-            else:
-                start = max(0, full_len - max_window)
-                end = full_len
-
-            # Extract the window
-            actual_ids = ids[start:end]
-            actual_mask = item_loss_mask[start:end]
-            actual_h = h_states[start:end]
-
-            # 使用F.pad统一长度，避免cat产生新碎片
-            curr_len = actual_ids.size(0)
-            if actual_h.size(0) < curr_len:
-                actual_h = F.pad(actual_h, (0, 0, 0, curr_len - actual_h.size(0)))
-
-            input_ids_list.append(actual_ids)
-            loss_mask_list.append(actual_mask)
-            hidden_states_list.append(actual_h)
-            cu_seqlens.append(cu_seqlens[-1] + curr_len)
-
-        # Concatenate all sequences into a single sequence
-        input_ids_concat = torch.cat(input_ids_list, dim=0).unsqueeze(0)  # (1, total_seq_len)
-        loss_mask_concat = torch.cat(loss_mask_list, dim=0).unsqueeze(0)  # (1, total_seq_len)
-        hidden_states_concat = torch.cat(hidden_states_list, dim=0).unsqueeze(0)  # (1, total_seq_len, hidden_dim)
-
-        # Create attention mask (all 1s since no padding)
-        total_seq_len = input_ids_concat.size(1)
-        attn_mask = torch.ones((1, total_seq_len), dtype=torch.long, device=dev)
-
-        # Window Concatenation
-        # 1. 自动获取窗口大小 (e.g., 12288 / 4096 = 3)
-        base_hidden_dim = self.model_config.hidden_size
-        target_fc_in = self.model.fc.in_features
-        window_size = target_fc_in // base_hidden_dim
         
-        if window_size > 1:
-            # padding 维度: [1, window_size-1, 4096]
-            pad = torch.zeros((1, window_size - 1, base_hidden_dim), device=dev, dtype=hidden_states_concat.dtype)
-            h_extended = torch.cat([pad, hidden_states_concat], dim=1)  # [1, L + window-1, 4096]
-            
-            # 3. 构造滑动窗口拼接 (t, t-1, t-2...)
-            chunks = []
-            for i in range(window_size):
-                # i=0: 当前位置 t (从偏移后的 window-1 开始)
-                # i=1: 前一个位置 t-1
-                start_idx = (window_size - 1) - i
-                chunks.append(h_extended[:, start_idx : start_idx + total_seq_len, :])
-            
-            # 在最后一个维度 D 上拼接，得到 [1, L, 12288] 或 [1, L, 16384]
-            hidden_states_concat = torch.cat(chunks, dim=-1)
+        preprocessed_lists = self.backend.preprocess_individual_items(items, dev, self.drafter_train_config)
+       
+        # Concatenate all sequences into a single sequence
+        input_ids_concat = torch.cat(preprocessed_lists['ids'], dim=0).unsqueeze(0)  # (1, total_seq_len)
+        loss_mask_concat = torch.cat(preprocessed_lists['masks'], dim=0).unsqueeze(0)  # (1, total_seq_len)
+        hidden_states_concat = torch.cat(preprocessed_lists['h_states'], dim=0).unsqueeze(0)  # (1, total_seq_len, hidden_dim)
 
-        full_pos_ids = torch.arange(total_seq_len, device=dev).unsqueeze(0)
+        # 执行算法特有的特征转换
+        batch = self.backend.transform_to_algorithm_features(
+            input_ids_concat,
+            loss_mask_concat,
+            hidden_states_concat,
+        )
 
         # Use Ulysses SP to pad and slice if needed
         if self.use_ulysses_sp:
+            from verl.utils.ulysses import slice_input_tensor, ulysses_pad_and_slice_inputs
             # Pad to be divisible by SP size and slice across ranks
-            input_ids_concat, sharded_pos_ids, pad_size = ulysses_pad_and_slice_inputs(
-                input_ids_concat, position_ids_rmpad=None, sp_size=self.ulysses_sequence_parallel_size
+            input_ids, sharded_pos, pad_size = ulysses_pad_and_slice_inputs(
+                batch["input_ids"], None, sp_size=self.ulysses_sequence_parallel_size
             )
-            # Pad loss_mask and hidden_states to match
-            if pad_size > 0:
-                loss_mask_concat = torch.nn.functional.pad(loss_mask_concat, (0, pad_size), value=0.0)
-                hidden_states_concat = torch.nn.functional.pad(hidden_states_concat, (0, 0, 0, pad_size), value=0.0)
-                attn_mask = torch.nn.functional.pad(attn_mask, (0, pad_size), value=0)
 
-            # Slice for this rank
-            from verl.utils.ulysses import slice_input_tensor
-            loss_mask_concat = slice_input_tensor(loss_mask_concat, dim=1, padding=False)
-            hidden_states_concat = slice_input_tensor(hidden_states_concat, dim=1, padding=False)
-            attn_mask = slice_input_tensor(attn_mask, dim=1, padding=False)
+            batch["input_ids"] = input_ids
+            batch["position_ids"] = sharded_pos
+
+            # Pad loss_mask 、hidden_states and attention_mask to match
+            for key in ["hidden_states", "target", "loss_mask", "attention_mask"]:
+                if pad_size > 0:
+                    p_val = 0.0 if "mark" in key or "target" in key else 0
+                    dim = 2 if batch[key].dim() == 3 else 1
+                    batch[key] = torch.nn.functional.pad(batch[key], (0, 0, 0, pad_size) if dim==2 else (0, pad_size), value=p_val)
+                
+                # Slice for this rank
+                batch[key] = slice_input_tensor(batch[key], dim=1, padding=False)
 
             # Store pad_size for later gathering
             self._current_pad_size = pad_size
-            position_ids_concat = sharded_pos_ids
         else:
+            batch["position_ids"] = torch.arange(batch["input_ids"].size(1), device=dev).unsqueeze(0)
             self._current_pad_size = 0
-            position_ids_concat = full_pos_ids
-        
-        position_ids = position_ids_concat[:, :-1].contiguous()
 
-        # Shift for next token prediction
-        if window_size > 1:
-            target = hidden_states_concat[:, 1:, :base_hidden_dim].contiguous()
-        else:
-            target = hidden_states_concat[:, 1:].contiguous()
-        loss_mask = loss_mask_concat[:, 1:].contiguous()
-        input_ids = input_ids_concat[:, :-1].contiguous()
-        attn_mask = attn_mask[:, :-1].contiguous()
-        base_h = hidden_states_concat[:, :-1].contiguous()
-
-        return {
-            "input_ids": input_ids,
-            "position_ids": position_ids,
-            "attention_mask": attn_mask,
-            "hidden_states": base_h,
-            "target": target,
-            "loss_mask": loss_mask,
-        }
+        return batch
     
     async def training_step(self, step: int) -> bool:
         try:
@@ -671,65 +452,39 @@ class EagleBackgroundTrainer:
             )
             return False
         
+        # 开启训练模式
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
 
         # 前向传播
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            outputs = self.model(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                hidden_states=batch["hidden_states"],
-                position_ids=batch["position_ids"],
-                output_hidden_states=True,
-            )
+            loss_dict = self.backend.compute_loss(self.model, batch, self._current_pad_size)
 
-            hidden_states = outputs["hidden_states"]
-            logits = outputs["logits"]
-
-            # 局部损失计算，不再对大张量进行 gather，直接在当前 Rank 计算局部 Loss
-            target = batch["target"]
-            loss_mask = batch["loss_mask"]
-
-            # V-Loss：隐藏态回归损失
-            vloss_all = self.criterion(hidden_states, target)  # [B,T,H]
-            vloss_per_token = vloss_all.mean(dim=-1) # [B, T]
-
-            # P-Loss: 概率分布对齐损失
-            with torch.no_grad():
-                target_p = F.softmax(self.model.lm_head(target), dim=1)
-
-            log_prod = F.log_softmax(logits,  dim=-1)
-            ploss_per_token = -(target_p * log_prod).sum(dim=-1) # [B, T]
-
-            # 结合 Mask
-            valid_mask = loss_mask > 0
-            total_local_vloss = (vloss_per_token * loss_mask).sum()
-            total_local_ploss = (ploss_per_token * loss_mask).sum()
-            local_num_tokens = loss_mask.sum()
+            l_v = loss_dict["total_local_vloss"]
+            l_p = loss_dict["total_local_ploss"]
+            l_n = loss_dict["local_num_tokens"]
 
         # 分布式同步（Global Reduction）,如果使用序列并行，仅在这里进行一次标量同步
         if self.training_device_mesh is not None and self.training_device_mesh.size() > 1:
-            metrics = torch.stack([total_local_vloss, total_local_ploss, local_num_tokens])
+            metrics = torch.stack([l_v, l_p, l_n])
             dist.all_reduce(metrics, group=self.training_device_mesh.get_group())
             global_vloss, global_ploss, global_tokens = metrics[0], metrics[1], metrics[2]
         else:
-            global_vloss, global_ploss, global_tokens = total_local_vloss, total_local_ploss, local_num_tokens
+            global_vloss, global_ploss, global_tokens = l_v, l_p, l_n
         
         # 最终 Loss 平滑处理
         denom = global_tokens.clamp(min=1.0)
         vloss = global_vloss / denom
         ploss = global_ploss / denom
 
-        w_v = float(self.config.get("vloss_weight", 0.5))
-        w_p = float(self.config.get("ploss_weight", 0.5))
-        loss = w_v * vloss + w_p * ploss
+        # 使用 backend 传回的权重合成最终 Loss
+        loss = loss_dict["v_weight"] * vloss + loss_dict["p_weight"] * ploss
 
         # 反向传播
         loss.backward()
 
+        # 更新权重
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-
         self.optimizer.step()
         if self.lr_scheduler is not None:
             self.lr_scheduler.step()

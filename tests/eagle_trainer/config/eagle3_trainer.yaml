@@ -74,7 +74,7 @@ actor_rollout_ref:
     enforce_eager: true
     cudagraph_capture_sizes: null
     free_cache_engine: true
-    tensor_model_parallel_size: 2
+    tensor_model_parallel_size: 1
     max_num_batched_tokens: 8192
     max_model_len: null
     max_num_seqs: 1024
@@ -165,7 +165,7 @@ actor_rollout_ref:
       batch_size_per_gpu: 2
       max_seq_len: 8192
       max_epochs: 10
-      checkpoint_path: null
+      checkpoint_path: /nas/disk6/ls/test_spec
       min_workers_for_training: 1
       collect_hidden_states_from_sgl: True 
       optim:

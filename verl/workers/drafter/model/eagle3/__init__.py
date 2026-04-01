@@ -1,5 +1,3 @@
-from .base import Eagle3DraftModel
-from .llama_eagle3 import LlamaForCausalLMEagle3
-from .qwen_eagle3 import QwenEagle
+from .eagle import LlamaForCausalLMEagle3
 
-__all__ = ["Eagle3DraftModel", "LlamaForCausalLMEagle3", "QwenEagle"]
+__all__ = ["LlamaForCausalLMEagle3"]
