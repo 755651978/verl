@@ -201,7 +201,7 @@ class ServerAdapter(BaseRollout):
             else:
                 tags = ["kv_cache", "weights"]
             await self._engine.release_memory_occupation(tags=tags)
-
+    # todo: add update_weights for sglang + drafter to prevent oom
     async def update_weights(
         self, weights: Generator[tuple[str, torch.Tensor], None, None], global_steps: int = None, **kwargs
     ):
