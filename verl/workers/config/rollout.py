@@ -34,6 +34,9 @@ __all__ = [
     "DiffusionRolloutConfig",
     "CheckpointEngineConfig",
     "SkipConfig",
+    "DrafterConfig",
+    "DrafterRolloutConfig",
+    "DrafterTrainingConfig",
 ]
 
 
@@ -68,6 +71,48 @@ class DiffusionSamplingConfig(SamplingConfig):
     noise_level: float = 0.0
     num_inference_steps: int = 40
     seed: int = 42
+
+
+@dataclass
+class DraftRolloutConfig(BaseConfig):
+    spec_steps: int = 3
+    spec_topk: int = 1
+    spec_verify_tokens: int = 3
+
+
+@dataclass
+class DraftTrainingConfig(BaseConfig):
+    collect_hidden_states_from_sgl: bool = False
+    use_data_buffer: bool = False
+    collect_interval_steps: int = 1
+    max_seq_len: int = 8192
+    max_epoch: int = 10
+    step: int = 100
+    training_interval_steps: int = 8
+    sample_last_n_steps: int = 8
+    buffer_capacity_steps: int = 128
+    train_batchs_per_cycle: int = 4
+    lr: float = 1e-6
+    lr_warmup_steps: int =1000
+    min_lr_ratio: int = None
+    warmup_style: str = "constant"
+
+
+@dataclass
+class DraftConfig(BaseConfig):
+
+    enable: bool = False
+    enable_drafter_training: bool = False
+    speculative_algorithm: str = "EAGLE"
+
+    model_path: str ="/path/to/drafter/model"
+    checkpoint_path: str ="/path/to/drafter/checkpoint"
+
+    # rollout configuration for drafter
+    rollout: DraftRolloutConfig = field(default_factory=DraftRolloutConfig)
+
+    # training configuration for drafter
+    training: DraftTrainingConfig = field(default_factory=DraftTrainingConfig)
 
 
 @dataclass

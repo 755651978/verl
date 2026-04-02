@@ -1567,6 +1567,9 @@ class RayPPOTrainer:
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self._update_actor(batch)
 
+                        if self.config.actor_rollout_ref.rollout.drafter.enable_drafter_training:
+                            self.self.actor_rollout_wg.update_drafter()
+
                         # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                         esi_close_to_expiration = should_save_ckpt_esi(
                             max_steps_duration=self.max_steps_duration,

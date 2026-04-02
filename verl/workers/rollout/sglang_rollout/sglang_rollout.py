@@ -261,6 +261,21 @@ class ServerAdapter(BaseRollout):
                     device_mesh=self.device_mesh,
                 )
 
+        # get drafter weights from drafter manager dang update to engine
+        if (self.device_mesh["infer_tp"].get_local_rank() == 0
+                and self.config.drafter.enable
+                and self.config.drafter.enable_drafter_training):
+            # get drafter weights
+            drafter_weights = await self.server_actor.maybe_publish.remote()
+            if drafter_weights is not None:
+                async for params_batch in get_named_tensor_buckets(drafter_weights, update_weights_bucket_bytes):
+                    await sgl_update_weights(
+                        engine=self._engine,
+                        params_batch=params_batch,
+                        device_mesh_key="infer_tp",
+                        device_mesh=self.device_mesh,
+                    )
+
         if self.device_mesh["infer_tp"].get_local_rank() == 0:
             await self._engine.flush_cache()
             if global_steps is not None:
@@ -285,3 +300,6 @@ class ServerAdapter(BaseRollout):
             serialized_named_tensors.append(serialized_tensors)
 
         return peft_config_json, serialized_named_tensors
+
+    async def train_drafter(self):
+        await self.server_actor.train_drafter.remote()

@@ -321,7 +321,7 @@ class DrafterBaseTrainer:
         }
         
         # 同步 DataBuffer
-        self.data_buffer.add_batch(data_item, hidden_states)
+        self.data_buffer.add_batch(data_item)
 
         # 同步 collect_data (当前步训练直接使用)
         self.collected_data.append(data_item)
