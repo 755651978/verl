@@ -253,22 +253,19 @@ class ServerAdapter(BaseRollout):
             else:
                 weights = weights
 
-            async for params_batch in get_named_tensor_buckets(weights, update_weights_bucket_bytes):
-                await sgl_update_weights(
-                    engine=self._engine,
-                    params_batch=params_batch,
-                    device_mesh_key="infer_tp",
-                    device_mesh=self.device_mesh,
-                )
-
-        # get drafter weights from drafter manager dang update to engine
-        if (self.device_mesh["infer_tp"].get_local_rank() == 0
-                and self.config.drafter.enable
-                and self.config.drafter.enable_drafter_training):
-            # get drafter weights
-            drafter_weights = await self.server_actor.maybe_publish.remote()
-            if drafter_weights is not None:
-                async for params_batch in get_named_tensor_buckets(drafter_weights, update_weights_bucket_bytes):
+            if self.config.drafter.enable and self.config.drafter.enable_drafter_training:
+                # update target model
+                async for params_batch in get_named_tensor_buckets(weights, update_weights_bucket_bytes):
+                    await self.sgl_update_weights_drafter(params_batch=params_batch)
+                # get drafter weights
+                if self.device_mesh["infer_tp"].get_local_rank() == 0:
+                    drafter_weights = await self.server_actor.maybe_publish.remote()
+                    if drafter_weights is not None:
+                        async for params_batch in get_named_tensor_buckets(drafter_weights,
+                                                                           update_weights_bucket_bytes):
+                            await self.sgl_update_weights_drafter(params_batch=params_batch, is_draft_model=True)
+            else:
+                async for params_batch in get_named_tensor_buckets(weights, update_weights_bucket_bytes):
                     await sgl_update_weights(
                         engine=self._engine,
                         params_batch=params_batch,
@@ -303,3 +300,24 @@ class ServerAdapter(BaseRollout):
 
     async def train_drafter(self):
         await self.server_actor.train_drafter.remote()
+
+    async def sgl_update_weights_drafter(
+            self,
+            params_batch: list[tuple[str, torch.Tensor]],
+            is_draft_model: bool = False
+    ):
+        for name, tensor in params_batch:
+            if is_draft_model:
+                if hasattr(self._engine, "draft_model"):
+                    parts = name.split('.')
+                    param = self._engine.draft_model
+                    for part in parts:
+                        param = getattr(param, part)
+                    param.data.copy_(tensor.to(param.device))
+            else:
+                if hasattr(self._engine, "model"):
+                    parts = name.split('.')
+                    param = self._engine.model
+                    for part in parts:
+                        param = getattr(param, part)
+                    param.data.copy_(tensor.to(param.device))
