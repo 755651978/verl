@@ -548,7 +548,7 @@ class SGLangHttpServer:
         # todo：add fsdp and target_config
         if full_config is not None:
             if full_config.actor_rollout_ref.drafter.speculative_algorithm == "EAGLE":
-                from verl.workers.ddrafter.eagle_trainer import EagleTrainerBackend
+                from verl.workers.drafter.eagle_trainer_backend import EagleTrainerBackend
                 self.drafter_manager.trainer_backend = EagleTrainerBackend(full_config)
 
     async def train_drafter(self):

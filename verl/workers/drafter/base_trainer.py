@@ -14,7 +14,6 @@ import torch.distributed.checkpoint as dcp
 from torch import optim
 from torch.distributed.device_mesh import DeviceMesh
 from torch.nn import SmoothL1Loss
-from torch.nn import functional as F
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import StateDictType, ShardedStateDictConfig
 
@@ -26,10 +25,6 @@ from verl.utils.fsdp_utils import (
     load_fsdp_model_to_gpu,
     load_fsdp_optimizer,
     MixedPrecisionPolicy
-)
-from verl.utils.torch_functional import (
-    get_constant_schedule_with_warmup,
-    get_cosine_schedule_with_warmup,
 )
 
 logger = logging.getLogger(__name__)
@@ -105,7 +100,7 @@ class DrafterBaseTrainer:
         """build draft model"""
         logger.info(f"[Rank {self.rollout_dp_rank}] Building drafter model...")
         # A. 实例化模型（委托给backend）
-        raw_model = self.backend.build_model()
+        raw_model, drafter_model_config = self.backend.build_model()
         raw_model.cuda()
 
         # B. 获取全量状态用于 FSDP 初始化
@@ -132,11 +127,13 @@ class DrafterBaseTrainer:
         del full_state
 
         # D. 构建优化器和调度器
+        drafter_train_config = self.config.actor_rollout_ref.eagle.train.copy()
         drafter_train_config = self._prepare_training_config(self.config.actor_rollout_ref)
 
         self.oprimizer = self.backend.setup_optimizer(self.model, drafter_train_config)
         self.lr_scheduler = self.backend.setup_scheduler(self.oprimizer, drafter_train_config)
         self.drafter_train_config = drafter_train_config
+        self.model_config = drafter_model_config
         
     def _prepare_training_config(self, rollout_config):
         """
@@ -378,48 +375,61 @@ class DrafterBaseTrainer:
 
         dev = next(self.model.parameters()).device
         
-        preprocessed_lists = self.backend.preprocess_individual_items(items, dev, self.drafter_train_config)
+        preprocessed_lists = self.backend.preprocess_individual_items(items, dev, self.model_config)
        
         # Concatenate all sequences into a single sequence
         input_ids_concat = torch.cat(preprocessed_lists['ids'], dim=0).unsqueeze(0)  # (1, total_seq_len)
         loss_mask_concat = torch.cat(preprocessed_lists['masks'], dim=0).unsqueeze(0)  # (1, total_seq_len)
         hidden_states_concat = torch.cat(preprocessed_lists['h_states'], dim=0).unsqueeze(0)  # (1, total_seq_len, hidden_dim)
 
-        # 执行算法特有的特征转换
-        batch = self.backend.transform_to_algorithm_features(
-            input_ids_concat,
-            loss_mask_concat,
-            hidden_states_concat,
-        )
+        # Create attention mask (all 1s since no padding)
+        total_seq_len = input_ids_concat.size(1)
+        attn_mask = torch.ones((1, total_seq_len), dtype=torch.long, device=dev)
 
         # Use Ulysses SP to pad and slice if needed
         if self.use_ulysses_sp:
             from verl.utils.ulysses import slice_input_tensor, ulysses_pad_and_slice_inputs
             # Pad to be divisible by SP size and slice across ranks
-            input_ids, sharded_pos, pad_size = ulysses_pad_and_slice_inputs(
-                batch["input_ids"], None, sp_size=self.ulysses_sequence_parallel_size
+            input_ids_concat, sharded_pos, pad_size = ulysses_pad_and_slice_inputs(
+                input_ids_concat, None, sp_size=self.ulysses_sequence_parallel_size
             )
 
-            batch["input_ids"] = input_ids
-            batch["position_ids"] = sharded_pos
+            position_ids = sharded_pos
 
-            # Pad loss_mask 、hidden_states and attention_mask to match
-            for key in ["hidden_states", "target", "loss_mask", "attention_mask"]:
-                if pad_size > 0:
-                    p_val = 0.0 if "mark" in key or "target" in key else 0
-                    dim = 2 if batch[key].dim() == 3 else 1
-                    batch[key] = torch.nn.functional.pad(batch[key], (0, 0, 0, pad_size) if dim==2 else (0, pad_size), value=p_val)
-                
-                # Slice for this rank
-                batch[key] = slice_input_tensor(batch[key], dim=1, padding=False)
+            # Pad loss_mask and hidden_states to match
+            if pad_size > 0:
+                loss_mask_concat = torch.nn.functional.pad(loss_mask_concat, (0, pad_size), value=0.0)
+                hidden_states_concat = torch.nn.functional.pad(hidden_states_concat, (0, 0, 0, pad_size), value=0.0)
+                attn_mask = torch.nn.functional.pad(attn_mask, (0, pad_size), value=0)
+
+            # Slice for this rank
+            from verl.utils.ulysses import slice_input_tensor
+
+            loss_mask_concat = slice_input_tensor(loss_mask_concat, dim=1, padding=False)
+            hidden_states_concat = slice_input_tensor(hidden_states_concat, dim=1, padding=False)
+            attn_mask = slice_input_tensor(attn_mask, dim=1, padding=False)
 
             # Store pad_size for later gathering
             self._current_pad_size = pad_size
         else:
-            batch["position_ids"] = torch.arange(batch["input_ids"].size(1), device=dev).unsqueeze(0)
+            position_ids = torch.arange(total_seq_len, device=dev).unsqueeze(0)
             self._current_pad_size = 0
 
-        return batch
+        # Shift for next token prediction
+        target = hidden_states_concat[:, 1:].contiguous()
+        loss_mask = loss_mask_concat[:, 1:].contiguous()
+        input_ids = input_ids_concat[:, :-1].contiguous()
+        attn_mask = attn_mask[:, :-1].contiguous()
+        base_h = hidden_states_concat[:, :-1].contiguous()
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attn_mask,
+            "hidden_states": base_h,
+            "target": target,
+            "loss_mask": loss_mask,
+            "position_ids": position_ids,
+        }
     
     async def training_step(self, step: int) -> bool:
         try:
