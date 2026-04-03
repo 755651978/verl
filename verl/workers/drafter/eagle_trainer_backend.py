@@ -8,7 +8,8 @@ import torch
 from torch.nn import SmoothL1Loss
 from torch.nn import functional as F
 
-from .model.eagle3.eagle import LlamaForCausalLMEagle3
+from .model.eagle.llama_eagle import LlamaForCausalLMEagle3, LlamaForCausalLMEagle
+from .model.auto import AutoDraftModelConfig, AutoEagle3DraftModel, AutoEagleDraftModel
 
 from verl.utils.torch_functional import (
     get_constant_schedule_with_warmup,
@@ -24,12 +25,10 @@ class EagleTrainerBackend:
     def __init__(
         self,
         config,
-        target_model_config,
-        target_model_fsdp
+        target_model_config
     ):
         self.config = config
         self.target_model_config = target_model_config
-        self.target_model_fsdp = target_model_fsdp
 
         self.criterion = SmoothL1Loss(reduction="none")
 
@@ -39,83 +38,72 @@ class EagleTrainerBackend:
 
     def build_model(self):
         """build draft model"""
-        num_layers_to_concat = getattr(self.config.actor_rollout_ref.drafter.eagle, "num_layers_to_concat", 1)
         logger.info(f"Initializing Eagle model with type: {self.target_model_config.model_type}")
+        eagle_cfg = self.config.actor_rollout_ref.drafter.eagle
+        spec_model_path = eagle_cfg.spec_model_path
+        config_path = os.path.join(spec_model_path, "config.json")
 
-        # 1、复制主模型配置并修改为单层 Eagle 结构
-        config = deepcopy(self.target_model_config)
-        config.num_hidden_layers = 1
-        config.torch_dtype = torch.bfloat16
-        config.tie_word_embeddings = False
-        config.num_layers_to_concat = num_layers_to_concat
-
-        # todo 对于eagle3，引入了draft_vocab_size
-        # config.draft_vocab_size
-
-        model_type = getattr(config, "model_type", "llama") 
-        
-        # 2、实例化模型
-        if model_type.lower() in ["llama", "qwen2", "qwen2.5", "qwen3"]:
-            model_class = LlamaForCausalLMEagle3
+        # 1、加载 Config
+        if os.path.exists(config_path):
+            drafter_config = AutoDraftModelConfig.from_file(config_path)
+            arch_list = getattr(drafter_config, "architectures", [])
+            arch = arch_list[0] if arch_list else "LlamaForCausalLMEagle"
         else:
-            raise ValueError(f"Unsupported model type for eagle: {model_type}")
-        
-        drafter_module = model_class(config=config)
+            drafter_config = deepcopy(self.target_model_config)
+            drafter_config.num_hidden_layers = 1
+            drafter_config.torch_dtype = torch.bfloat16
+            drafter_config.tie_word_embeddings = False
+            drafter_config.architectures = ["LlamaForCausalLMEagle"]
+            arch = "LlamaForCausalLMEagle"
 
-        spec_model_path = self.config.actor_rollout_ref.drafter.eagle.spec_model_path
-        # 3、权重加载与处理
+        if "Eagle3" in arch:
+            factory_cls = AutoEagle3DraftModel
+        else:
+            factory_cls = AutoEagleDraftModel
+        
+        drafter_module = factory_cls.from_config(drafter_config)
+
+        # Initialize model
         if spec_model_path and os.path.exists(spec_model_path):
             logger.info(f"Loading eagle model from checkpoint: {spec_model_path}")
             state = self._load_checkpoint_files(spec_model_path)
 
-            # 兼容性更名
-            model_dict = drafter_module.state_dict()
-            matched_checkpoint = {}
+            renamed_checkpoint = {}
 
             for key, value in state.items():
-                # 处理 key 的命名空间兼容性
-                new_key = key if (key.startswith("model.") or key.startswith("lm_head")) else f"model.{key}"
-
-                if new_key in model_dict:
-                    # 【核心修复】：检查 Checkpoint 里的权重维度和当前模型是否一致
-                    if value.shape == model_dict[new_key].shape:
-                        matched_checkpoint[new_key] = value
-                    else:
-                        # 如果维度不一致（比如 32000 vs 128256），跳过这个 key，不让它报 RuntimeError
-                        logger.warning(
-                            f"Dimension mismatch for {new_key}: Checkpoint {value.shape} vs Model {model_dict[new_key].shape}. "
-                            f"Skipping this weight (it will be randomly initialized)."
-                        )
+                if not key.startswith("model.") and not key.startswith("lm_head"):
+                    renamed_checkpoint[f"model.{key}"] = value
                 else:
-                    logger.debug(f"Key {new_key} not found in model_class, skipping.")
+                    renamed_checkpoint[key] = value
+            del state
 
-            # 使用 strict=False，允许跳过刚才那些维度不匹配的词表权重
-            drafter_module.load_state_dict(matched_checkpoint, strict=False)
-            del state, matched_checkpoint
+            drafter_module.load_state_dict(renamed_checkpoint, strict=False)
         else:
             logger.info("Initialized eagle model from scratch")
 
-        # 4、复用主模型的Embedding和LM_Head
-        with self.target_model_fsdp.unshard():
-            base_module = self.actor_module_fsdp
-            # 共享LM_Head
-            if hasattr(base_module, "lm_head"):
-                drafter_module.lm_head = base_module.lm_head
-                for param in drafter_module.lm_head.parameters():
-                    param.requires_grad = False
-                logger.info("Successfully load lm_head for drafter model")
+        
+        # 复用主模型的Embedding和LM_Head
+        target_model_path = self.config.actor_rollout_ref.model.path
+        if arch == "LlamaForCausalLMEagle":
+            logger.info("Start load lm_head for eagle")
+            drafter_module.load_lm_head(target_model_path)
+            drafter_module.freeze_lm_head()
+            
+        
+        drafter_module.load_embedding(target_model_path)
+        drafter_module.freeze_embedding()
 
-            # 共享Embedding
-            base_model_obj = getattr(base_module, "model", base_module)
-            drafter_model_obj = getattr(drafter_module, "model", drafter_module)
+        del base_module
+        
+        # EAGLE-3 特有逻辑：加载词表映射
+        if arch == "LlamaForCausalLMEagle3":
+            mapping_path = getattr(eagle_cfg, "vocab_mapping_path", None)
 
-            if hasattr(base_module.model, "embed_tokens"):
-                drafter_model_obj.embed_tokens = base_model_obj.embed_tokens
-                for param in drafter_model_obj.embed_tokens.parameters():
-                    param.requires_grad = False
-                logger.info("Successfully load embed_tokens for drafter model")
+            if mapping_path and os.path.exists(mapping_path):
+                drafter_module.load_vocab_mapping(mapping_path)
+                logger.info(f"Loaded EAGLE-3 vocab mapping from {mapping_path}")
 
-        return drafter_module
+        return drafter_module, drafter_config
 
     def _load_checkpoint_files(self, path):
         """内部工具：支持 safetensors 和 bin 格式"""
@@ -189,19 +177,16 @@ class EagleTrainerBackend:
         max_window = 512
         pad_id = int(getattr(model_config, "pad_token_id", 0) or 0)
 
-        num_layers_to_concat = getattr(self.config.actor_rollout_ref.drafter.eagle, "num_layers_to_concat", 1)
-
         for item in items:
-            # 1. 搬运到GPU并统一hidden states维度[L, D]
+            # 1. 搬运到GPU
             ids = item["input_ids"].to(device, non_blocking=True)
             seq_len = ids.size(0)
 
             raw_h = item["hidden_states"]
 
             if isinstance(raw_h, (list, tuple)):
-                h_states = torch.cat(raw_h[-num_layers_to_concat:], dim=-1).to(device, dtype=torch.bfloat16)
-            elif raw_h.dim() == 3:
-                h_states = torch.cat([raw_h[i] for i in range(-num_layers_to_concat, 0)], dim=-1).to(device, dtype=torch.bfloat16)
+                # 将hidden_states进行拼接
+                h_states = torch.cat(raw_h, dim=-1).to(device, dtype=torch.bfloat16)
             else:
                 h_states = raw_h.to(device, dtype=torch.bfloat16)
 
@@ -254,54 +239,6 @@ class EagleTrainerBackend:
             res['masks'].append(item_loss_mask[start:end])
         
         return res
-    
-    def transform_to_algorithm_features(self, input_ids_concat, loss_mask_concat, hidden_states_concat):
-        """
-        执行 Eagle 核心的滑动窗口特征融合
-        input_ids_concat: [1, Total_L]
-        hidden_states_concat: [1, Total_L, D]
-        """
-        dev = input_ids_concat.device
-        total_seq_len = input_ids_concat.size(1)
-        
-        # 识别当前的纵向维度（D * num_layer）
-        current_dim = hidden_states_concat.size(-1)
-
-        time_window = getattr(self.config, "time_window_size",1)
-
-        if time_window > 1:
-            # padding 维度: [1, window_size-1, 4096]
-            pad = torch.zeros((1, time_window - 1, current_dim), device=dev, dtype=hidden_states_concat.dtype)
-            h_extended = torch.cat([pad, hidden_states_concat], dim=1)  # [1, L + window-1, 4096]
-            
-            # 3. 构造滑动窗口拼接 (t, t-1, t-2...)
-            chunks = []
-            for i in range(time_window):
-                # i=0: 当前位置 t (从偏移后的 window-1 开始)
-                # i=1: 前一个位置 t-1
-                start_idx = (time_window - 1) - i
-                chunks.append(h_extended[:, start_idx : start_idx + total_seq_len, :])
-            
-            # 在最后一个维度 D 上拼接，得到 [1, L, 12288] 或 [1, L, 16384]
-            full_hidden_states = torch.cat(chunks, dim=-1)
-        else:
-            full_hidden_states = hidden_states_concat
-
-        input_ids = input_ids_concat[:, :-1].contiguous()
-        base_h = full_hidden_states[:, :-1].contiguous()
-
-        # 无论输入拼接多少层，我们要预测的永远只是主模型最后一层的输出向量
-        base_hidden_dim = self.target_model_config.hidden_size
-        target = hidden_states_concat[:, 1:, -base_hidden_dim:].contiguous()
-        loss_mask = loss_mask_concat[:, 1:].contiguous()
-
-        return {
-            "input_ids": input_ids,
-            "hidden_states": base_h,
-            "target": target,
-            "loss_mask": loss_mask,
-            "attention_mask": torch.ones_like(input_ids)
-        }
     
     def compute_loss(self, model, batch, _current_pad_size):
         """

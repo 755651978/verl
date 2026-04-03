@@ -1,24 +1,25 @@
 import os
 import math
 import warnings
-import logging
 from typing import List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+import logging
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
-from transformers import PreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.models.llama.configuration_llama import LlamaConfig
+# from yunchang.comm import SeqAllToAll4D
 
 from .flex_attention import (
     compile_friendly_create_block_mask,
     compile_friendly_flex_attention,
     generate_eagle3_mask,
 )
+from .base import EagleDraftModel, Eagle3DraftModel
 
 try:
     from flash_attn import flash_attn_func
@@ -972,6 +973,197 @@ class LlamaFlashAttention(LlamaAttention):
 
         return attn_output
 
+
+# class LlamaUSPFlashAttention(LlamaAttention):
+#     """
+#     LlamaUSPFlashAttention with Trainable Ring Attention & Correct Eagle3 Branch Merging.
+#     """
+
+#     def __init__(self, config):
+#         super().__init__(config)
+#         assert (
+#             dist.is_initialized()
+#         ), f"LlamaUSPAttention requires torch.distributed; call init_distributed first."
+#         if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
+#             raise NotImplementedError(
+#                 f"LlamaMutiRotaryEmbedding is currently not supported for LlamaUSPFlashAttention."
+#             )
+#         # self.ring_pg = get_sp_ring_group()
+#         # self.ulysses_pg = get_sp_ulysses_group()
+#         self.sp_ring_degree = torch.distributed.get_world_size(self.ring_pg)
+#         self.sp_ulysses_degree = torch.distributed.get_world_size(self.ulysses_pg)
+#         self.ring_rank = torch.distributed.get_rank(self.ring_pg)
+
+#         self.scatter_idx = 2
+#         self.gather_idx = 1
+#         self.use_sync = False
+
+#     def forward(
+#         self,
+#         hidden_states: torch.Tensor,
+#         cache_hidden: Optional[List[torch.Tensor]] = None,
+#         attention_mask: Optional[torch.Tensor] = None,
+#         position_ids: Optional[torch.LongTensor] = None,
+#         past_key_values: Optional[Cache] = None,
+#         output_attentions: bool = False,
+#         use_cache: bool = False,
+#     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+
+#         bsz, q_len, _ = hidden_states.size()
+#         local_q_len = q_len
+
+#         # =============================================================
+#         # 1. Projections & Ulysses Scatter
+#         # =============================================================
+#         query_states = self.q_proj(hidden_states)
+#         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
+#         query_states = SeqAllToAll4D.apply(
+#             self.ulysses_pg,
+#             query_states,
+#             self.scatter_idx,
+#             self.gather_idx,
+#             self.use_sync,
+#         )
+
+#         key_states = self.k_proj(hidden_states)
+#         key_states = key_states.view(
+#             bsz, q_len, self.num_key_value_heads, self.head_dim
+#         )
+#         key_states = SeqAllToAll4D.apply(
+#             self.ulysses_pg,
+#             key_states,
+#             self.scatter_idx,
+#             self.gather_idx,
+#             self.use_sync,
+#         )
+
+#         value_states = self.v_proj(hidden_states)
+#         value_states = value_states.view(
+#             bsz, q_len, self.num_key_value_heads, self.head_dim
+#         )
+#         value_states = SeqAllToAll4D.apply(
+#             self.ulysses_pg,
+#             value_states,
+#             self.scatter_idx,
+#             self.gather_idx,
+#             self.use_sync,
+#         )
+
+#         current_q_len = query_states.shape[1]
+#         local_num_heads = query_states.shape[2]
+
+#         # Global length calculation (for RoPE)
+#         global_q_len = q_len * self.sp_ring_degree * self.sp_ulysses_degree
+#         # =============================================================
+#         # 2. RoPE & Cache Management
+#         # =============================================================
+#         lck = 0 if cache_hidden is None else len(cache_hidden[0])
+
+#         cos, sin = self.rotary_emb(query_states, seq_len=global_q_len + lck)
+#         cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+#         query_states, key_states = apply_rotary_pos_emb(
+#             query_states, key_states, cos, sin, position_ids + lck, unsqueeze_dim=2
+#         )
+
+#         # Update Cache (Eagle3 Logic: Cache is a list of tensors for tree branches)
+#         if cache_hidden is not None:
+#             cache_hidden[0] = cache_hidden[0] + [key_states]
+#             cache_hidden[1] = cache_hidden[1] + [value_states]
+#             cache_k = cache_hidden[0]
+#             cache_v = cache_hidden[1]
+#         else:
+#             cache_k = [key_states]
+#             cache_v = [value_states]
+
+#         # =============================================================
+#         # 3. Hybrid Attention Computation
+#         # =============================================================
+
+#         # 3.1 Main Sequence (Ring Attention)
+#         out_ring, lse_ring, _ = ring_flash_attn_func(
+#             query_states,
+#             cache_k[0],
+#             cache_v[0],
+#             dropout_p=0.0,
+#             softmax_scale=1.0 / math.sqrt(self.head_dim),
+#             causal=True,
+#             window_size=(-1, -1),
+#             alibi_slopes=None,
+#             deterministic=False,
+#             return_attn_probs=True,
+#             group=self.ring_pg,
+#         )
+
+#         if lse_ring.dim() == 3 and lse_ring.shape[1] == local_num_heads:
+#             acc_lse = lse_ring.transpose(1, 2).contiguous()  # -> [B, S, H]
+#         else:
+#             acc_lse = lse_ring
+
+#         assert (
+#             acc_lse.shape[1] == current_q_len
+#         ), f"LSE seq_len {acc_lse.shape[1]} mismatch with Query seq_len {current_q_len}"
+
+#         acc_out = out_ring
+
+#         # 3.2 Extras Branches (Eagle3 Point-wise Update)
+#         if len(cache_k) > 1:
+#             num_kv_heads_local = cache_k[0].shape[2]
+#             local_groups = local_num_heads // num_kv_heads_local
+
+#             q_shape_expanded = (
+#                 bsz,
+#                 current_q_len,
+#                 num_kv_heads_local,
+#                 local_groups,
+#                 self.head_dim,
+#             )
+#             qi_reshaped = query_states.view(q_shape_expanded)  # [B, S, KV, G, D]
+
+#             for i in range(1, len(cache_k)):
+#                 ki = cache_k[i]  # [B, S, KV, D]
+#                 vi = cache_v[i]  # [B, S, KV, D]
+
+#                 ki_expanded = ki.unsqueeze(-2)  # [B, S, KV, 1, D]
+
+#                 # Dot Product: [B, S, KV, G]
+#                 score_i = (qi_reshaped * ki_expanded).sum(-1) / math.sqrt(self.head_dim)
+
+#                 # Flatten back to [B, S, H_local]
+#                 step_lse = score_i.view(bsz, current_q_len, -1)
+
+#                 vi_expanded = vi.unsqueeze(-2)
+#                 step_out = vi_expanded.expand(q_shape_expanded).reshape(acc_out.shape)
+
+#                 # Online Softmax Update
+#                 new_lse = torch.logaddexp(acc_lse, step_lse)
+
+#                 acc_out = acc_out * torch.exp(acc_lse - new_lse).unsqueeze(
+#                     -1
+#                 ) + step_out * torch.exp(step_lse - new_lse).unsqueeze(-1)
+
+#                 acc_lse = new_lse
+
+#         attn_output = acc_out.to(query_states.dtype)
+
+#         # =============================================================
+#         # 4. Ulysses Gather & Output Projection
+#         # =============================================================
+#         attn_output = SeqAllToAll4D.apply(
+#             self.ulysses_pg,
+#             attn_output,
+#             self.gather_idx,  # Scatter idx: 1 (Seq)
+#             self.scatter_idx,  # Gather idx: 2 (Heads)
+#             self.use_sync,
+#         )
+
+#         attn_output = attn_output.reshape(
+#             bsz, local_q_len, self.head_dim * self.num_heads
+#         )
+#         attn_output = self.o_proj(attn_output)
+
+#         return attn_output
+
+
 class LlamaMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -1047,6 +1239,8 @@ class LlamaDecoderLayer(nn.Module):
             self.self_attn = LlamaFlexAttention(config=config)
         elif attention_backend == "fa":
             self.self_attn = LlamaFlashAttention(config=config)
+        # elif attention_backend == "usp":
+        #     self.self_attn = LlamaUSPFlashAttention(config=config)
         else:
             raise ValueError(f"Unknown attention backend {attention_backend}")
 
@@ -1116,8 +1310,7 @@ class LlamaDecoderLayer(nn.Module):
         return hidden_states
 
 
-class LlamaForCausalLMEagle3(PreTrainedModel):
-    _no_split_modules = ["LlamaDecoderLayer"]
+class LlamaForCausalLMEagle3(Eagle3DraftModel):
 
     config_class = LlamaConfig
 
@@ -1127,8 +1320,7 @@ class LlamaForCausalLMEagle3(PreTrainedModel):
         self.quant_config = quant_config
 
         self.vocab_size = config.vocab_size
-        self.draft_vocab_size = getattr(config, "draft_vocab_size", config.vocab_size)
-        self.n_concat = getattr(config, "num_layers_to_concat", 1)
+        self.draft_vocab_size = config.draft_vocab_size
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
@@ -1136,16 +1328,16 @@ class LlamaForCausalLMEagle3(PreTrainedModel):
 
         if hasattr(config, "target_hidden_size"):
             self.fc = torch.nn.Linear(
-                config.target_hidden_size * self.n_concat, config.hidden_size, bias=False
+                config.target_hidden_size * 3, config.hidden_size, bias=False
             )
         else:
             self.fc = torch.nn.Linear(
-                config.hidden_size * self.n_concat, config.hidden_size, bias=False
+                config.hidden_size * 3, config.hidden_size, bias=False
             )
 
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = nn.Linear(
-            config.hidden_size, self.draft_vocab_size, bias=False
+            config.hidden_size, config.draft_vocab_size, bias=False
         )
 
         # create vocab buffers
@@ -1156,10 +1348,11 @@ class LlamaForCausalLMEagle3(PreTrainedModel):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
         hidden_states: torch.Tensor,
+        inputs_embeds: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
         ttt_length: int = 1,
     ):
         """
@@ -1181,6 +1374,13 @@ class LlamaForCausalLMEagle3(PreTrainedModel):
 
         # make position ids
         device = hidden_states.device
+        if position_ids is None:
+            if past_key_value is not None:
+                past_length = past_key_value.get_usable_length(seq_length)
+            else:
+                past_length = 0
+            position_ids = torch.arange(past_length, seq_length + past_length, dtype=torch.long, device=device)
+            position_ids = position_ids.unsqueeze(0)
 
         # make attention mask
         if attention_mask is None:
@@ -1193,8 +1393,7 @@ class LlamaForCausalLMEagle3(PreTrainedModel):
 
         # fc
         hidden_states = self.project_hidden_states(hidden_states)
-        inputs_embeds = self.embed_input_ids(input_ids)
-        hidden_states = self.midlayer(
+        hidden_states = self.backbone(
             input_emb=inputs_embeds,
             hidden_states=hidden_states,
             cache_hidden=cache_hidden,
@@ -1207,8 +1406,7 @@ class LlamaForCausalLMEagle3(PreTrainedModel):
 
         # norm
         last_hidden_states = self.norm(hidden_states)
-
-        logits = self.lm_head(hidden_states)
+        logits = self.compute_logits(hidden_states)
 
         return {
             "logits": logits,
@@ -1220,5 +1418,125 @@ class LlamaForCausalLMEagle3(PreTrainedModel):
 
     def project_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # eagle 3 requires hidden states from 3 layers
-        assert hidden_states.size(-1) == self.config.hidden_size * self.n_concat
+        assert hidden_states.size(-1) == self.config.hidden_size * 3
         return self.fc(hidden_states)
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        norm_hidden_states = self.norm(hidden_states)
+        return self.lm_head(norm_hidden_states)
+
+    def backbone(
+        self,
+        input_embeds: torch.Tensor,
+        hidden_states: torch.Tensor,
+        cache_hidden: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        past_key_values: Optional[Cache] = None,
+        use_cache: bool = True,
+    ) -> torch.Tensor:
+        return self.midlayer(
+            input_emb=input_embeds,
+            hidden_states=hidden_states,
+            cache_hidden=cache_hidden,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            output_attentions=False,
+            use_cache=use_cache,
+        )
+
+
+class LlamaForCausalLMEagle(EagleDraftModel):
+
+    config_class = LlamaConfig
+
+    def __init__(self, config, quant_config=None, attention_backend="sdpa") -> None:
+        super().__init__(config)
+        self.config = config
+        self.quant_config = quant_config
+
+        self.vocab_size = config.vocab_size
+
+        self.embed_tokens = nn.Embedding(
+            config.vocab_size, config.hidden_size, config.pad_token_id
+        )
+        self.midlayer = LlamaDecoderLayer(config, attention_backend=attention_backend)
+
+        target_dim = getattr(config, "target_hidden_size", config.hidden_size)
+        self.fc = torch.nn.Linear(target_dim, config.hidden_size, bias=False)
+
+        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.lm_head = nn.Linear(
+            config.hidden_size, config.draft_vocab_size, bias=False
+        )
+
+        # create vocab buffers
+        t2d = torch.ones(self.vocab_size, dtype=torch.bool)
+        d2t = torch.zeros(self.vocab_size, dtype=torch.int64)
+        self.register_buffer("t2d", t2d)
+        self.register_buffer("d2t", d2t)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        use_cache: bool = False,
+    ):
+        """
+        Arguments:
+            hidden_states (`torch.FloatTensor`): input to the layer, cat low, mid high hidden_states of shape `(batch, seq_len, hidden_states * 3)`
+            input_ids (`torch.LongTensor`): input ids of shape `(batch, seq_len)`
+            attention_mask (`torch.FloatTensor`): attention mask of size
+                `(batch, 1, tgt_len, src_len)` where padding elements are indicated by very large negative values.
+            position_ids (`torch.LongTensor`, *optional*): position ids of shape `(batch, seq_len)`
+        """
+        batch_size, seq_length, _ = hidden_states.size()
+
+        # make position ids
+        device = hidden_states.device
+
+        if position_ids is None:
+            if past_key_value is not None:
+                past_length = past_key_value.get_usable_length(seq_length)
+            else:
+                past_length = 0
+            position_ids = torch.arange(past_length, seq_length + past_length, dtype=torch.long, device=device)
+            position_ids = position_ids.unsqueeze(0)
+
+        # make attention mask
+        past_key_value_length = past_key_value.get_usable_length(seq_length) if past_key_value else 0
+        attention_mask = prepare_decoder_attention_mask(
+            attention_mask, (batch_size, seq_length), hidden_states, past_key_value_length
+        )
+
+        # fc
+        hidden_states = self.fc(hidden_states)
+        hidden_states = self.midlayer(
+            input_emb=inputs_embeds,
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_value,
+            use_cache=False,
+        )
+
+        # norm
+        last_hidden_states = self.norm(hidden_states)
+        logits = self.compute_logits(hidden_states)
+
+        return {
+            "logits": logits,
+            "hidden_states": last_hidden_states,
+        }
+
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens(input_ids)
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        norm_hidden_states = self.norm(hidden_states)
+        return self.lm_head(norm_hidden_states)
