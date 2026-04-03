@@ -1,9 +1,19 @@
-# Tested successfully on the hiyouga/verl:ngc-th2.6.0-cu126-vllm0.8.4-flashinfer0.2.2-cxx11abi0 image.
-# It outperforms the Qwen2 7B base model by two percentage points on the test set of GSM8K.
-
 set -x
+export HCCL_HOST_SOCKET_PORT_RANGE=60000-60050
+export HCCL_NPU_SOCKET_PORT_RANGE=61000-61050
+export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+export SGLANG_DEEPEP_BF16_DISPATCH=1
 
-gen_tp=4
+export SGLANG_SET_CPU_AFFINITY=1
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export STREAMS_PER_DEVICE=32
+export HCCL_OP_EXPANSION_MOD=AIV
+
+project_name='verl_grpo_example_gsm8k_drafter'
+exp_name='qwen3_8b_function_rm_drafter'
+
+gen_tp=2
 train_sp=4
 
 MODEL_PATH=/path/to/model
@@ -16,36 +26,41 @@ python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files=${TRAIN_FILE} \
     data.val_files=${TEST_FILE} \
-    data.train_batch_size=1024 \
+    data.train_batch_size=32 \
     data.max_prompt_length=512 \
-    data.max_response_length=1024 \
+    data.max_response_length=8192 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     actor_rollout_ref.model.path=Qwen/Qwen3-8B \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
-    actor_rollout_ref.actor.ppo_mini_batch_size=256 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=32 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=16 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.entropy_coeff=0 \
+    actor_rollout_ref.actor.calculate_entropy=False \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=32 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=${train_sp} \
     actor_rollout_ref.ref.ulysses_sequence_parallel_size=${train_sp} \
+    actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
+    actor_rollout_ref.actor.use_dynamic_bsz=True \
+    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.rollout.name=sglang \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
+    +actor_rollout_ref.rollout.engine_kwargs.sglang.log_level=info \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.3 \
     actor_rollout_ref.rollout.n=5 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=32 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.rollout.drafter.enable=True \
     actor_rollout_ref.rollout.drafter.enable_drafter_training=False \
     actor_rollout_ref.rollout.drafter.model_path=${DRAFTER_PATH} \
-    actor_rollout_ref.rollout.drafter.speculative_algorithm="EAGLE" \
+    actor_rollout_ref.rollout.drafter.speculative_algorithm="EAGLE3" \
     actor_rollout_ref.rollout.drafter.training.collect_hidden_states_from_sgl=False \
     actor_rollout_ref.rollout.drafter.rollout.spec_steps=3 \
     actor_rollout_ref.rollout.drafter.rollout.spec_topk=1 \
@@ -53,11 +68,12 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.load_format="auto" \
     actor_rollout_ref.actor.strategy=fsdp2 \
     algorithm.use_kl_in_reward=False \
+    trainer.val_before_train=False \
     trainer.critic_warmup=0 \
-    trainer.logger='["console","wandb"]' \
-    trainer.project_name='verl_grpo_example_gsm8k_drafter' \
-    trainer.experiment_name='qwen3_8b_function_rm_drafter' \
-    trainer.n_gpus_per_node=8 \
+    trainer.logger='["console"]' \
+    trainer.project_name=project_name \
+    trainer.experiment_name=exp_name \
+    trainer.n_gpus_per_node=16 \
     trainer.nnodes=1 \
     trainer.default_local_dir=${CKPTS_DIR}
     trainer.save_freq=20 \
