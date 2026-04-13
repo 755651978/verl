@@ -58,12 +58,12 @@ class DrafterBaseTrainer:
 
         self.collected_data = deque(maxlen=int(self.config.actor_rollout_ref.rollout.get("buffer_max_samples", 2000)))
         self.shared_data_buffer = None
-        self.batch_size = int(self.config.actor_rollout_ref.drafter.train.get("batch_size_per_gpu", 32))
+        self.batch_size = int(self.config.actor_rollout_ref.drafter.training.get("batch_size_per_gpu", 32))
 
         # Initialize DataBuffer for storing data across RL steps
-        buffer_max_size = int(self.config.actor_rollout_ref.drafter.train.get("data_buffer_max_size", 10000))
+        buffer_max_size = int(self.config.actor_rollout_ref.drafter.training.get("data_buffer_max_size", 10000))
         # Only store hidden states in buffer if we're collecting them during generation
-        collect_hidden_states_from_sgl = bool(self.config.actor_rollout_ref.drafter.train.get("collect_hidden_states_from_sgl", False))
+        collect_hidden_states_from_sgl = bool(self.config.actor_rollout_ref.drafter.training.get("collect_hidden_states_from_sgl", False))
 
         #DataBuffer define
         self.data_buffer = DataBuffer(max_size=buffer_max_size, store_hidden_states=collect_hidden_states_from_sgl)
@@ -72,7 +72,7 @@ class DrafterBaseTrainer:
 
         self._last_ckpt_step = -1
         # New: optional per-step barrier (default False to avoid stalls)
-        self.enable_mesh_barrier = bool(self.config.actor_rollout_ref.drafter.train.get("enable_step_barrier", False))
+        self.enable_mesh_barrier = bool(self.config.actor_rollout_ref.drafter.training.get("enable_step_barrier", False))
 
         # Track the last pending async checkpoint save future
         self._pending_checkpoint_future = None
@@ -86,7 +86,7 @@ class DrafterBaseTrainer:
         self.ulysses_sequence_parallel_size = self.config.actor_rollout_ref.actor.get("ulysses_sequence_parallel_size", 1)
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
 
-        self.checkpoint_dir = self.config.actor_rollout_ref.drafter.train.get("checkpoint_path")
+        self.checkpoint_dir = self.config.actor_rollout_ref.drafter.training.get("checkpoint_path")
 
     def _setup_device_mesh(self):
         infer_tp = self.config.actor_rollout_ref.rollout.tensor_model_parallel_size
@@ -446,7 +446,7 @@ class DrafterBaseTrainer:
             return False
 
         # Skip training if we're not collecting hidden states (since we can't train without them)
-        collect_hidden_states_from_sgl = bool(self.config.actor_rollout_ref.drafter.train.get("collect_hidden_states_from_sgl", False))
+        collect_hidden_states_from_sgl = bool(self.config.actor_rollout_ref.drafter.training.get("collect_hidden_states_from_sgl", False))
         if not collect_hidden_states_from_sgl:
             logger.debug(
                 f"[EagleTrainer rank {self.rank}] Skipping training step {step} "

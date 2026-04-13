@@ -600,8 +600,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.layered_summon = self.config.rollout.get("layered_summon", False)
             self.peft_merge: bool = model_config.lora.get("merge", False)
 
-            if (self.config.drafter.enable
-                and self.config.drafter.train.enable_drafter_training):
+            if (self.config.rollout.drafter.enable
+                and self.config.rollout.drafter.train.enable_drafter_training):
                 self.init_drafter_trainer_backend()
 
         # 4. build checkpoint engine

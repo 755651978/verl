@@ -34,9 +34,9 @@ __all__ = [
     "DiffusionRolloutConfig",
     "CheckpointEngineConfig",
     "SkipConfig",
-    "DrafterConfig",
-    "DrafterRolloutConfig",
-    "DrafterTrainingConfig",
+    "DraftConfig",
+    "DraftRolloutConfig",
+    "DraftTrainingConfig",
 ]
 
 
@@ -91,7 +91,7 @@ class DraftTrainingConfig(BaseConfig):
     training_interval_steps: int = 8
     sample_last_n_steps: int = 8
     buffer_capacity_steps: int = 128
-    train_batchs_per_cycle: int = 4
+    train_batches_per_cycle: int = 4
     lr: float = 1e-6
     lr_warmup_steps: int =1000
     min_lr_ratio: int = None
@@ -323,6 +323,8 @@ class RolloutConfig(BaseConfig):
     mtp: MtpConfig = field(default_factory=MtpConfig)
 
     qat: Optional[dict] = None
+
+    drafter: DrafterConfig = field(default_factory=DrafterConfig)
 
     def __post_init__(self):
         """Validate the rollout config"""

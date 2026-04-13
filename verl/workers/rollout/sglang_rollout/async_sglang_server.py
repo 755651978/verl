@@ -272,7 +272,7 @@ class SGLangHttpServer:
             args["cuda_graph_max_bs"] = 32
             args["speculative_draft_model_path"] = self.config.drafter.model_path
             args["speculative_num_steps"] = self.config.drafter.rollout.spec_steps
-            args["speculative_eagle_topk"] = self.config.drafter.spec_topk
+            args["speculative_eagle_topk"] = self.config.drafter.rollout.spec_topk
             args["speculative_num_draft_tokens"] = self.config.drafter.rollout.spec_verify_tokens
             args["enable_return_hidden_states"] = bool(self.config.drafter.enable_drafter_training
                                                        and self.config.drafter.training.collect_hidden_states_from_sgl)

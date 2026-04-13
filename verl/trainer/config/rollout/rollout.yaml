@@ -421,24 +421,24 @@ qat: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat,${oc.select:actor_rollo
 
 # Drafter configuration
 drafter:
-  _target_: verl.workers.config.DrafterConfig
+  _target_: verl.workers.config.DraftConfig
   enable: false
   enable_drafter_training: false
   speculative_algorithm: EAGLE
   model_path: /path/to/drafter/model
   checkpoint_path: /path/to/drafter/checkpoint
   rollout:
-    _target_: verl.workers.config.DrafterRolloutConfig
+    _target_: verl.workers.config.DraftRolloutConfig
     spec_steps: 3
     spec_topk: 1
     spec_verify_tokens: 3
   training:
-    _target_: verl.workers.config.DrafterTrainingConfig
+    _target_: verl.workers.config.DraftTrainingConfig
     collect_hidden_states_from_sgl: false
     use_data_buffer: false
     collect_interval_steps: 1
     max_seq_len: 8192
-    max epoch: 10
+    max_epoch: 10
     step: 100
     training_interval_steps: 8
     sample_last_n_steps: 8
