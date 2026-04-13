@@ -37,6 +37,9 @@ __all__ = [
     "DraftConfig",
     "DraftRolloutConfig",
     "DraftTrainingConfig",
+    "DraftConfig",
+    "DraftRolloutConfig",
+    "DraftTrainingConfig",
 ]
 
 
@@ -82,6 +85,7 @@ class DraftRolloutConfig(BaseConfig):
 
 @dataclass
 class DraftTrainingConfig(BaseConfig):
+    checkpoint_path: Optional[str] = None
     collect_hidden_states_from_sgl: bool = False
     use_data_buffer: bool = False
     collect_interval_steps: int = 1
@@ -92,10 +96,19 @@ class DraftTrainingConfig(BaseConfig):
     sample_last_n_steps: int = 8
     buffer_capacity_steps: int = 128
     train_batches_per_cycle: int = 4
+    batch_size_per_gpu: int = 32
+    data_buffer_max_size: int = 10000
+    buffer_max_samples: int = 2000
     lr: float = 1e-6
-    lr_warmup_steps: int =1000
+    lr_warmup_steps: int = 1000
     min_lr_ratio: int = None
     warmup_style: str = "constant"
+    is_offload_param: bool = False
+    is_offload_optimizer: bool = False
+    enable_step_barrier: bool = False
+    ulysses_sequence_parallel_size: int = 1
+    save_distributed_checkpoint: bool = False
+    prediction_length: int = 1
 
 
 @dataclass
@@ -324,7 +337,7 @@ class RolloutConfig(BaseConfig):
 
     qat: Optional[dict] = None
 
-    drafter: DrafterConfig = field(default_factory=DrafterConfig)
+    drafter: DraftConfig = field(default_factory=DraftConfig)
 
     def __post_init__(self):
         """Validate the rollout config"""

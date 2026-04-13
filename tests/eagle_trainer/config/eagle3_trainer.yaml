@@ -164,7 +164,7 @@ actor_rollout_ref:
       training_interval_steps: 10
       batch_size_per_gpu: 2
       max_seq_len: 8192
-      max_epochs: 10
+      max_epoch: 10
       checkpoint_path: /nas/disk6/ls/test_spec
       min_workers_for_training: 1
       collect_hidden_states_from_sgl: True 
