@@ -253,7 +253,7 @@ class ServerAdapter(BaseRollout):
             else:
                 weights = weights
 
-            if self.config.drafter.enable and self.config.drafter.enable_drafter_training:
+            if self.config.drafter.enable:
                 # update target model
                 async for params_batch in get_named_tensor_buckets(weights, update_weights_bucket_bytes):
                     await self.sgl_update_weights_drafter(params_batch=params_batch)

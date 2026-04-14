@@ -34,9 +34,9 @@ __all__ = [
     "DiffusionRolloutConfig",
     "CheckpointEngineConfig",
     "SkipConfig",
-    "DraftConfig",
-    "DraftRolloutConfig",
-    "DraftTrainingConfig",
+    "DrafertConfig",
+    "DrafterRolloutConfig",
+    "DrafterTrainingConfig",
 ]
 
 
@@ -74,14 +74,14 @@ class DiffusionSamplingConfig(SamplingConfig):
 
 
 @dataclass
-class DraftRolloutConfig(BaseConfig):
+class DrafterRolloutConfig(BaseConfig):
     spec_steps: int = 3
     spec_topk: int = 1
     spec_verify_tokens: int = 3
 
 
 @dataclass
-class DraftTrainingConfig(BaseConfig):
+class DrafterTrainingConfig(BaseConfig):
     collect_hidden_states_from_sgl: bool = False
     use_data_buffer: bool = False
     collect_interval_steps: int = 1
@@ -99,7 +99,7 @@ class DraftTrainingConfig(BaseConfig):
 
 
 @dataclass
-class DraftConfig(BaseConfig):
+class DrafterConfig(BaseConfig):
 
     enable: bool = False
     enable_drafter_training: bool = False
@@ -109,10 +109,10 @@ class DraftConfig(BaseConfig):
     checkpoint_path: str ="/path/to/drafter/checkpoint"
 
     # rollout configuration for drafter
-    rollout: DraftRolloutConfig = field(default_factory=DraftRolloutConfig)
+    rollout: DrafterRolloutConfig = field(default_factory=DrafterRolloutConfig)
 
     # training configuration for drafter
-    training: DraftTrainingConfig = field(default_factory=DraftTrainingConfig)
+    training: DrafterTrainingConfig = field(default_factory=DrafterTrainingConfig)
 
 
 @dataclass
@@ -324,7 +324,7 @@ class RolloutConfig(BaseConfig):
 
     qat: Optional[dict] = None
 
-    drafter: DraftConfig = field(default_factory=DraftConfig)
+    drafter: DrafterConfig = field(default_factory=DrafterConfig)
 
     def __post_init__(self):
         """Validate the rollout config"""
