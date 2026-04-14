@@ -20,7 +20,7 @@ from verl.base_config import BaseConfig
 from verl.trainer.config import CheckpointConfig
 
 from ...utils.profiler import ProfilerConfig
-from .model import HFModelConfig
+from .model import DiffusionModelConfig, HFModelConfig
 from .optimizer import OptimizerConfig
 
 __all__ = [
@@ -33,6 +33,7 @@ __all__ = [
     "EngineConfig",
     "EngineRouterReplayConfig",
     "QATEngineConfig",
+    "MindSpeedEngineConfig",
 ]
 
 
@@ -524,9 +525,33 @@ class AutomodelEngineConfig(EngineConfig):
 
 
 @dataclass
+class MindSpeedEngineConfig(McoreEngineConfig):
+    """Configuration for mindspeed parallelism.
+
+    The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
+
+    Args:
+        llm_kwargs (str): mindspeed_llm engine kwargs.
+        mm_kwargs (str): mindspeed_mm engine kwargs.
+    """
+
+    strategy: str = "mindspeed_llm"
+    llm_kwargs: dict[str, Any] = field(default_factory=dict)
+    mm_kwargs: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """config validation logics go here"""
+        assert self.strategy in ["mindspeed_llm", "mindspeed_mm"], f"strategy {self.strategy} not supported"
+        assert self.dtype in ["bfloat16", "float16"], f"dtype {self.dtype} not supported"
+        if self.tensor_model_parallel_size == 1:
+            warnings.warn("set sequence parallel to false as TP size is 1", stacklevel=2)
+            self.sequence_parallel = False
+
+
+@dataclass
 class TrainingWorkerConfig(BaseConfig):
     model_type: str = None  # model type (language_model/value_model)
-    model_config: HFModelConfig = None
+    model_config: HFModelConfig | DiffusionModelConfig = None
     engine_config: EngineConfig = None
     optimizer_config: OptimizerConfig = None
     checkpoint_config: CheckpointConfig = None

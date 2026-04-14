@@ -35,6 +35,7 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_device_name, is_npu_available, set_expandable_segments
 from verl.utils.distributed import initialize_global_process_group_ray, set_numa_affinity
 from verl.utils.flops_counter import FlopsCounter
+from verl.utils.import_utils import import_external_libs
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.metric.utils import Metric
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage
@@ -113,10 +114,9 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
         # we use the one defined in model
         # TODO: this is not elegant and should refactor later
-        self.engine_config.use_remove_padding = self.model_config.use_remove_padding
-        self.engine_config.use_fused_kernels = self.model_config.use_fused_kernels
+        self.engine_config.use_remove_padding = self.model_config.get("use_remove_padding", False)
+        self.engine_config.use_fused_kernels = self.model_config.get("use_fused_kernels", False)
 
-        # TODO: add DistProfilerExtension
         self.profiler_config = self.config.profiler_config
         if self.profiler_config is not None:
             self.profiler_tool_config = self.profiler_config.tool_config.get(self.profiler_config.tool, {})
@@ -144,7 +144,11 @@ class TrainingWorker(Worker, DistProfilerExtension):
             is_collect=self.engine.is_mp_src_rank_with_outputs(),
         )
 
-        self.flops_counter = FlopsCounter(self.model_config.hf_config)
+        if hasattr(self.model_config, "hf_config"):
+            self.flops_counter = FlopsCounter(self.model_config.hf_config)
+        else:
+            # for Diffusion models, FlopsCounter is not supported yet.
+            self.flops_counter = None
 
         self.loss_fn = None
 
@@ -215,7 +219,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 flatten_v = [sublist[0] for sublist in v]  # sublist should be single element
                 final_metrics[k] = sum(flatten_v) / len(flatten_v)
         # compute mfu
-        if global_token_num is not None:
+        if global_token_num is not None and self.flops_counter is not None:
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(
                 global_token_num, delta_time, images_seqlens=images_seqlens
             )
@@ -277,15 +281,19 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
             for batch_idx, mini_batch_td in enumerate(dataloader):
                 # add global token num
-                global_token_num = mini_batch_td["input_ids"].offsets().diff().tolist()  # (total_nnz,)
-                # allgather from dp rank
-                global_token_num_output = [None] * torch.distributed.get_world_size(
-                    self.engine.get_data_parallel_group()
-                )
-                torch.distributed.all_gather_object(
-                    global_token_num_output, global_token_num, self.engine.get_data_parallel_group()
-                )
-                global_token_num = [x for xs in global_token_num_output for x in xs]
+                if "input_ids" in mini_batch_td:
+                    global_token_num = mini_batch_td["input_ids"].offsets().diff().tolist()  # (total_nnz,)
+                    # allgather from dp rank
+                    global_token_num_output = [None] * torch.distributed.get_world_size(
+                        self.engine.get_data_parallel_group()
+                    )
+                    torch.distributed.all_gather_object(
+                        global_token_num_output, global_token_num, self.engine.get_data_parallel_group()
+                    )
+                    global_token_num = [x for xs in global_token_num_output for x in xs]
+                else:
+                    global_token_num = None
+
                 tu.assign_non_tensor(
                     mini_batch_td,
                     global_token_num=NonTensorData(global_token_num),
@@ -315,6 +323,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)
+    @DistProfiler.annotate(color="red", role="train_batch")
     def train_batch(self, data: TensorDict) -> TensorDict:
         assert self.loss_fn is not None, "loss function can't be None when calling train_batch"
         assert not self.engine_config.forward_only, "Can't run `train_batch` when forward_only is in the engine config."
@@ -325,7 +334,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
         # inject engineering parameters if not specified
         default_keys = dict(
-            use_remove_padding=self.model_config.use_remove_padding,
+            use_remove_padding=self.model_config.get("use_remove_padding", False),
             use_dynamic_bsz=self.engine_config.use_dynamic_bsz,
             max_token_len_per_gpu=self.engine_config.max_token_len_per_gpu,
             micro_batch_size_per_gpu=self.engine_config.micro_batch_size_per_gpu,
@@ -379,7 +388,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
         images_seqlens = tu.get(data, key="images_seqlens", default=None)
 
         default_keys = dict(
-            use_remove_padding=self.model_config.use_remove_padding,
+            use_remove_padding=self.model_config.get("use_remove_padding", False),
             use_dynamic_bsz=self.engine_config.use_dynamic_bsz,
             max_token_len_per_gpu=self.engine_config.infer_max_token_len_per_gpu,
             micro_batch_size_per_gpu=self.engine_config.infer_micro_batch_size_per_gpu,
@@ -457,7 +466,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             omega_profiler_config = config.ref.get("profiler", {})
 
         profiler_config = omega_conf_to_dataclass(omega_profiler_config, dataclass_type=ProfilerConfig)
-        if omega_profiler_config.get("tool", None) in ["npu", "nsys", "torch", "torch_memory"]:
+        if omega_profiler_config.get("tool", None) in ["npu", "nsys", "torch", "torch_memory", "precision_debugger"]:
             tool_config = omega_conf_to_dataclass(
                 omega_profiler_config.get("tool_config", {}).get(omega_profiler_config.get("tool"))
             )
@@ -610,6 +619,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             backend = checkpoint_engine_config.backend
             bucket_size = checkpoint_engine_config.update_weights_bucket_megabytes << 20
             engine_kwargs = checkpoint_engine_config.engine_kwargs.get(backend, {})
+            # If custom_backend_module is set, import it so plugins can register
+            # in CheckpointEngineRegistry before the backend is instantiated.
+            import_external_libs(checkpoint_engine_config.custom_backend_module or None)
             self.checkpoint_engine = CheckpointEngineRegistry.new(
                 backend, is_master=(torch.distributed.get_rank() == 0), bucket_size=bucket_size, **engine_kwargs
             )
@@ -684,16 +696,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         log_gpu_memory_usage("Before resume weights", logger=logger)
 
         # 1. resume rollout memory (weights were released during sleep)
-        # When sleep_level=1 (adapter mode), sleep() only released kv_cache,
-        # so skip the weight resume to avoid a no-op sglang call.
         if self.config.rollout.free_cache_engine:
-            if getattr(self.rollout, "sleep_level", 2) != 1:
-                await self.rollout.resume(tags=["weights"])
+            await self.rollout.resume(tags=["weights"])
         log_gpu_memory_usage("After resume weights", logger=logger)
 
         # 2. determine if we need a base weight sync (adapter path only)
         per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param(
-            layered_summon=self.layered_summon, base_sync_done=self.base_sync_done
+            layered_summon=self.layered_summon, base_sync_done=True
         )
 
         do_lora_base_sync = False
@@ -701,23 +710,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.rollout.sleep_level = 1
             do_lora_base_sync = not self.base_sync_done
 
-        # 3. sync weights: base first (when needed), then adapter/merged
+        # 3. sync weights: For SGLang, we need base first (when needed), then adapter/merged
         if do_lora_base_sync:
-            # First iteration: per_tensor_param has base params (base_sync_done was False).
-            # Send base weights, then fetch and send adapter deltas.
-            await self.rollout.update_weights(
-                per_tensor_param, peft_config=peft_config, base_sync_done=False, global_steps=global_steps
-            )
-            per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param(
-                layered_summon=self.layered_summon, base_sync_done=True
+            per_tensor_param_base, peft_config = self.actor.engine.get_per_tensor_param(
+                layered_summon=self.layered_summon, base_sync_done=False
             )
             await self.rollout.update_weights(
-                per_tensor_param, peft_config=peft_config, base_sync_done=True, global_steps=global_steps
+                per_tensor_param_base, peft_config=peft_config, base_sync_done=False, global_steps=global_steps
             )
-        else:
-            await self.rollout.update_weights(
-                per_tensor_param, peft_config=peft_config, base_sync_done=self.base_sync_done, global_steps=global_steps
-            )
+
+        await self.rollout.update_weights(
+            per_tensor_param, peft_config=peft_config, base_sync_done=True, global_steps=global_steps
+        )
 
         log_gpu_memory_usage("After update_weights", logger=logger)
 
