@@ -35,6 +35,32 @@ class AutoDraftModel(AutoModelForCausalLMBase):
         if torch_dtype is not None:
             model = model.to(dtype=torch_dtype)
         return model
+    
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: Union[str, os.PathLike[str]],
+        *model_args,
+        **kwargs,
+    ):
+        original_warn = modeling_utils.logger.warning
+
+        def filtered_warning(msg):
+            if "embed_tokens.weight" in str(msg) and "initialized" in str(msg):
+                return
+            original_warn(msg)
+
+        modeling_utils.logger.warning = filtered_warning
+
+        try:
+            model = super().from_pretrained(
+                pretrained_model_name_or_path, *model_args, **kwargs
+            )
+        finally:
+            modeling_utils.logger.warning = original_warn
+
+        return model
+
 
 class AutoEagle3DraftModel(AutoDraftModel):
     _model_mapping = {

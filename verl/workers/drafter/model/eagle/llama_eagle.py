@@ -1348,8 +1348,9 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
 
     def forward(
         self,
+        input_ids: torch.Tensor,
         hidden_states: torch.Tensor,
-        inputs_embeds: torch.Tensor,
+        loss_mask: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
@@ -1362,6 +1363,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             attention_mask (`torch.FloatTensor`): attention mask of size
                 `(batch, 1, tgt_len, src_len)` where padding elements are indicated by very large negative values.
             position_ids (`torch.LongTensor`, *optional*): position ids of shape `(batch, seq_len)`
+            ttt_length (`int`): 预测长度
         """
         if ttt_length == 1:
             logger.info("using ttt_length 1, no need to cache hidden states")
@@ -1374,6 +1376,9 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
 
         # make position ids
         device = hidden_states.device
+
+        current_hidden_states = self.project_hidden_states(hidden_states)
+
         if position_ids is None:
             if past_key_value is not None:
                 past_length = past_key_value.get_usable_length(seq_length)
@@ -1391,26 +1396,53 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             attention_mask, (batch_size, seq_length), hidden_states, 0
         )
 
-        # fc
-        hidden_states = self.project_hidden_states(hidden_states)
-        hidden_states = self.backbone(
-            input_emb=inputs_embeds,
-            hidden_states=hidden_states,
-            cache_hidden=cache_hidden,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=None,
-            output_attentions=False,
-            use_cache=False,
-        )
+        current_position_mask = (input_ids != self.config.pad_token_id).float().unsqueeze(-1)
+        current_loss_mask = loss_mask
+        current_input_ids = input_ids
 
-        # norm
-        last_hidden_states = self.norm(hidden_states)
-        logits = self.compute_logits(hidden_states)
+        all_step_logits = []
+        all_step_loss_masks = []
+        all_step_position_masks = []
+
+        # TTT多步循环
+        for idx in range(ttt_length):
+            is_last = (idx == ttt_length - 1)
+
+            inputs_embeds = self.embed_input_ids(current_input_ids)
+
+            # run the draft model backbone
+            current_hidden_states = self.backbone(
+                input_embeds=inputs_embeds,
+                hidden_states=hidden_states,
+                cache_hidden=cache_hidden,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=None,
+                output_attentions=False,
+                use_cache=False,
+            )
+
+            # 计算logits
+            logits = self.compute_logits(current_hidden_states)
+
+            # 保存当前状态供外层Loss使用
+            all_step_logits.append(logits)
+            all_step_loss_masks.append(current_loss_mask)
+            all_step_position_masks.append(current_position_mask)
+
+            # 更新 Mask 和 Input
+            if not is_last:
+                # 原因：为了模拟“预测下一个词”的过程，我们需要将输入序列向右平移。
+                # 这样在 idx+1 步时，模型实际上是在基于 Token[n+idx] 预测 Token[n+idx+1]
+                current_input_ids = self._shift_right(current_input_ids)
+                current_loss_mask = self._shift_right(current_loss_mask)
+                current_position_mask = self._shift_right(current_position_mask)
 
         return {
-            "logits": logits,
-            "hidden_states": last_hidden_states,
+            "logits": all_step_logits,
+            "loss_masks": all_step_loss_masks,
+            "position_masks": all_step_position_masks,
+            "last_hidden_states": current_hidden_states 
         }
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -1445,6 +1477,12 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             output_attentions=False,
             use_cache=use_cache,
         )
+    
+    def _shift_right(self, x: torch.Tensor):
+        """实现 Teacher Forcing 下的右移填充：舍弃首位，末位补0"""
+        # x: (batch, seq) -> (batch, seq)
+        # 逻辑：将序列整体向左推一格，模拟序列的步进
+        return torch.cat([x[:, 1:], torch.zeros_like(x[:, :1])], dim=-1)
 
 
 class LlamaForCausalLMEagle(EagleDraftModel):

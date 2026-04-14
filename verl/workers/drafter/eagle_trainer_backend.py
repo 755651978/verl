@@ -8,8 +8,7 @@ import torch
 from torch.nn import SmoothL1Loss
 from torch.nn import functional as F
 
-from .model.eagle.llama_eagle import LlamaForCausalLMEagle3, LlamaForCausalLMEagle
-from .model.auto import AutoDraftModelConfig, AutoEagle3DraftModel, AutoEagleDraftModel
+from .model.auto import AutoDraftModelConfig, AutoEagleDraftModel
 
 from verl.utils.torch_functional import (
     get_constant_schedule_with_warmup,
@@ -46,62 +45,32 @@ class EagleTrainerBackend:
         # 1、加载 Config
         if os.path.exists(config_path):
             drafter_config = AutoDraftModelConfig.from_file(config_path)
-            arch_list = getattr(drafter_config, "architectures", [])
-            arch = arch_list[0] if arch_list else "LlamaForCausalLMEagle"
         else:
             drafter_config = deepcopy(self.target_model_config)
             drafter_config.num_hidden_layers = 1
             drafter_config.torch_dtype = torch.bfloat16
             drafter_config.tie_word_embeddings = False
             drafter_config.architectures = ["LlamaForCausalLMEagle"]
-            arch = "LlamaForCausalLMEagle"
 
-        if "Eagle3" in arch:
-            factory_cls = AutoEagle3DraftModel
-        else:
-            factory_cls = AutoEagleDraftModel
+        factory_cls = AutoEagleDraftModel
         
         drafter_module = factory_cls.from_config(drafter_config)
 
         # Initialize model
         if spec_model_path and os.path.exists(spec_model_path):
-            logger.info(f"Loading eagle model from checkpoint: {spec_model_path}")
-            state = self._load_checkpoint_files(spec_model_path)
-
-            renamed_checkpoint = {}
-
-            for key, value in state.items():
-                if not key.startswith("model.") and not key.startswith("lm_head"):
-                    renamed_checkpoint[f"model.{key}"] = value
-                else:
-                    renamed_checkpoint[key] = value
-            del state
-
-            drafter_module.load_state_dict(renamed_checkpoint, strict=False)
-        else:
-            logger.info("Initialized eagle model from scratch")
+            drafter_module = factory_cls.from_pretrained(spec_model_path)
 
         
         # 复用主模型的Embedding和LM_Head
         target_model_path = self.config.actor_rollout_ref.model.path
-        if arch == "LlamaForCausalLMEagle":
-            logger.info("Start load lm_head for eagle")
-            drafter_module.load_lm_head(target_model_path)
-            drafter_module.freeze_lm_head()
-            
+        logger.info("Start load lm_head for eagle")
+        drafter_module.load_lm_head(target_model_path)
+        drafter_module.freeze_lm_head()
         
         drafter_module.load_embedding(target_model_path)
         drafter_module.freeze_embedding()
 
         del base_module
-        
-        # EAGLE-3 特有逻辑：加载词表映射
-        if arch == "LlamaForCausalLMEagle3":
-            mapping_path = getattr(eagle_cfg, "vocab_mapping_path", None)
-
-            if mapping_path and os.path.exists(mapping_path):
-                drafter_module.load_vocab_mapping(mapping_path)
-                logger.info(f"Loaded EAGLE-3 vocab mapping from {mapping_path}")
 
         return drafter_module, drafter_config
 

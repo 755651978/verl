@@ -324,7 +324,7 @@ class RolloutConfig(BaseConfig):
 
     qat: Optional[dict] = None
 
-    drafter: DrafterConfig = field(default_factory=DrafterConfig)
+    drafter: DraftConfig = field(default_factory=DraftConfig)
 
     def __post_init__(self):
         """Validate the rollout config"""
