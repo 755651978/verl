@@ -118,6 +118,21 @@ verl is fast with:
 
 .. toctree::
    :maxdepth: 1
+   :caption: Async Training
+
+   advance/one_step_off
+   advance/fully_async
+   advance/async-on-policy-distill
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Low Precision
+
+   low_precision/fp8.md
+   low_precision/nvfp4_qat.md
+
+.. toctree::
+   :maxdepth: 1
    :caption: Advanced Features
 
    advance/checkpoint
@@ -131,14 +146,10 @@ verl is fast with:
    examples/sandbox_fusion_example
    advance/rollout_trace.rst
    advance/rollout_skip.rst
-   advance/one_step_off
    advance/agent_loop
    advance/reward_loop
-   advance/fully_async
    data/transfer_queue.md
    advance/grafana_prometheus.md
-   advance/fp8.md
-   advance/async-on-policy-distill
    advance/mtp.md
 
 .. toctree::
@@ -155,6 +166,7 @@ verl is fast with:
    ascend_tutorial/features/ascend_backend_features.md
    ascend_tutorial/profiling/ascend_profiling_zh.rst
    ascend_tutorial/profiling/ascend_profiling_en.rst
+   ascend_tutorial/profiling/precision_debugger.md
    ascend_tutorial/examples/gspo_optimization_practice.md
    ascend_tutorial/examples/ascend_performance_analysis_guide.md
    ascend_tutorial/examples/dapo_multi_model_optimization_practice.md
@@ -183,6 +195,12 @@ verl is fast with:
    :caption: FAQ
 
    faq/faq
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Contributing
+
+   contributing/editing-agent-instructions.md
 
 .. toctree::
    :maxdepth: 1
