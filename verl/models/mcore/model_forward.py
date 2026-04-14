@@ -13,7 +13,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 from typing import Optional
 
 import torch
@@ -23,6 +22,8 @@ from verl.utils.megatron_utils import unwrap_model
 from verl.workers.config import MtpConfig
 
 from .util import (
+    build_vlm_attn_mask_bshd,
+    build_vlm_attn_mask_thd,
     postprocess_bshd,
     postprocess_bshd_engine,
     postprocess_packed_seqs,
@@ -278,11 +279,7 @@ def gptmodel_forward_model_engine(
         # For VLM model, need to pass bshd format `input_ids` and `attention_mask`.
         attention_mask = None
         if vision_model:
-            input_ids_rmpad = input_ids.to_padded_tensor(pad_token_id)
-            seqlens_in_batch = input_ids.offsets().diff()
-            attention_mask = torch.zeros_like(input_ids_rmpad, dtype=torch.bool)
-            for i, seqlen in enumerate(seqlens_in_batch):
-                attention_mask[i, :seqlen] = True
+            input_ids_rmpad, attention_mask = build_vlm_attn_mask_thd(input_ids, pad_token_id)
 
         output_orig = model(
             input_ids=input_ids_rmpad,
@@ -352,9 +349,15 @@ def gptmodel_forward_model_engine(
         if logits_processor_args and "loss_mask" in logits_processor_args:
             logits_processor_args.pop("loss_mask")
 
+        # For VLM model, need to pass bshd format `input_ids` and `attention_mask`.
+        if vision_model:
+            input_ids_bshd, attention_mask = build_vlm_attn_mask_bshd(input_ids, batch_size, pad_token_id)
+        else:
+            attention_mask = attention_mask_bshd
+
         output_orig = model(
             input_ids=input_ids_bshd,
-            attention_mask=attention_mask_bshd,
+            attention_mask=attention_mask,
             position_ids=None if vision_model else position_ids_bshd,
             **model_kwargs,
         )
