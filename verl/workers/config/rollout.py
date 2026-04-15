@@ -34,7 +34,7 @@ __all__ = [
     "DiffusionRolloutConfig",
     "CheckpointEngineConfig",
     "SkipConfig",
-    "DrafertConfig",
+    "DrafterConfig",
     "DrafterRolloutConfig",
     "DrafterTrainingConfig",
 ]
