@@ -97,8 +97,8 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
         #     drafter_module.load_vocab_mapping(mapping_path)
         #     logger.info(f"Loaded EAGLE-3 vocab mapping from {mapping_path}")
 
-        target_model_path = self.config.actor_rollout_ref.model.path
-        self.target_model = self._build_target_model(target_model_path)
+        if not self.config.actor_rollout_ref.drafter.training.use_logits:
+            self.target_model = self._build_target_model(target_model_path)
 
         return drafter_module, drafter_config
 
