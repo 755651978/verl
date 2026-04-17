@@ -1,11 +1,9 @@
 import glob
 import json
 import os
-from abc import ABC, abstractmethod
 from typing import Optional
 
 import torch
-import torch.nn as nn
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers.cache_utils import Cache
@@ -55,18 +53,19 @@ def load_checkpoint(model_path: str, key: str) -> torch.Tensor:
         state_dict = torch.load(os.path.join(model_path, ckpt_file))
         return state_dict[key]
 
-class DraftModel(PreTrainedModel, ABC):
-    @abstractmethod
+class DraftModel(PreTrainedModel):
+    
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         """
         Embed the input ids.
         """
+        raise NotImplementedError("Subclasses must implement embed_input_ids")
 
-    @abstractmethod
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
         Compute the logits of the draft model.
         """
+        raise NotImplementedError("Subclasses must implement compute_logits")
 
     def prepare_decoder_attention_mask(
         self,
@@ -80,7 +79,6 @@ class DraftModel(PreTrainedModel, ABC):
         Prepare the attention mask of the draft model.
         """
 
-    @abstractmethod
     def backbone(
         self,
         input_embeds: torch.Tensor,
@@ -94,6 +92,7 @@ class DraftModel(PreTrainedModel, ABC):
         """
         The backbone of the draft model.
         """
+        raise NotImplementedError("Subclasses must implement backbone")
 
     def freeze_embedding(self) -> None:
         """
@@ -123,11 +122,11 @@ class Eagle3DraftModel(DraftModel):
     """
     drafter_model_type = "LlamaForCausalLMEagle3"
 
-    @abstractmethod
     def project_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
         Project the concatenated hidden states from the high, medium and low layers to the target hidden size.
         """
+        raise NotImplementedError("Subclasses must implement project_hidden_states")
     
     def load_vocab_mapping(self, file_path: str) -> None:
         """

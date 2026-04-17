@@ -31,15 +31,14 @@ class EagleTrainerBackend:
 
         self.criterion = SmoothL1Loss(reduction="none")
 
-        # Ulysses Sequence Parallelism configuration
-        self.ulysses_sequence_parallel_size = self.config.actor_rollout_ref.actor.get("ulysses_sequence_parallel_size", 1)
-        self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
+    @property
+    def model_type(self):
+        return "eagle"
 
     def build_model(self):
         """build draft model"""
         logger.info(f"Initializing Eagle model with type: {self.target_model_config.model_type}")
-        eagle_cfg = self.config.actor_rollout_ref.drafter.eagle
-        spec_model_path = eagle_cfg.spec_model_path
+        spec_model_path = self.config.actor_rollout_ref.drafter.model_path
         config_path = os.path.join(spec_model_path, "config.json")
 
         # 1、加载 Config
@@ -58,7 +57,7 @@ class EagleTrainerBackend:
 
         # Initialize model
         if spec_model_path and os.path.exists(spec_model_path):
-            drafter_module = factory_cls.from_pretrained(spec_model_path)
+            drafter_module = factory_cls.from_pretrained(spec_model_path, ignore_mismatched_sizes = True)
 
         
         # 复用主模型的Embedding和LM_Head
@@ -70,52 +69,25 @@ class EagleTrainerBackend:
         drafter_module.load_embedding(target_model_path)
         drafter_module.freeze_embedding()
 
-        del base_module
-
         return drafter_module, drafter_config
-
-    def _load_checkpoint_files(self, path):
-        """内部工具：支持 safetensors 和 bin 格式"""
-        allow_patterns = ["*.safetensors", "*.bin", "*.pt"]
-        hf_weights_files = []
-        for pattern in allow_patterns:
-            files = glob.glob(os.path.join(path, pattern))
-            if files:
-                hf_weights_files = files
-                use_safetensors = (pattern == "*.safetensors")
-                break
-
-        state = {}
-        if use_safetensors:
-            # Load from safetensors files
-            for file in hf_weights_files:
-                with safetensors.safe_open(file, framework="pt", device="cpu") as f:
-                    for name in f.keys():
-                        state[name] = f.get_tensor(name)
-        else:
-            # Load from bin/pt files
-            for file in hf_weights_files:
-                file_state = torch.load(file, map_location="cpu", weights_only=True)
-                state.update(file_state)
-        return state
     
     def setup_optimizer(self, drafter_model, drafter_train_config):
         trainable_params = [p for p in drafter_model.parameters() if p.requires_grad]
 
         optimizer = torch.optim.AdamW(
             trainable_params,
-            lr=drafter_train_config.optim.lr,
+            lr=drafter_train_config.lr,
             betas=(0.9, 0.95),
-            weight_decay=drafter_train_config.optim.get("weight_decay", 1e-2),
+            weight_decay=drafter_train_config.get("weight_decay", 1e-2),
         )
 
         return optimizer
 
 
     def setup_scheduler(self, optimizer, train_cfg):
-        total_steps = train_cfg.optim.get("total_training_steps", 0)
-        num_warmup_steps = int(train_cfg.optim.get("lr_warmup_steps", 1000))
-        warmup_style = train_cfg.optim.get("warmup_style", "constant")
+        total_steps = train_cfg.get("step", 0)
+        num_warmup_steps = int(train_cfg.get("lr_warmup_steps", 1000))
+        warmup_style = train_cfg.get("warmup_style", "constant")
 
         if warmup_style == "constant":
             return get_constant_schedule_with_warmup(
@@ -126,8 +98,8 @@ class EagleTrainerBackend:
                 optimizer=optimizer,
                 num_warmup_steps=num_warmup_steps,
                 num_training_steps=total_steps,
-                min_lr_ratio=train_cfg.optim.get("min_lr_ratio", 0.0),
-                num_cycles=train_cfg.optim.get("num_cycles", 0.5),
+                min_lr_ratio=train_cfg.get("min_lr_ratio", 0.0),
+                num_cycles=train_cfg.get("num_cycles", 0.5),
             )
         # elif warmup_style == "linear":
         #     return get_linear_schedule_with_warmup(
@@ -209,7 +181,7 @@ class EagleTrainerBackend:
         
         return res
     
-    def compute_loss(self, model, batch, _current_pad_size):
+    def compute_loss(self, model, batch, _current_pad_size, logits=None):
         """
         计算 Eagle 特有的V-Loss 和 P-Loss
         """

@@ -1313,9 +1313,11 @@ class LlamaDecoderLayer(nn.Module):
 class LlamaForCausalLMEagle3(Eagle3DraftModel):
 
     config_class = LlamaConfig
+    _no_split_modules = ["LlamaDecoderLayer"]
 
     def __init__(self, config, quant_config=None, attention_backend="sdpa") -> None:
         super().__init__(config)
+        
         self.config = config
         self.quant_config = quant_config
 
@@ -1339,6 +1341,8 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         self.lm_head = nn.Linear(
             config.hidden_size, config.draft_vocab_size, bias=False
         )
+
+        self.post_init()
 
         # create vocab buffers
         t2d = torch.ones(self.vocab_size, dtype=torch.bool)
@@ -1413,7 +1417,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             # run the draft model backbone
             current_hidden_states = self.backbone(
                 input_embeds=inputs_embeds,
-                hidden_states=hidden_states,
+                hidden_states=current_hidden_states,
                 cache_hidden=cache_hidden,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -1488,6 +1492,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
 class LlamaForCausalLMEagle(EagleDraftModel):
 
     config_class = LlamaConfig
+    _no_split_modules = ["LlamaDecoderLayer"]
 
     def __init__(self, config, quant_config=None, attention_backend="sdpa") -> None:
         super().__init__(config)
@@ -1506,7 +1511,7 @@ class LlamaForCausalLMEagle(EagleDraftModel):
 
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = nn.Linear(
-            config.hidden_size, config.draft_vocab_size, bias=False
+            config.hidden_size, self.vocab_size, bias=False
         )
 
         # create vocab buffers
@@ -1517,12 +1522,11 @@ class LlamaForCausalLMEagle(EagleDraftModel):
 
     def forward(
         self,
+        input_ids,
         hidden_states: torch.Tensor,
-        inputs_embeds: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
-        use_cache: bool = False,
     ):
         """
         Arguments:
@@ -1551,11 +1555,14 @@ class LlamaForCausalLMEagle(EagleDraftModel):
             attention_mask, (batch_size, seq_length), hidden_states, past_key_value_length
         )
 
+        input_embeds = self.embed_input_ids(input_ids)
+
         # fc
         hidden_states = self.fc(hidden_states)
-        hidden_states = self.midlayer(
-            input_emb=inputs_embeds,
+        hidden_states = self.backbone(
+            input_emb=input_embeds,
             hidden_states=hidden_states,
+            cache_hidden=None,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_value,
@@ -1578,3 +1585,23 @@ class LlamaForCausalLMEagle(EagleDraftModel):
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         norm_hidden_states = self.norm(hidden_states)
         return self.lm_head(norm_hidden_states)
+    
+    def backbone(
+        self,
+        input_embeds: torch.Tensor,
+        hidden_states: torch.Tensor,
+        cache_hidden: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        past_key_values: Optional[Cache] = None,
+        use_cache: bool = False,
+    ) -> torch.Tensor:
+        return self.midlayer(
+            input_emb=input_embeds,
+            hidden_states=hidden_states,
+            cache_hidden=cache_hidden,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+        )

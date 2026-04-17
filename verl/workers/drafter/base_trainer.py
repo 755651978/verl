@@ -44,6 +44,7 @@ class DrafterBaseTrainer:
         self.rollout_dp_rank = rollout_dp_rank
         self.backend = backend
         self.rank = dist.get_rank() if dist.is_initialized() else 0
+        self.use_data_buffer = config.actor_rollout_ref.drafter.training.get("use_data_buffer", False)
 
         self.training_device_mesh = self._setup_device_mesh()
         
@@ -58,7 +59,7 @@ class DrafterBaseTrainer:
 
         self.collected_data = deque(maxlen=int(self.config.actor_rollout_ref.rollout.get("buffer_max_samples", 2000)))
         self.shared_data_buffer = None
-        self.batch_size = int(self.config.actor_rollout_ref.drafter.training.get("batch_size_per_gpu", 32))
+        self.batch_size = int(self.config.actor_rollout_ref.drafter.training.get("batch_size_per_gpu", 4))
 
         # Initialize DataBuffer for storing data across RL steps
         buffer_max_size = int(self.config.actor_rollout_ref.drafter.training.get("data_buffer_max_size", 10000))
@@ -86,7 +87,7 @@ class DrafterBaseTrainer:
         self.ulysses_sequence_parallel_size = self.config.actor_rollout_ref.actor.get("ulysses_sequence_parallel_size", 1)
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
 
-        self.checkpoint_dir = self.config.actor_rollout_ref.drafter.training.get("checkpoint_path")
+        self.checkpoint_dir = self.config.actor_rollout_ref.drafter.get("checkpoint_path")
 
     def _setup_device_mesh(self):
         infer_tp = self.config.actor_rollout_ref.rollout.tensor_model_parallel_size
@@ -127,7 +128,6 @@ class DrafterBaseTrainer:
         del full_state
 
         # D. 构建优化器和调度器
-        drafter_train_config = self.config.actor_rollout_ref.eagle.train.copy()
         drafter_train_config = self._prepare_training_config(self.config.actor_rollout_ref)
 
         self.oprimizer = self.backend.setup_optimizer(self.model, drafter_train_config)
@@ -145,15 +145,15 @@ class DrafterBaseTrainer:
         Returns:
             dict: The prepared training configuration.
         """
-        drafter_train_config = rollout_config['drafter']['train'].copy()
+        drafter_train_config = rollout_config['drafter']['training'].copy()
 
         # Open the dictionary for modification
         with open_dict(drafter_train_config):
             # Update the configuration with required values
             drafter_train_config.update(
                 {
-                    "spec_strategy": rollout_config['drafter']['spec_strategy'],
-                    "spec_model_path": rollout_config['drafter']['eagle']['spec_model_path'],
+                    "speculative_algorithm": rollout_config['drafter']['speculative_algorithm'],
+                    "model_path": rollout_config['drafter']['model_path'],
                     "is_offload_optimizer": False,
                     "is_offload_param": False,
                     "vloss_weight": 1.0,
@@ -213,8 +213,6 @@ class DrafterBaseTrainer:
                     # "optimizer": FSDP.sharded_optim_state_dict(self.model, self.optimizer) if self.optimizer else {},
                     "step": step 
                 } 
-
-            logger.info(f"11111111111111111:{self.training_device_mesh}")
 
             pg = None
             if self.training_device_mesh is not None:
@@ -335,12 +333,11 @@ class DrafterBaseTrainer:
         self.collected_data.append(data_item)
 
     def _prepare_training_batch(
-        self, use_buffer_data: bool = True, buffer_steps: int = 2
+        self, buffer_steps: int = 2
     ) -> Optional[dict[str, torch.Tensor]]:
         """Prepare a batch for training using Ulysses SP to remove padding.
 
         Args:
-            use_buffer_data: If True, use data from DataBuffer (across multiple RL steps)
             buffer_steps: Number of recent RL steps to include data from (only used if use_buffer_data=True)
 
         Returns:
@@ -349,7 +346,7 @@ class DrafterBaseTrainer:
         effective_batch_size = min(self.batch_size, 4)
 
         # Determine data source: DataBuffer (cross-step) or collected_data (current step only)
-        if use_buffer_data and len(self.data_buffer) > 0:
+        if self.use_data_buffer and len(self.data_buffer) > 0:
             # Use data from last N RL steps via DataBuffer
             available_data = self.data_buffer.get_data_from_last_n_steps(buffer_steps)
             if len(available_data) < effective_batch_size:
@@ -393,6 +390,9 @@ class DrafterBaseTrainer:
         loss_mask_concat = torch.cat(preprocessed_lists['masks'], dim=0).unsqueeze(0)  # (1, total_seq_len)
         hidden_states_concat = torch.cat(preprocessed_lists['h_states'], dim=0).unsqueeze(0)  # (1, total_seq_len, hidden_dim)
 
+        if self.backend.model_type == "eagle3":
+            last_hidden_states_concat = torch.cat(preprocessed_lists['last_h_states'], dim=0).unsqueeze(0)
+
         # Create attention mask (all 1s since no padding)
         total_seq_len = input_ids_concat.size(1)
         attn_mask = torch.ones((1, total_seq_len), dtype=torch.long, device=dev)
@@ -412,6 +412,8 @@ class DrafterBaseTrainer:
                 loss_mask_concat = torch.nn.functional.pad(loss_mask_concat, (0, pad_size), value=0.0)
                 hidden_states_concat = torch.nn.functional.pad(hidden_states_concat, (0, 0, 0, pad_size), value=0.0)
                 attn_mask = torch.nn.functional.pad(attn_mask, (0, pad_size), value=0)
+                if self.backend.model_type == "eagle3":
+                    last_hidden_states_concat = torch.nn.functional.pad(last_hidden_states_concat, (0, 0, 0, pad_size), value=0.0)
 
             # Slice for this rank
             from verl.utils.ulysses import slice_input_tensor
@@ -419,6 +421,8 @@ class DrafterBaseTrainer:
             loss_mask_concat = slice_input_tensor(loss_mask_concat, dim=1, padding=False)
             hidden_states_concat = slice_input_tensor(hidden_states_concat, dim=1, padding=False)
             attn_mask = slice_input_tensor(attn_mask, dim=1, padding=False)
+            if self.backend.model_type == "eagle3":
+                last_hidden_states_concat = slice_input_tensor(last_hidden_states_concat, dim=1, padding=False)
 
             # Store pad_size for later gathering
             self._current_pad_size = pad_size
@@ -427,20 +431,25 @@ class DrafterBaseTrainer:
             self._current_pad_size = 0
 
         # Shift for next token prediction
-        target = hidden_states_concat[:, 1:].contiguous()
         loss_mask = loss_mask_concat[:, 1:].contiguous()
         input_ids = input_ids_concat[:, :-1].contiguous()
         attn_mask = attn_mask[:, :-1].contiguous()
         base_h = hidden_states_concat[:, :-1].contiguous()
 
-        return {
+        batch = {
             "input_ids": input_ids,
             "attention_mask": attn_mask,
             "hidden_states": base_h,
-            "target": target,
             "loss_mask": loss_mask,
             "position_ids": position_ids,
         }
+
+        if self.backend.model_type == "eagle3":
+            batch["last_hidden_states"] = last_hidden_states_concat[:, 1:].contiguous()
+        elif self.backend.model_type == "eagle":
+            batch["target"] = hidden_states_concat[:, 1:].contiguous()
+
+        return batch
     
     async def training_step(self, step: int) -> bool:
         try:
@@ -548,3 +557,14 @@ class DrafterBaseTrainer:
             return None
         trainable_state = self._get_trainable_state_dict()
         return {k: v.detach().cpu() for k, v in trainable_state.items() if v.requires_grad}
+    
+    async def cleanup_training(self):
+        # First set training as inactive to prevent further steps
+        self._training_active = False
+        self.collected_data.clear()
+        self.data_buffer.clear()  # Clear the cross-step data buffer
+        self.training_device_mesh = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        self._training_initialized = False
+        self.training_steps = 0

@@ -129,7 +129,7 @@ actor_rollout_ref:
   hybrid_engine: true
   nccl_timeout: 600
   model:
-    path: ~/models/deepseek-llm-7b-chat
+    path: "/nas/disk1/Qwen3-8B"
     custom_chat_template: null
     use_shm: false
     external_lib: null
@@ -149,28 +149,23 @@ actor_rollout_ref:
 
   drafter:
     enable: true
-    spec_strategy: "eagle"
-    bs_threshold: 32
-    eagle:
-      spec_model_path: /model/EAGLE3-LLaMA3.1-Instruct-8B/
-      spec_steps: 8
-      spec_topk: 4
-      spec_verify_tokens: 48
-      tune_algorithm: "BEG"
-      mab_configs: ["8_4_32", "8_4_16", "8_4_8"] # Besides the listed entries, mab_configs automatically appends an external config based on `spec_steps`, `spec_topk`, and `spec_verify_tokens`.
-      mab_bs_threshold: [1, 2, 5, 21]  # Batch size thresholds for BEG algorithm
-    train:
-      enable_drafter_training: false
-      training_interval_steps: 10
+    speculative_algorithm: "eagle"
+    enable_drafter_training: True
+    model_path: "/nas/disk6/ls/angelslim-qwen3-8b-eagle3"
+    checkpoint_path: "/nas/disk6/ls/test_spec/checkpoint-eagle-1"
+    training:
+      collect_hidden_states_from_sgl: True
+      use_data_buffer: False
+      collect_interval_steps: 1
       batch_size_per_gpu: 2
       max_seq_len: 8192
-      max_epochs: 10
-      checkpoint_path: /nas/disk6/ls/test_spec
-      min_workers_for_training: 1
-      collect_hidden_states_from_sgl: True 
-      optim:
-        lr: 1e-6
-        weight_decay: 0.01
-        lr_warmup_steps: 1000
-        min_lr_ratio: null
-        warmup_style: constant 
+      max_epoch: 10
+      step: 100
+      training_interval_steps: 10
+      sample_last_n_steps: 8
+      buffer_capacity_steps: 128
+      train_batches_per_cycle: 4
+      lr: 1e-6
+      lr_warmup_steps: 1000
+      min_lr_ratio: null
+      warmup_style: "constant" 

@@ -53,12 +53,14 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
         self.target_model = None
         self.vocab_size = None
 
+    @property
+    def model_type(self):
+        return "eagle3"
 
     def build_model(self):
         """build eagle3 draft model"""
         logger.info(f"Initializing Eagle3 model with type: {self.target_model_config.model_type}")
-        eagle_cfg = self.config.actor_rollout_ref.drafter.eagle
-        spec_model_path = eagle_cfg.spec_model_path
+        spec_model_path = self.config.actor_rollout_ref.drafter.model_path
         config_path = os.path.join(spec_model_path, "config.json")
 
         # 1、加载 Config
@@ -87,18 +89,16 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
             
         drafter_module.load_embedding(target_model_path)
         drafter_module.freeze_embedding()
-
-        del base_module
         
         # EAGLE-3 特有逻辑：加载词表映射
-        mapping_path = getattr(eagle_cfg, "vocab_mapping_path", None)
+        # mapping_path = getattr(eagle_cfg, "vocab_mapping_path", None)
 
-        if mapping_path and os.path.exists(mapping_path):
-            drafter_module.load_vocab_mapping(mapping_path)
-            logger.info(f"Loaded EAGLE-3 vocab mapping from {mapping_path}")
+        # if mapping_path and os.path.exists(mapping_path):
+        #     drafter_module.load_vocab_mapping(mapping_path)
+        #     logger.info(f"Loaded EAGLE-3 vocab mapping from {mapping_path}")
 
-        if not self.config.actor_rollout_ref.drafter.training.use_logits:
-            self.target_model = self._build_target_model(target_model_path)
+        target_model_path = self.config.actor_rollout_ref.model.path
+        self.target_model = self._build_target_model(target_model_path)
 
         return drafter_module, drafter_config
 
@@ -112,6 +112,82 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
         )
 
         return target_head
+    
+    def preprocess_individual_items(self, items, device, model_config):
+        """
+        针对单条数据：裁剪窗口、生成Mask、确保维度对齐
+        """
+        res = {'ids':[], 'h_states':[], 'masks': [], 'last_h_states': []}
+        max_window = 512
+        pad_id = int(getattr(model_config, "pad_token_id", 0) or 0)
+        h_dim = model_config.hidden_size
+
+        for item in items:
+            # 1. 搬运到GPU
+            ids = item["input_ids"].to(device, non_blocking=True)
+            seq_len = ids.size(0)
+
+            raw_h = item["hidden_states"]
+
+            if isinstance(raw_h, (list, tuple)):
+                # 将hidden_states进行拼接
+                full_h = torch.cat(raw_h, dim=-1).to(device, dtype=torch.bfloat16)
+            else:
+                full_h = raw_h.to(device, dtype=torch.bfloat16)
+
+            h_states = full_h[:, :3*h_dim]
+            last_h_states = full_h[:, 3*h_dim:]
+
+            # 通过统一裁剪或填充将Hidden States与sequence length对齐
+            h_len = h_states.size(0)
+            if h_len < seq_len:
+                # 批量 Padding
+                padding = torch.zeros((seq_len - h_len, h_states.size(-1)), 
+                                    device, dtype=h_states.dtype)
+                h_states = torch.cat([h_states, padding], dim=0)
+            else:
+                h_states = h_states[:seq_len, :]
+
+            # Compute loss_mask if not present (for DataBuffer items)
+            if "loss_mask" not in item:
+                item_loss_mask = torch.zeros_like(ids, dtype=torch.float32)
+                if "prompts" in item and "responses" in item:
+                    prompt_len = item["prompts"].size(0)
+                    response_len = item["responses"].size(0)
+                    for j in range(response_len):
+                        if item["responses"][j] != pad_id:
+                            item_loss_mask[prompt_len + j] = 1.0
+                elif "responses" in item:
+                    response_start = full_len - item["responses"].size(0)
+                    response_mask = (item["responses"] != pad_id).float()
+                    item_loss_mask[response_start:] = response_mask
+                else:
+                    # If no response info, assume all tokens are valid
+                    item_loss_mask[:] = 1.0
+            else:
+                item_loss_mask = item["loss_mask"]
+            
+            # Select window around response tokens
+            nonzero = torch.nonzero(item_loss_mask)
+            full_len = ids.size(0)
+
+            if nonzero.numel() > 0:
+                # 获取 Response 的起止点
+                r_start, r_end = nonzero[0, 0], nonzero[-1, 0] + 1
+                # 尽量让窗口覆盖 Response 区域
+                start_max = max(0, full_len - max_window)
+                start = torch.clamp(r_start - (max_window // 2), min=0, max=start_max).item()
+                end = min(start + max_window, full_len)
+            else:
+                start = max(0, full_len - max_window)
+                end = full_len
+
+            res['ids'].append(ids[start:end])
+            res['h_states'].append(h_states[start:end])
+            res['last_h_states'].append(last_h_states[start:end])
+            res['masks'].append(item_loss_mask[start:end])
+        
+        return res
 
     def compute_loss(self, model, batch, _current_pad_size):
         """
@@ -137,11 +213,58 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
-            position_ids=batch["position_ids"],
+            position_ids=position_ids,
         )
 
         all_step_logits = outputs["logits"]
         all_step_position_mask = outputs["position_masks"]
+
+        # Gather outputs if using Ulysses SP
+        if getattr(self, "use_ulysses_sp", False):
+            from verl.utils.ulysses import gather_outputs_and_unpad
+
+            all_step_logits = [
+                gather_outputs_and_unpad(
+                    hidden_states.squeeze(0),
+                    gather_dim=0,
+                    unpad_dim=0,
+                    padding_size=_current_pad_size,
+                ).unsqueeze(0) for l in all_step_logits
+            ]
+
+            all_step_position_mask = [
+                gather_outputs_and_unpad(
+                    logits.squeeze(0), gather_dim=0, unpad_dim=0, padding_size=_current_pad_size
+                ).unsqueeze(0) for m in all_step_position_mask
+            ]
+
+            last_hidden_states = gather_outputs_and_unpad(
+                last_hidden_states.squeeze(0),
+                gather_dim=0,
+                unpad_dim=0,
+                padding_size=_current_pad_size,
+            ).unsqueeze(0)
+
+            loss_mask = gather_outputs_and_unpad(
+                loss_mask.squeeze(0),
+                gather_dim=0,
+                unpad_dim=0,
+                padding_size=_current_pad_size,
+            ).unsqueeze(0)
+
+            # todo logits聚合
+        else:
+            all_step_logits = all_step_logits
+            all_step_position_mask = all_step_position_mask
+            last_hidden_states = last_hidden_states
+            loss_mask = loss_mask
+
+        if logits is not None:
+            target_logits = logits
+        else:
+            with torch.no_grad():
+                target_logits = self.target_model(last_hidden_states)
+        
         length = len(all_step_logits)
         seq_length = input_ids.shape[1]
 

@@ -8,9 +8,9 @@ from omegaconf import OmegaConf
 from unittest.mock import MagicMock
 from transformers import AutoConfig
 
-from verl.workers.drafter.eagle3_trainer_backend import Eagle3TrainerBackend
+from verl.workers.drafter.eagle_trainer_backend import EagleTrainerBackend
 from verl.workers.drafter.base_trainer import DrafterBaseTrainer
-from verl.workers.drafter.model.eagle import LlamaForCausalLMEagle3
+from verl.workers.drafter.model.eagle import LlamaForCausalLMEagle
 
 
 def setup_real_dist():
@@ -36,7 +36,7 @@ def test_eagle_training_flow():
     target_config = AutoConfig.from_pretrained("/model/Llama-3.2-1B/", trust_remote_code=True)
 
     # 4. 实例化 Backend
-    backend = Eagle3TrainerBackend(
+    backend = EagleTrainerBackend(
         config=config,
         target_model_config=target_config,
     )
@@ -51,19 +51,7 @@ def test_eagle_training_flow():
 
     # 6. 模型初始化
     print("--- 步骤 1: 构建模型 ---")
-    try:
-        trainer.build_draft_model()
-
-        print("\n ✔ 模型构建成功")
-        print(f"模型架构：{type(trainer.model)}")
-        print(f"主模型 Head(TargetHead)：{type(backend.target_model)}")
-
-        # 检查模型是否正确移至 GPU
-        first_param_device = next(trainer.model.parameters()).device
-        print(f"模型当前所在设备：{first_param_device}")
-    except Exception as e:
-        print(f"\n ❌ 模型构建失败！错误信息：\n{str(e)}")
-        raise e
+    trainer.build_draft_model()
 
     # 7. 数据采集测试
     print("--- 步骤 2: 采集在线数据 ---")
@@ -108,6 +96,7 @@ def test_eagle_training_flow():
     else: 
         print("training_step failed (check logs for 'Not enough data' or other warnings).") 
     print("--- 集成测试完成！ ---")
+
 
 if __name__ == "__main__":
     test_eagle_training_flow()
