@@ -545,7 +545,7 @@ class SGLangHttpServer:
                 batch = TensorDict(
                     {
                         "input_ids": torch.cat([torch.tensor(prompt_ids), torch.tensor(token_ids)], dim=0),
-                        "prompts": torch.tensor(prompts),
+                        "prompts": torch.tensor(prompt_ids),
                         "responses": torch.tensor(token_ids)
                     }
                 )
