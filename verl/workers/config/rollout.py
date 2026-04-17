@@ -96,6 +96,8 @@ class DrafterTrainingConfig(BaseConfig):
     lr_warmup_steps: int =1000
     min_lr_ratio: int = None
     warmup_style: str = "constant"
+    use_logits: bool = False
+    logits_topk: int = 128
 
 
 @dataclass
@@ -103,7 +105,7 @@ class DrafterConfig(BaseConfig):
 
     enable: bool = False
     enable_drafter_training: bool = False
-    speculative_algorithm: str = "EAGLE"
+    speculative_algorithm: str = "EAGLE3"
 
     model_path: str ="/path/to/drafter/model"
     checkpoint_path: str ="/path/to/drafter/checkpoint"

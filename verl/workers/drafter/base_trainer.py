@@ -289,7 +289,7 @@ class DrafterBaseTrainer:
             self._training_active = False
             return False
 
-    def collect_online_data(self, batch: dict, hidden_states: list[torch.Tensor]):
+    def collect_online_data(self, batch: dict, hidden_states: torch.Tensor, target_logits: List) -> torch.Tensor:
         """Collect online data from inference for Eagle training.
 
         This method collects data both to the local collected_data deque (for immediate use)
@@ -305,16 +305,27 @@ class DrafterBaseTrainer:
         # 1、异步拷贝，GPU在后台进行数据搬运，避免阻塞Rollout Stream
         with torch.cuda.stream(self.copy_stream):
             cpu_input_ids = input_ids.to('cpu', non_blocking=True)
-            cpu_h_states = [h.to('cpu', non_blocking=True) for h in hidden_states]
+            cpu_h_states = hidden_states.to('cpu', non_blocking=True)
+            cpu_target_logits = target_logits.to('cpu', non_blocking=True)
             cpu_responses = batch.get("responses").to('cpu', non_blocking=True) if "responses" in batch else None
             cpu_prompts = batch.get("prompts").to('cpu', non_blocking=True) if "prompts" in batch else None
+
+        # 对齐长度
+        if cpu_target_logits:
+            seq_length = min(len(cpu_target_logits), len(cpu_input_ids), len(cpu_h_states))
+            cpu_target_logits = cpu_target_logits[:seq_length]
+        else:
+            seq_length = min(len(cpu_input_ids), len(cpu_h_states))
+        cpu_input_ids = cpu_input_ids[:seq_length]
+        cpu_h_states = cpu_h_states[:seq_length]
 
         # 构建要存入的数据项
         data_item = {
             "input_ids": cpu_input_ids,
             "responses": cpu_responses,
             "prompts": cpu_prompts,
-            "hidden_states": cpu_h_states[0] if isinstance(cpu_h_states, list) else cpu_h_states,
+            "hidden_states": cpu_h_states,
+            "target_logits": cpu_target_logits,
         }
         
         # 同步 DataBuffer

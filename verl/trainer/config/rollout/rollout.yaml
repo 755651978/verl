@@ -476,5 +476,7 @@ drafter:
     lr_warmup_steps: 1000
     min_lr_ratio: null
     warmup_style: constant
+    use_logits: false
+    logits_topk: 128
 
 

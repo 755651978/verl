@@ -5,6 +5,7 @@ from copy import deepcopy
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import numpy as np
 
 from .model.auto import AutoDraftModelConfig, AutoEagle3DraftModel
 from .eagle_trainer_backend import EagleTrainerBackend
@@ -13,6 +14,30 @@ from .model.target.target_head import TargetHead
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+
+def reconstruct_logits(target_topk_logits, topk, vocab_size):
+
+    dtype = [('logits', 'f4'), ('idx', 'i4'), ('none', 'O')]
+
+    flat_topk_logits_list = np.array([item for step in target_topk_logits for item in step], dtype=dtype)
+
+    logits_flat = flat_topk_logits_list['logits']
+    indices_flat = flat_topk_logits_list['idx']
+
+    l = len(target_topk_logits)
+
+    final_topk_logits = torch.from_numpy(logits_flat).reshape(l, topk)
+    final_topk_indices = torch.from_numpy(indices_flat).reshape(l, topk)
+
+    # 初始化全为负无穷的张量
+    full_logits = torch.full((l, vocab_size), float('-inf'), device=final_topk_logits.device)
+    # 构建行索引
+    row_indeces = torch.arange(l, device=final_topk_logits.device).unsqueeze(1).expand(-1, topk)
+    # 填入logits
+    full_logits[row_indeces, final_topk_indices] = final_topk_logits
+
+    return full_logits
 
 
 class Eagle3TrainerBackend(EagleTrainerBackend):
@@ -25,6 +50,7 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
         super().__init__(config, target_model_config)
 
         self.target_model = None
+        self.vocab_size = None
 
 
     def build_model(self):
@@ -43,6 +69,8 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
             drafter_config.torch_dtype = torch.bfloat16
             drafter_config.tie_word_embeddings = False
             drafter_config.architectures = ["LlamaForCausalLMEagle3"]
+
+        self.vocab_size = drafter_config.vocab_size
 
         factory_cls = AutoEagle3DraftModel
         
@@ -68,8 +96,8 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
             drafter_module.load_vocab_mapping(mapping_path)
             logger.info(f"Loaded EAGLE-3 vocab mapping from {mapping_path}")
 
-        target_model_path = self.config.actor_rollout_ref.model.path
-        self.target_model = self._build_target_model(target_model_path)
+        if not self.config.actor_rollout_ref.drafter.training.use_logits:
+            self.target_model = self._build_target_model(target_model_path)
 
         return drafter_module, drafter_config
 
@@ -94,9 +122,13 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
         attention_mask = batch["attention_mask"]
         loss_mask = batch["loss_mask"]
 
-        if last_hidden_states is None:
-            raise ValueError("last_hidden_states is required when use_target_model=False")
-        target_logits = self.target_model(last_hidden_states)
+        if self.config.actor_rollout_ref.drafter.training.use_logits:
+            target_topk_logits = batch["target_logits"]
+            target_logits = reconstruct_logits(target_topk_logits[1:], topk=self.config.actor_rollout_ref.drafter.training.logits_topk, vocab_size=self.vocab_size)
+        else:
+            if last_hidden_states is None:
+                raise ValueError("last_hidden_states is required when use_target_model=False")
+            target_logits = self.target_model(last_hidden_states)
 
         # 前向传播
         outputs = model(

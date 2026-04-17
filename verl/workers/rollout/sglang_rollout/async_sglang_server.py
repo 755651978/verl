@@ -454,9 +454,10 @@ class SGLangHttpServer:
             ):
             should_collect = True
             request.update({"return_hidden_states": True})
-            return_logprob = True
-            request.update({"return_logprob": True})
-            request.update({"logprob_start_len": 0})
+            if self.config.drafter.training.use_logits:
+                request.update({"return_logprob": True})
+                request.update({"logprob_start_len": 0})
+                request.update({"top_logprobs_num": self.config.drafter.training.logits_topk})
 
         generate_request = GenerateReqInput(**request)
 
@@ -508,6 +509,10 @@ class SGLangHttpServer:
 
             engine_hidden_states = []
             valid_batch_indices = []  # Track which samples have valid hidden states
+            target_logits = []
+
+            if self.config.drafter.training.use_logits:
+                target_logits = output["meta_info"]["input_top_logprobs"][1:] + output["meta_info"]["output_top_logprobs"]
 
             hidden_states_data = output["meta_info"]["hidden_states"]
             hidden_states_list = []
@@ -533,7 +538,7 @@ class SGLangHttpServer:
                 logger.warning(f"No valid hidden states found for sample {idx}, skipping collection")
 
             # Only collect data if we have valid hidden states
-            if engine_hidden_states is not None:
+            if engine_hidden_states:
 
                 # Create a filtered batch containing only samples with valid hidden states
                 filtered_batch = {}
@@ -552,7 +557,7 @@ class SGLangHttpServer:
                         # Keep non-tensor or non-batch values as-is
                         filtered_batch[key] = value
 
-                self.drafter_manager.background_trainer.collect_online_data(filtered_batch, engine_hidden_states)
+                self.drafter_manager.background_trainer.collect_online_data(filtered_batch, engine_hidden_states, target_logits)
             else:
                 logger.warning(f"[Rank {self._rank}] No engine hidden states to collect for drafter training")
 
