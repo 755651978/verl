@@ -29,9 +29,10 @@ def reconstruct_logits(target_topk_logits, topk, vocab_size):
 
     final_topk_logits = torch.from_numpy(logits_flat).reshape(l, topk)
     final_topk_indices = torch.from_numpy(indices_flat).reshape(l, topk)
-
-    # 初始化全为负无穷的张量
-    full_logits = torch.full((l, vocab_size), float('-inf'), device=final_topk_logits.device)
+    # logprob转为概率
+    final_topk_logits = torch.exp(final_topk_logits)
+    # 初始化全为0的张量
+    full_logits = torch.full((l, vocab_size), float(0), device=final_topk_logits.device)
     # 构建行索引
     row_indeces = torch.arange(l, device=final_topk_logits.device).unsqueeze(1).expand(-1, topk)
     # 填入logits
