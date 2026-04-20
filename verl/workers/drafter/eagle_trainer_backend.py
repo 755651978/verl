@@ -121,8 +121,6 @@ class EagleTrainerBackend:
         for item in items:
             # 1. 搬运到GPU
             ids = item["input_ids"].to(device, non_blocking=True)
-            seq_len = ids.size(0)
-
             raw_h = item["hidden_states"]
 
             if isinstance(raw_h, (list, tuple)):
@@ -130,16 +128,6 @@ class EagleTrainerBackend:
                 h_states = torch.cat(raw_h, dim=-1).to(device, dtype=torch.bfloat16)
             else:
                 h_states = raw_h.to(device, dtype=torch.bfloat16)
-
-            # 通过统一裁剪或填充将Hidden States与sequence length对齐
-            h_len = h_states.size(0)
-            if h_len < seq_len:
-                # 批量 Padding
-                padding = torch.zeros((seq_len - h_len, h_states.size(-1)), 
-                                    device, dtype=h_states.dtype)
-                h_states = torch.cat([h_states, padding], dim=0)
-            else:
-                h_states = h_states[:seq_len, :]
 
             # Compute loss_mask if not present (for DataBuffer items)
             if "loss_mask" not in item:

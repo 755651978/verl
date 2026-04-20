@@ -1,23 +1,20 @@
 import logging
 import os
 import time
-import glob
 from collections import deque
 from typing import Optional
-from copy import deepcopy
-import safetensors
+from typing import List
 from omegaconf import open_dict
 
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
-from torch import optim
 from torch.distributed.device_mesh import DeviceMesh
 from torch.nn import SmoothL1Loss
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import StateDictType, ShardedStateDictConfig
 
-from verl.utils.data_buffer import DataBuffer
+from verl.workers.drafter.data_buffer import DataBuffer
 from verl.utils.fsdp_utils import (
     get_device_id,
     apply_fsdp2,
@@ -78,7 +75,7 @@ class DrafterBaseTrainer:
         # Track the last pending async checkpoint save future
         self._pending_checkpoint_future = None
         self.model = None
-        self.oprimizer = None
+        self.optimizer = None
         self.lr_scheduler = None
         self.drafter_train_config = None
         self._frozen_param_names = {"model.embed_tokens.weight", "lm_head.weight"}
@@ -97,7 +94,7 @@ class DrafterBaseTrainer:
         ]
         return global_device_mesh_list[self.rollout_dp_rank]
 
-    def build_draft_model(self):
+    def _build_draft_model(self):
         """build draft model"""
         logger.info(f"[Rank {self.rollout_dp_rank}] Building drafter model...")
         # A. 实例化模型（委托给backend）
@@ -130,8 +127,8 @@ class DrafterBaseTrainer:
         # D. 构建优化器和调度器
         drafter_train_config = self._prepare_training_config(self.config.actor_rollout_ref)
 
-        self.oprimizer = self.backend.setup_optimizer(self.model, drafter_train_config)
-        self.lr_scheduler = self.backend.setup_scheduler(self.oprimizer, drafter_train_config)
+        self.optimizer = self.backend.setup_optimizer(self.model, drafter_train_config)
+        self.lr_scheduler = self.backend.setup_scheduler(self.optimizer, drafter_train_config)
         self.drafter_train_config = drafter_train_config
         self.model_config = drafter_model_config
         
@@ -193,51 +190,22 @@ class DrafterBaseTrainer:
         if not self.checkpoint_dir:
             return None
 
-        try:
-            checkpoint_path = os.path.join(self.checkpoint_dir, f"eagle_step_{step}")
-            if self.rank == 0:
-                os.makedirs(checkpoint_path, exist_ok=True)
+        checkpoint_path = os.path.join(self.checkpoint_dir, f"eagle_step_{step}")
+        os.makedirs(checkpoint_path, exist_ok=True)
             
-            # Synchronization point: Ensure directory exists before any rank starts writing
-            if self.training_device_mesh is not None:
-                dist.barrier(group=self.training_device_mesh.get_group()) 
-            
-            # Optimization: Sharded save with CPU offloading to maintain GPU compute space 
-            with FSDP.state_dict_type( 
-                self.model, 
-                state_dict_type=StateDictType.SHARDED_STATE_DICT, 
-                state_dict_config=ShardedStateDictConfig(offload_to_cpu=True) 
-            ): 
-                state_dict = { 
-                    "model": self._get_trainable_state_dict(), 
-                    # "optimizer": FSDP.sharded_optim_state_dict(self.model, self.optimizer) if self.optimizer else {},
-                    "step": step 
-                } 
+        # Get trainable state dict (excluding frozen layers)
+        model_state_dict = self._get_trainable_state_dict()
+        optimizer_state_dict = self.optimizer.state_dict() if self.optimizer else {}
 
-            pg = None
-            if self.training_device_mesh is not None:
-                try:
-                    pg = self.training_device_mesh.get_group()
-                except Exception:
-                    pg = None
+        state_dict = {"model": model_state_dict, "optimizer": optimizer_state_dict, "step": step}
 
-            # 单卡保底逻辑
-            if pg is None and dist.is_initialized():
-                pg = dist.group.WORLD
-            
-            save_kwargs = {
-                "state_dict": state_dict, 
-                "checkpoint_id": checkpoint_path, 
-            }
-            if pg is not None:
-                save_kwargs["process_group"] = pg
-
-
-            return dcp.save(**save_kwargs)
-
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"Async checkpoint save failed on rank {self.rank}: {e}")
-            return None
+        # Use DCP async_save - returns a future that can be checked later
+        future = dcp.async_save(
+            state_dict=state_dict,
+            checkpoint_id=checkpoint_path,
+            process_group=self.training_device_mesh.get_group(),
+        )
+        return future
 
     async def activate_training_model(
         self, device_mesh: DeviceMesh, training_ranks: list[int], model_config=None
@@ -252,7 +220,7 @@ class DrafterBaseTrainer:
 
             if self.model is None:
                 logger.info("Draft Model not initialized, calling build_draft_model during activation...")
-                self.build_draft_model(model_config)
+                self._build_draft_model()
 
             # 只有当配置了 offload 或者当前模型不在 CUDA 上时执行加载
             first_param = next(self.model.parameters(), None)
@@ -287,7 +255,7 @@ class DrafterBaseTrainer:
             self._training_active = False
             return False
 
-    def collect_online_data(self, batch: dict, hidden_states: torch.Tensor, target_logits: List) -> torch.Tensor:
+    def collect_online_data(self, batch: dict, hidden_states: torch.Tensor, target_logits: List = None) -> torch.Tensor:
         """Collect online data from inference for Eagle training.
 
         This method collects data both to the local collected_data deque (for immediate use)
@@ -304,33 +272,34 @@ class DrafterBaseTrainer:
         with torch.cuda.stream(self.copy_stream):
             cpu_input_ids = input_ids.to('cpu', non_blocking=True)
             cpu_h_states = hidden_states.to('cpu', non_blocking=True)
-            cpu_target_logits = target_logits.to('cpu', non_blocking=True)
+            cpu_target_logits = target_logits.to('cpu', non_blocking=True) if target_logits is not None else None
             cpu_responses = batch.get("responses").to('cpu', non_blocking=True) if "responses" in batch else None
             cpu_prompts = batch.get("prompts").to('cpu', non_blocking=True) if "prompts" in batch else None
 
-        # 对齐长度
+        torch.cuda.current_stream().wait_stream(self.copy_stream)
+
+        batch_size = cpu_input_ids.size(0)
+
+        # 动态计算最小序列长度
         if cpu_target_logits:
-            seq_length = min(len(cpu_target_logits), len(cpu_input_ids), len(cpu_h_states))
-            cpu_target_logits = cpu_target_logits[:seq_length]
+            seq_length = min(cpu_target_logits.size(1), cpu_input_ids.size(1), cpu_h_states.size(1))
         else:
-            seq_length = min(len(cpu_input_ids), len(cpu_h_states))
-        cpu_input_ids = cpu_input_ids[:seq_length]
-        cpu_h_states = cpu_h_states[:seq_length]
-
-        # 构建要存入的数据项
-        data_item = {
-            "input_ids": cpu_input_ids,
-            "responses": cpu_responses,
-            "prompts": cpu_prompts,
-            "hidden_states": cpu_h_states,
-            "target_logits": cpu_target_logits,
-        }
+            seq_length = min(cpu_input_ids.size(1), cpu_h_states.size(1))
         
-        # 同步 DataBuffer
-        self.data_buffer.add_batch(data_item)
+        for i in range(batch_size):
+            data_item = { 
+                "input_ids": cpu_input_ids[i, :seq_length], 
+                "hidden_states": cpu_h_states[i, :seq_length, :], 
+                "target_logits": cpu_target_logits[i, :seq_length, ...] if cpu_target_logits is not None else None, 
+                "responses": cpu_responses[i] if cpu_responses is not None else None, 
+                "prompts": cpu_prompts[i] if cpu_prompts is not None else None, 
+            }
 
-        # 同步 collect_data (当前步训练直接使用)
-        self.collected_data.append(data_item)
+            # 同步 DataBuffer
+            self.data_buffer.add_batch(data_item)
+
+            # 同步 collect_data (当前步训练直接使用)
+            self.collected_data.append(data_item)
 
     def _prepare_training_batch(
         self, buffer_steps: int = 2
@@ -435,6 +404,7 @@ class DrafterBaseTrainer:
         input_ids = input_ids_concat[:, :-1].contiguous()
         attn_mask = attn_mask[:, :-1].contiguous()
         base_h = hidden_states_concat[:, :-1].contiguous()
+        position_ids = position_ids[:, :-1].contiguous()
 
         batch = {
             "input_ids": input_ids,

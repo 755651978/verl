@@ -97,7 +97,8 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
         #     drafter_module.load_vocab_mapping(mapping_path)
         #     logger.info(f"Loaded EAGLE-3 vocab mapping from {mapping_path}")
 
-        if not self.config.actor_rollout_ref.drafter.training.use_logits:
+        use_logits = self.config.actor_rollout_ref.drafter.training.get("use_logits", False)
+        if not use_logits:
             self.target_model = self._build_target_model(target_model_path)
 
         return drafter_module, drafter_config
@@ -125,7 +126,6 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
         for item in items:
             # 1. 搬运到GPU
             ids = item["input_ids"].to(device, non_blocking=True)
-            seq_len = ids.size(0)
 
             raw_h = item["hidden_states"]
 
@@ -137,16 +137,6 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
 
             h_states = full_h[:, :3*h_dim]
             last_h_states = full_h[:, 3*h_dim:]
-
-            # 通过统一裁剪或填充将Hidden States与sequence length对齐
-            h_len = h_states.size(0)
-            if h_len < seq_len:
-                # 批量 Padding
-                padding = torch.zeros((seq_len - h_len, h_states.size(-1)), 
-                                    device, dtype=h_states.dtype)
-                h_states = torch.cat([h_states, padding], dim=0)
-            else:
-                h_states = h_states[:seq_len, :]
 
             # Compute loss_mask if not present (for DataBuffer items)
             if "loss_mask" not in item:
@@ -198,14 +188,8 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
         last_hidden_states = batch.get("last_hidden_states", None)
         attention_mask = batch["attention_mask"]
         loss_mask = batch["loss_mask"]
-
-        if self.config.actor_rollout_ref.drafter.training.use_logits:
-            target_topk_logits = batch["target_logits"]
-            target_logits = reconstruct_logits(target_topk_logits[1:], topk=self.config.actor_rollout_ref.drafter.training.logits_topk, vocab_size=self.vocab_size)
-        else:
-            if last_hidden_states is None:
-                raise ValueError("last_hidden_states is required when use_target_model=False")
-            target_logits = self.target_model(last_hidden_states)
+        position_ids = batch["position_ids"]
+        use_logits = self.config.actor_rollout_ref.drafter.training.use_logits
 
         # 前向传播
         outputs = model(
@@ -238,13 +222,6 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
                 ).unsqueeze(0) for m in all_step_position_mask
             ]
 
-            last_hidden_states = gather_outputs_and_unpad(
-                last_hidden_states.squeeze(0),
-                gather_dim=0,
-                unpad_dim=0,
-                padding_size=_current_pad_size,
-            ).unsqueeze(0)
-
             loss_mask = gather_outputs_and_unpad(
                 loss_mask.squeeze(0),
                 gather_dim=0,
@@ -252,18 +229,37 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
                 padding_size=_current_pad_size,
             ).unsqueeze(0)
 
-            # todo logits聚合
+            if use_logits:
+                target_topk_logits = gather_outputs_and_unpad(
+                    batch["target_logits"].squeeze(0),
+                    gather_dim=0,
+                    unpad_dim=0,
+                    padding_size=_current_pad_size,
+                ).unsqueeze(0)
+                target_logits = reconstruct_logits(target_topk_logits[1:], topk=self.config.actor_rollout_ref.drafter.training.logits_topk, vocab_size=self.vocab_size)
+            else:
+                if last_hidden_states is None:
+                    raise ValueError("last_hidden_states is required when use_target_model=False")
+                last_hidden_states = gather_outputs_and_unpad(
+                    last_hidden_states.squeeze(0),
+                    gather_dim=0,
+                    unpad_dim=0,
+                    padding_size=_current_pad_size,
+                ).unsqueeze(0)
+                with torch.no_grad():
+                    target_logits = self.target_model(last_hidden_states)
         else:
             all_step_logits = all_step_logits
             all_step_position_mask = all_step_position_mask
-            last_hidden_states = last_hidden_states
             loss_mask = loss_mask
-
-        if logits is not None:
-            target_logits = logits
-        else:
-            with torch.no_grad():
-                target_logits = self.target_model(last_hidden_states)
+            if use_logits:
+                target_topk_logits = batch["target_logits"]
+                target_logits = reconstruct_logits(target_topk_logits[1:], topk=self.config.actor_rollout_ref.drafter.training.logits_topk, vocab_size=self.vocab_size)
+            else:
+                if last_hidden_states is None:
+                    raise ValueError("last_hidden_states is required when use_target_model=False")
+                with torch.no_grad():
+                    target_logits = self.target_model(last_hidden_states)
         
         length = len(all_step_logits)
         seq_length = input_ids.shape[1]
@@ -272,7 +268,7 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
             target=target_logits,
             t2d=model.t2d,
             loss_mask=loss_mask,
-            length=self.length,
+            length=length,
         )
 
         # Clean up large tensors to free memory

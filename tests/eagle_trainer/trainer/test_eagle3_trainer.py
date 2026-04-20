@@ -1,12 +1,10 @@
 import os
-import sys
 import torch
 import torch.distributed as dist
-import asyncio
-import unittest
 from omegaconf import OmegaConf
 from unittest.mock import MagicMock
 from transformers import AutoConfig
+from torch.distributed.device_mesh import init_device_mesh
 
 from verl.workers.drafter.eagle3_trainer_backend import Eagle3TrainerBackend
 from verl.workers.drafter.base_trainer import DrafterBaseTrainer
@@ -16,7 +14,7 @@ from verl.workers.drafter.model.eagle import LlamaForCausalLMEagle3
 def setup_real_dist():
     # 1. 初始化分布式环境（FSDP2 依赖）
     if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
+        dist.init_process_group(backend="cpu:gloo,cuda:nccl")
         local_rank = int(os.environ["LOCAL_RANK"])
         torch.cuda.set_device(local_rank)
         return local_rank
@@ -30,10 +28,10 @@ def test_eagle_training_flow():
     world_size = dist.get_world_size()
        
     # 2、配置加载
-    config = OmegaConf.load("/nas/disk6/ls/workspace/verl-spac-2/tests/eagle_trainer/config/eagle3_trainer.yaml")
+    config = OmegaConf.load("/nas/disk6/ls/workspace/verl-spec-3/tests/eagle_trainer/config/eagle3_trainer.yaml")
 
     # 3、准备模型配置
-    target_config = AutoConfig.from_pretrained("/model/Llama-3.2-1B/", trust_remote_code=True)
+    target_config = AutoConfig.from_pretrained("/nas/disk6/ls/angelslim-qwen3-8b-eagle3", trust_remote_code=True)
 
     # 4. 实例化 Backend
     backend = Eagle3TrainerBackend(
@@ -49,24 +47,8 @@ def test_eagle_training_flow():
         backend=backend
     )
 
-    # 6. 模型初始化
-    print("--- 步骤 1: 构建模型 ---")
-    try:
-        trainer.build_draft_model()
-
-        print("\n ✔ 模型构建成功")
-        print(f"模型架构：{type(trainer.model)}")
-        print(f"主模型 Head(TargetHead)：{type(backend.target_model)}")
-
-        # 检查模型是否正确移至 GPU
-        first_param_device = next(trainer.model.parameters()).device
-        print(f"模型当前所在设备：{first_param_device}")
-    except Exception as e:
-        print(f"\n ❌ 模型构建失败！错误信息：\n{str(e)}")
-        raise e
-
-    # 7. 数据采集测试
-    print("--- 步骤 2: 采集在线数据 ---")
+    # 6. 数据采集测试
+    print("--- 步骤 1: 采集在线数据 ---")
     # 定义 batch 大小和序列长度
     batch_size = 2  # 对应你 config 里的 batch_size_per_gpu
     seq_len = 256
@@ -81,20 +63,36 @@ def test_eagle_training_flow():
         "prompts": torch.randint(0, target_config.vocab_size, (batch_size, prompt_len)),
     }
     # 模拟隐藏层状态
-    mock_hiddens_states = [torch.randn(batch_size, seq_len, hidden_dim)]
+    mock_hiddens_states = torch.randn(batch_size, seq_len, hidden_dim*4)
 
     trainer.collect_online_data(mock_batch, mock_hiddens_states)
     print(f"Data collect. Buffer size: {len(trainer.data_buffer)}")
 
-    # 采集两组数据以满足 batch_size=2
-    # trainer.collect_online_data(mock_batch, mock_h_states)
-    # trainer.collect_online_data(mock_batch, mock_h_states)
+     # 7. 模型初始化
+    print("--- 步骤 2: 激活模型 ---")
+    import asyncio
+    mesh = init_device_mesh("cuda", (world_size,))
+    training_ranks = list(range(world_size))
+    async def activate_model():
+        success = await trainer.activate_training_model(mesh, training_ranks)
+        return success
+    loop = asyncio.get_event_loop() 
+    active_success = loop.run_until_complete(activate_model()) 
+    
+    if active_success:
+        print("\n ✔ 激活模型成功")
+        print(f"模型架构：{type(trainer.model)}")
+        print(f"主模型 Head(TargetHead)：{type(backend.target_model)}")
+        # 检查模型是否正确移至 GPU
+        first_param_device = next(trainer.model.parameters()).device
+        print(f"模型当前所在设备：{first_param_device}")
+    else:
+        print("\n ❌ 模型激活失败")
+        return
 
-    # self.assertEqual(len(trainer.collected_data), 2)
 
     # 8. 训练步执行测试
     print("--- 步骤 3: 执行训练步 ---")
-    import asyncio
     async def run_step():
         success = await trainer.training_step(step=1)
         return success
@@ -107,6 +105,7 @@ def test_eagle_training_flow():
         print(f"Current training steps counter: {trainer.training_steps}") 
     else: 
         print("training_step failed (check logs for 'Not enough data' or other warnings).") 
+        return
     print("--- 集成测试完成！ ---")
 
 if __name__ == "__main__":

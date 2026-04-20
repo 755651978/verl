@@ -1400,7 +1400,10 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             attention_mask, (batch_size, seq_length), hidden_states, 0
         )
 
-        current_position_mask = (input_ids != self.config.pad_token_id).float().unsqueeze(-1)
+        pad_id = self.config.pad_token_id
+        if pad_id is None:
+            pad_id = 0
+        current_position_mask = (input_ids != pad_id).float().unsqueeze(-1)
         current_loss_mask = loss_mask
         current_input_ids = input_ids
 
@@ -1469,6 +1472,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         attention_mask: torch.Tensor,
         position_ids: torch.Tensor,
         past_key_values: Optional[Cache] = None,
+        output_attentions: bool = False,
         use_cache: bool = True,
     ) -> torch.Tensor:
         return self.midlayer(
@@ -1478,7 +1482,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
-            output_attentions=False,
+            output_attentions=output_attentions,
             use_cache=use_cache,
         )
     
