@@ -98,6 +98,8 @@ class DrafterTrainingConfig(BaseConfig):
     warmup_style: str = "constant"
     use_logits: bool = False
     logits_topk: int = 128
+    current_max_samples: int = 2000
+    data_buffer_max_size: int = 10000
 
 
 @dataclass
@@ -109,6 +111,8 @@ class DrafterConfig(BaseConfig):
 
     model_path: str ="/path/to/drafter/model"
     checkpoint_path: str ="/path/to/drafter/checkpoint"
+
+    world_size: int = 16
 
     # rollout configuration for drafter
     rollout: DrafterRolloutConfig = field(default_factory=DrafterRolloutConfig)

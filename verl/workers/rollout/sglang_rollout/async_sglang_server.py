@@ -50,6 +50,7 @@ from verl.workers.rollout.sglang_rollout.sglang_rollout import _set_envs_and_con
 from verl.workers.rollout.sglang_rollout.utils import SGLANG_LORA_NAME
 from verl.workers.rollout.utils import get_max_position_embeddings, run_uvicorn
 from verl.workers.drafter.manager import RolloutDrafterManager
+from verl.workers.drafter.base_drafter import DrafterBaseTrainer
 from tensordict import TensorDict
 
 logger = logging.getLogger(__file__)
@@ -512,7 +513,7 @@ class SGLangHttpServer:
             target_logits = []
 
             if self.config.drafter.training.use_logits:
-                target_logits = output["meta_info"]["input_top_logprobs"][1:] + output["meta_info"]["output_top_logprobs"]
+                target_logprobs = output["meta_info"]["input_top_logprobs"][1:] + output["meta_info"]["output_top_logprobs"]
 
             hidden_states_data = output["meta_info"]["hidden_states"]
             hidden_states_list = []
@@ -557,7 +558,7 @@ class SGLangHttpServer:
                         # Keep non-tensor or non-batch values as-is
                         filtered_batch[key] = value
 
-                self.drafter_manager.background_trainer.collect_online_data(filtered_batch, engine_hidden_states, target_logits)
+                self.drafter_manager.background_trainer.collect_online_data(filtered_batch, engine_hidden_states, target_logprobs)
             else:
                 logger.warning(f"[Rank {self._rank}] No engine hidden states to collect for drafter training")
 
@@ -574,14 +575,23 @@ class SGLangHttpServer:
         self.global_steps = global_steps
 
     async def build_drafter_trainer_backend(self, full_config=None):
-        # todo：add fsdp and target_config
         if full_config is not None:
-            if full_config.actor_rollout_ref.drafter.speculative_algorithm == "EAGLE":
+            if full_config.rollout.drafter.speculative_algorithm == "EAGLE":
                 from verl.workers.drafter.eagle_trainer_backend import EagleTrainerBackend
-                self.drafter_manager.trainer_backend = EagleTrainerBackend(full_config)
+                trainer_backend = await EagleTrainerBackend(full_config, full_config.model)
+                logger.info("EagleTrainerBackend initialized!")
+            elif full_config.rollout.drafter.speculative_algorithm == "EAGLE3":
+                from verl.workers.drafter.eagle_trainer_backend import Eagle3TrainerBackend
+                trainer_backend = await Eagle3TrainerBackend(full_config, full_config.model)
+                logger.info("Eagle3TrainerBackend initialized!")
+            else:
+                raise ValueError(f"Unknown drafter algorithm {full_config.rollout.drafter.speculative_algorithm}")
+            self.drafter_manager.trainer_backend = await DrafterBaseTrainer(full_config, full_config.drafter.world_size, self.replica_rank, trainer_backend)
+        else:
+            raise ValueError(f"full_config is None")
 
-    async def train_drafter(self):
-        self.drafter_manager.run_training_loop()
+    async def update_drafter(self):
+        await self.drafter_manager.run_training_loop()
 
     async def abort_all_requests(self):
         await self.tokenizer_manager.pause_generation(PauseGenerationReqInput(mode="abort"))

@@ -106,6 +106,7 @@ class ServerAdapter(BaseRollout):
         model_config: HFModelConfig,
         device_mesh: DeviceMesh,
         replica_rank: int = -1,
+        full_config: Any = None,
     ):
         super().__init__(config, model_config, device_mesh)
         if self.config.get("quantization", None) == "fp8":
@@ -142,6 +143,8 @@ class ServerAdapter(BaseRollout):
         # Set by engine_workers.update_weights() when lora.merge=False.
         self.sleep_level = 2
 
+        self.full_config = full_config
+
     async def _init_server_adapter(self):
         if self._engine is not None:
             return
@@ -176,6 +179,11 @@ class ServerAdapter(BaseRollout):
             launch_server=False,
             trust_remote_code=self.model_config.trust_remote_code,
         )
+
+        if (self.config.drafter.enable
+            and self.config.drafter.enable_drafter_training):
+            print("build drafter trainer backend")
+            await self.server_actor.build_drafter_trainer_backend.remote(self.full_config)
 
     async def resume(self, tags: list[str]):
         """Resume rollout weights or kv cache in GPU memory.

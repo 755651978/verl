@@ -38,7 +38,7 @@ class EagleTrainerBackend:
     def build_model(self):
         """build draft model"""
         logger.info(f"Initializing Eagle model with type: {self.target_model_config.model_type}")
-        spec_model_path = self.config.actor_rollout_ref.drafter.model_path
+        spec_model_path = self.config.rollout.drafter.model_path
         config_path = os.path.join(spec_model_path, "config.json")
 
         # 1、加载 Config
@@ -61,7 +61,7 @@ class EagleTrainerBackend:
 
         
         # 复用主模型的Embedding和LM_Head
-        target_model_path = self.config.actor_rollout_ref.model.path
+        target_model_path = self.config.model.path
         logger.info("Start load lm_head for eagle")
         drafter_module.load_lm_head(target_model_path)
         drafter_module.freeze_lm_head()

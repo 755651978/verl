@@ -601,17 +601,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             # 3.2 initialize rollout engine
             rollout_cls: type[BaseRollout] = get_rollout_class(rollout_config.name, rollout_config.mode)
             self.rollout = rollout_cls(
-                config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
+                config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh, full_config=self.config
             )
 
             # used for LoRA (base_sync_done is unused in merge-only mode but kept for Phase 2 adapter path)
             self.base_sync_done: bool = "dummy" not in self.config.rollout.load_format
             self.layered_summon = self.config.rollout.get("layered_summon", False)
             self.peft_merge: bool = model_config.lora.get("merge", False)
-
-            if (self.config.rollout.drafter.enable
-                and self.config.rollout.drafter.enable_drafter_training):
-                self.init_drafter_trainer_backend()
 
         # 4. build checkpoint engine
         if "actor" in self.role:
@@ -628,12 +624,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # Free cached GPU memory so colocated vLLM processes can see it via cudaMemGetInfo
         aggressive_empty_cache(force_sync=True)
-
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    async def init_drafter_trainer_backend(self):
-        await self.rollout._init_server_adapter()
-        if self.rollout.device_mesh["infer_tp"].get_local_rank() == 0:
-            await self.rollout.server_actor.build_drafter_trainer_backend.remote(self.config)
 
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="ref"))
@@ -658,7 +648,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         output = self.actor.train_mini_batch(data=data)
         return output.cpu() if output is not None else None
 
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
     def update_drafter(self):
         self.rollout.update_drafter()
 

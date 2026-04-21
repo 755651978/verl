@@ -14,6 +14,7 @@ from torch.nn import SmoothL1Loss
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import StateDictType, ShardedStateDictConfig
 
+from verl.utils.device import get_device_name
 from verl.workers.drafter.data_buffer import DataBuffer
 from verl.utils.fsdp_utils import (
     get_device_id,
@@ -27,6 +28,7 @@ from verl.utils.fsdp_utils import (
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
+device_name = get_device_name()
 
 class DrafterBaseTrainer:
     def __init__(
@@ -41,12 +43,12 @@ class DrafterBaseTrainer:
         self.rollout_dp_rank = rollout_dp_rank
         self.backend = backend
         self.rank = dist.get_rank() if dist.is_initialized() else 0
-        self.use_data_buffer = config.actor_rollout_ref.drafter.training.get("use_data_buffer", False)
+        self.use_data_buffer = config.rollout.drafter.training.get("use_data_buffer", False)
 
         self.training_device_mesh = self._setup_device_mesh()
         
         self.device_id = get_device_id()
-        self.copy_stream = torch.cuda.Stream()
+        self.copy_stream = torch.accelerator.Stream()
 
         self.is_offload_param = False
         self.is_offload_optimizer = False
@@ -54,14 +56,14 @@ class DrafterBaseTrainer:
         self._training_active = False
         self.training_steps = 0
 
-        self.collected_data = deque(maxlen=int(self.config.actor_rollout_ref.rollout.get("buffer_max_samples", 2000)))
+        self.collected_data = deque(maxlen=int(self.config.rollout.drafter.training.get("current_max_samples", 2000)))
         self.shared_data_buffer = None
-        self.batch_size = int(self.config.actor_rollout_ref.drafter.training.get("batch_size_per_gpu", 4))
+        self.batch_size = int(self.config.rollout.drafter.training.get("batch_size_per_gpu", 4))
 
         # Initialize DataBuffer for storing data across RL steps
-        buffer_max_size = int(self.config.actor_rollout_ref.drafter.training.get("data_buffer_max_size", 10000))
+        buffer_max_size = int(self.config.rollout.drafter.training.get("data_buffer_max_size", 10000))
         # Only store hidden states in buffer if we're collecting them during generation
-        collect_hidden_states_from_sgl = bool(self.config.actor_rollout_ref.drafter.training.get("collect_hidden_states_from_sgl", False))
+        collect_hidden_states_from_sgl = bool(self.config.rollout.drafter.training.get("collect_hidden_states_from_sgl", False))
 
         #DataBuffer define
         self.data_buffer = DataBuffer(max_size=buffer_max_size, store_hidden_states=collect_hidden_states_from_sgl)
@@ -70,7 +72,7 @@ class DrafterBaseTrainer:
 
         self._last_ckpt_step = -1
         # New: optional per-step barrier (default False to avoid stalls)
-        self.enable_mesh_barrier = bool(self.config.actor_rollout_ref.drafter.training.get("enable_step_barrier", False))
+        self.enable_mesh_barrier = bool(self.config.rollout.drafter.training.get("enable_step_barrier", False))
 
         # Track the last pending async checkpoint save future
         self._pending_checkpoint_future = None
@@ -81,16 +83,17 @@ class DrafterBaseTrainer:
         self._frozen_param_names = {"model.embed_tokens.weight", "lm_head.weight"}
 
         # Ulysses Sequence Parallelism configuration
-        self.ulysses_sequence_parallel_size = self.config.actor_rollout_ref.actor.get("ulysses_sequence_parallel_size", 1)
+        self.ulysses_sequence_parallel_size = self.config.rollout.get("tensor_model_parallel_size", 1)
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
 
-        self.checkpoint_dir = self.config.actor_rollout_ref.drafter.get("checkpoint_path")
+        self.checkpoint_dir = self.config.rollout.drafter.get("checkpoint_path")
+        self.step = self.config.rollout.drafter.training.step
 
     def _setup_device_mesh(self):
-        infer_tp = self.config.actor_rollout_ref.rollout.tensor_model_parallel_size
+        infer_tp = self.config.rollout.tensor_model_parallel_size
         dp_size = self.world_size // infer_tp
         global_device_mesh_list = [
-            DeviceMesh("cuda", list(range(i * infer_tp, (i + 1) * infer_tp))) for i in range(dp_size)
+            DeviceMesh(device_name, list(range(i * infer_tp, (i + 1) * infer_tp))) for i in range(dp_size)
         ]
         return global_device_mesh_list[self.rollout_dp_rank]
 
@@ -105,7 +108,7 @@ class DrafterBaseTrainer:
         full_state = raw_model.state_dict()
 
         # C. FSDP包装
-        fsdp_config = self.config.actor_rollout_ref.actor.fsdp_config
+        fsdp_config = self.actor.fsdp_config
         mp_policy = MixedPrecisionPolicy(
             param_dtype=torch.bfloat16, reduce_dtype=torch.float32, cast_forward_inputs=True
         )
@@ -125,7 +128,7 @@ class DrafterBaseTrainer:
         del full_state
 
         # D. 构建优化器和调度器
-        drafter_train_config = self._prepare_training_config(self.config.actor_rollout_ref)
+        drafter_train_config = self._prepare_training_config(self.config.rollout)
 
         self.optimizer = self.backend.setup_optimizer(self.model, drafter_train_config)
         self.lr_scheduler = self.backend.setup_scheduler(self.optimizer, drafter_train_config)
@@ -255,7 +258,7 @@ class DrafterBaseTrainer:
             self._training_active = False
             return False
 
-    def collect_online_data(self, batch: dict, hidden_states: torch.Tensor, target_logits: List = None) -> torch.Tensor:
+    def collect_online_data(self, batch: dict, hidden_states: torch.Tensor, target_logprobs: List = None) -> torch.Tensor:
         """Collect online data from inference for Eagle training.
 
         This method collects data both to the local collected_data deque (for immediate use)
@@ -272,7 +275,7 @@ class DrafterBaseTrainer:
         with torch.cuda.stream(self.copy_stream):
             cpu_input_ids = input_ids.to('cpu', non_blocking=True)
             cpu_h_states = hidden_states.to('cpu', non_blocking=True)
-            cpu_target_logits = target_logits.to('cpu', non_blocking=True) if target_logits is not None else None
+            cpu_target_logprobs = target_logprobs.to('cpu', non_blocking=True) if target_logprobs is not None else None
             cpu_responses = batch.get("responses").to('cpu', non_blocking=True) if "responses" in batch else None
             cpu_prompts = batch.get("prompts").to('cpu', non_blocking=True) if "prompts" in batch else None
 
@@ -281,8 +284,8 @@ class DrafterBaseTrainer:
         batch_size = cpu_input_ids.size(0)
 
         # 动态计算最小序列长度
-        if cpu_target_logits:
-            seq_length = min(cpu_target_logits.size(1), cpu_input_ids.size(1), cpu_h_states.size(1))
+        if cpu_target_logprobs:
+            seq_length = min(cpu_target_logprobs.size(1), cpu_input_ids.size(1), cpu_h_states.size(1))
         else:
             seq_length = min(cpu_input_ids.size(1), cpu_h_states.size(1))
         
@@ -290,7 +293,7 @@ class DrafterBaseTrainer:
             data_item = { 
                 "input_ids": cpu_input_ids[i, :seq_length], 
                 "hidden_states": cpu_h_states[i, :seq_length, :], 
-                "target_logits": cpu_target_logits[i, :seq_length, ...] if cpu_target_logits is not None else None, 
+                "target_logprobs": cpu_target_logprobs[i, :seq_length, ...] if cpu_target_logprobs is not None else None,
                 "responses": cpu_responses[i] if cpu_responses is not None else None, 
                 "prompts": cpu_prompts[i] if cpu_prompts is not None else None, 
             }
@@ -436,7 +439,7 @@ class DrafterBaseTrainer:
             return False
 
         # Skip training if we're not collecting hidden states (since we can't train without them)
-        collect_hidden_states_from_sgl = bool(self.config.actor_rollout_ref.drafter.training.get("collect_hidden_states_from_sgl", False))
+        collect_hidden_states_from_sgl = bool(self.config.rollout.drafter.training.get("collect_hidden_states_from_sgl", False))
         if not collect_hidden_states_from_sgl:
             logger.debug(
                 f"[EagleTrainer rank {self.rank}] Skipping training step {step} "
@@ -495,7 +498,7 @@ class DrafterBaseTrainer:
                 f"Step {self.training_steps}: loss={float(loss.item()):.4f}, vloss={float(vloss.item()):.4f}, ploss={float(ploss.item()):.4f}"
             )
         # 异步进行checkpoint保存
-        if self.checkpoint_dir and (step // 100) > self._last_ckpt_step:
+        if self.checkpoint_dir and (self.training_step // self.step) > self._last_ckpt_step:
             # Wait for previous checkpoint to complete before starting a new one
             # This avoids queuing multiple checkpoints and excessive memory usage
             if self._pending_checkpoint_future is not None:
@@ -506,7 +509,7 @@ class DrafterBaseTrainer:
 
             # Launch async checkpoint save without blocking training
             self._pending_checkpoint_future = self._save_checkpoint_async(step, is_final=False)
-            self._last_ckpt_step = step // 100
+            self._last_ckpt_step = self.training_step // self.step
 
         return True
     

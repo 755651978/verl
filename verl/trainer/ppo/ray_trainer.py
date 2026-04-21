@@ -360,6 +360,7 @@ class RayPPOTrainer:
             drop_last=True,
             collate_fn=collate_fn,
             sampler=train_sampler,
+            shuffle=False,
         )
 
         val_batch_size = self.config.data.val_batch_size  # Prefer config value if set

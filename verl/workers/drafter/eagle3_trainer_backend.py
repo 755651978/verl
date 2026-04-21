@@ -16,21 +16,21 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
-def reconstruct_logits(target_topk_logits, topk, vocab_size):
+def reconstruct_logits(target_topk_logprobs, topk, vocab_size):
 
-    dtype = [('logits', 'f4'), ('idx', 'i4'), ('none', 'O')]
+    dtype = [('logprobs', 'f4'), ('idx', 'i4'), ('none', 'O')]
 
-    flat_topk_logits_list = np.array([item for step in target_topk_logits for item in step], dtype=dtype)
+    flat_topk_logprobs_list = np.array([item for step in target_topk_logprobs for item in step], dtype=dtype)
 
-    logits_flat = flat_topk_logits_list['logits']
-    indices_flat = flat_topk_logits_list['idx']
+    logprobs_flat = flat_topk_logprobs_list['logprobs']
+    indices_flat = flat_topk_logprobs_list['idx']
 
-    l = len(target_topk_logits)
+    l = len(target_topk_logprobs)
 
-    final_topk_logits = torch.from_numpy(logits_flat).reshape(l, topk)
+    final_topk_logprobs = torch.from_numpy(logprobs_flat).reshape(l, topk)
     final_topk_indices = torch.from_numpy(indices_flat).reshape(l, topk)
     # logprob转为概率
-    final_topk_logits = torch.exp(final_topk_logits)
+    final_topk_logits = torch.exp(final_topk_logprobs)
     # 初始化全为0的张量
     full_logits = torch.full((l, vocab_size), float(0), device=final_topk_logits.device)
     # 构建行索引
@@ -60,7 +60,7 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
     def build_model(self):
         """build eagle3 draft model"""
         logger.info(f"Initializing Eagle3 model with type: {self.target_model_config.model_type}")
-        spec_model_path = self.config.actor_rollout_ref.drafter.model_path
+        spec_model_path = self.config.rollout.drafter.model_path
         config_path = os.path.join(spec_model_path, "config.json")
 
         # 1、加载 Config
@@ -85,7 +85,7 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
 
         
         # 复用主模型的Embedding和LM_Head
-        target_model_path = self.config.actor_rollout_ref.model.path
+        target_model_path = self.config.model.path
             
         drafter_module.load_embedding(target_model_path)
         drafter_module.freeze_embedding()
@@ -97,7 +97,7 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
         #     drafter_module.load_vocab_mapping(mapping_path)
         #     logger.info(f"Loaded EAGLE-3 vocab mapping from {mapping_path}")
 
-        use_logits = self.config.actor_rollout_ref.drafter.training.get("use_logits", False)
+        use_logits = self.config.rollout.drafter.training.get("use_logits", False)
         if not use_logits:
             self.target_model = self._build_target_model(target_model_path)
 
@@ -230,13 +230,13 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
             ).unsqueeze(0)
 
             if use_logits:
-                target_topk_logits = gather_outputs_and_unpad(
-                    batch["target_logits"].squeeze(0),
+                target_topk_logprobs = gather_outputs_and_unpad(
+                    batch["target_logprobs"].squeeze(0),
                     gather_dim=0,
                     unpad_dim=0,
                     padding_size=_current_pad_size,
                 ).unsqueeze(0)
-                target_logits = reconstruct_logits(target_topk_logits[1:], topk=self.config.actor_rollout_ref.drafter.training.logits_topk, vocab_size=self.vocab_size)
+                target_logits = reconstruct_logits(target_topk_logprobs[1:], topk=self.config.rollout.drafter.training.logits_topk, vocab_size=self.vocab_size)
             else:
                 if last_hidden_states is None:
                     raise ValueError("last_hidden_states is required when use_target_model=False")

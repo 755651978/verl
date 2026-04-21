@@ -455,6 +455,7 @@ drafter:
   speculative_algorithm: EAGLE
   model_path: /path/to/drafter/model
   checkpoint_path: /path/to/drafter/checkpoint
+  world_size: 16
   rollout:
     _target_: verl.workers.config.DrafterRolloutConfig
     spec_steps: 3
@@ -478,5 +479,7 @@ drafter:
     warmup_style: constant
     use_logits: false
     logits_topk: 128
+    current_max_samples: 2000
+    data_buffer_max_size: 10000
 
 

@@ -11,17 +11,19 @@ class RolloutDrafterManager:
         self.trainer_backend = None
 
         # step tracking
-        self.current_rl_step = 0
+        self.current_rl_step = 1
         self.training_interval_steps = rollout_config.drafter.training.get("training_interval_steps")
-        self.collection_interval_steps = rollout_config.drafter.get("training.collection_interval_steps")
+        self.collection_interval_steps = rollout_config.drafter.training.get("training.collection_interval_steps")
         self.step = rollout_config.drafter.training.get("step", 100)
 
 
     async def run_training_loop(self):
         if self.should_train_this_step():
-            success = self.trainer_backend.training_step(self.step)
-            if success:
-                logger.info(f"Successfully trained drafter.")
+            for _ in range(self.step):
+                success = self.trainer_backend.training_step(self.current_rl_step)
+                if success:
+                    logger.info(f"Successfully trained drafter.")
+            self.trainer_backend.cleanup_training()
 
 
     def should_train_this_step(self):
