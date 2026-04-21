@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import logging
 import os
 import time
@@ -99,7 +100,6 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         self.use_prefix_grouper = self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
-        self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
 
         # ==================== SeparateRayPPOTrainer config ====================
         self.global_steps = 0
@@ -247,7 +247,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         queue_len = 0
         while len(queue_samples) < self.required_samples:
             # Get a single sample and wait until there is a sample or None is received
-            sample, queue_len = self.message_queue_client.get_sample_sync()
+            sample, queue_len = await self.message_queue_client.get_sample()
 
             if sample is None:
                 print(
@@ -407,6 +407,14 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         self.global_steps += 1
 
+        self.prev_step_profile = False
+        self.curr_step_profile = (
+            self.global_steps in self.config.global_profiler.steps
+            if self.config.global_profiler.steps is not None
+            else False
+        )
+        self.next_step_profile = False
+
         # Use queue mode, no need for traditional dataloader iterator
         # Initialize to get the first batch of data
         while True:
@@ -460,7 +468,6 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self._fit_save_checkpoint()
         self._fit_stop_profile()
         self._fit_collect_metrics(batch)
-        self._fit_torch_memory()
         self._fit_postprocess_step()
 
     async def _fit_generate(self, batch: DataProto = None) -> DataProto | None:
@@ -523,7 +530,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         )
 
         # Reset staleness in rollouter
-        timing_raw = ray.get(self.rollouter.reset_staleness.remote())
+        timing_raw = await asyncio.wrap_future(self.rollouter.reset_staleness.remote().future())
         self.logger.log(
             data=timing_raw,
             step=self.current_param_version,
@@ -603,7 +610,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         train_val_metrics = await self._validate_process()
 
         # Wait for rollouter validation result and log
-        val_metrics: ValidateMetrics = ray.get(val_future)
+        val_metrics: ValidateMetrics = await asyncio.wrap_future(val_future.future())
         if train_val_metrics:
             # Merge trainer and rollouter validation results
             with marked_timer("timing_s/merge_val", self.timing_raw):
