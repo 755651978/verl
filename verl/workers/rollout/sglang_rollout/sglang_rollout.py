@@ -183,7 +183,15 @@ class ServerAdapter(BaseRollout):
         if (self.config.drafter.enable
             and self.config.drafter.enable_drafter_training):
             print("build drafter trainer backend")
-            await self.server_actor.build_drafter_trainer_backend.remote(self.full_config)
+            if self.device_mesh is None:
+                raise RuntimeError("device_mesh is required to initialize drafter trainer backend")
+            drafter_training_mesh = self.device_mesh["infer_tp"]
+            await self.server_actor.build_drafter_trainer_backend.remote(
+                self.full_config,
+                drafter_training_mesh,
+                self.replica_rank,
+            )
+
 
     async def resume(self, tags: list[str]):
         """Resume rollout weights or kv cache in GPU memory.

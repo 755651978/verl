@@ -189,7 +189,7 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
         attention_mask = batch["attention_mask"]
         loss_mask = batch["loss_mask"]
         position_ids = batch["position_ids"]
-        use_logits = self.config.actor_rollout_ref.drafter.training.use_logits
+        use_logits = self.config.drafter.training.use_logits
 
         # 前向传播
         outputs = model(
@@ -254,7 +254,7 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
             loss_mask = loss_mask
             if use_logits:
                 target_topk_logits = batch["target_logits"]
-                target_logits = reconstruct_logits(target_topk_logits[1:], topk=self.config.actor_rollout_ref.drafter.training.logits_topk, vocab_size=self.vocab_size)
+                target_logits = reconstruct_logits(target_topk_logits[1:], topk=self.config.drafter.training.logits_topk, vocab_size=self.vocab_size)
             else:
                 if last_hidden_states is None:
                     raise ValueError("last_hidden_states is required when use_target_model=False")

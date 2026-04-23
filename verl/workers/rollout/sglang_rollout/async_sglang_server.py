@@ -23,6 +23,7 @@ import ray
 import sglang
 import sglang.srt.entrypoints.engine
 import torch
+from torch.distributed.device_mesh import DeviceMesh
 from packaging import version
 from ray.actor import ActorHandle
 from sglang.srt.entrypoints.http_server import (
@@ -50,7 +51,7 @@ from verl.workers.rollout.sglang_rollout.sglang_rollout import _set_envs_and_con
 from verl.workers.rollout.sglang_rollout.utils import SGLANG_LORA_NAME
 from verl.workers.rollout.utils import get_max_position_embeddings, run_uvicorn
 from verl.workers.drafter.manager import RolloutDrafterManager
-from verl.workers.drafter.base_drafter import DrafterBaseTrainer
+from verl.workers.drafter.base_trainer import DrafterBaseTrainer
 from tensordict import TensorDict
 
 logger = logging.getLogger(__file__)
@@ -359,7 +360,7 @@ class SGLangHttpServer:
             await self.tokenizer_manager.flush_cache()
 
         if self.config.drafter.enable and self.config.drafter.enable_drafter_training:
-            self.drafter_manager_update_rl_steps(self.global_steps)
+            self.drafter_manager.update_rl_steps(self.global_steps)
 
     @property
     def lora_as_adapter(self) -> bool:
@@ -507,60 +508,45 @@ class SGLangHttpServer:
                 )
 
         if should_collect:
-
-            engine_hidden_states = []
-            valid_batch_indices = []  # Track which samples have valid hidden states
-            target_logits = []
-
+            target_logprobs = None
             if self.config.drafter.training.use_logits:
-                target_logprobs = output["meta_info"]["input_top_logprobs"][1:] + output["meta_info"]["output_top_logprobs"]
+                input_top = output.get("meta_info", {}).get("input_top_logprobs", [])
+                output_top = output.get("meta_info", {}).get("output_top_logprobs", [])
+                if len(input_top) > 1:
+                    try:
+                        target_logprobs = torch.tensor(input_top[1:] + output_top, dtype=torch.float32).unsqueeze(0)
+                    except Exception:
+                        logger.warning("Failed to convert top_logprobs to tensor; skip target_logprobs collection")
+                        target_logprobs = None
 
-            hidden_states_data = output["meta_info"]["hidden_states"]
+            hidden_states_data = output.get("meta_info", {}).get("hidden_states", [])
             hidden_states_list = []
-
-            for i in range(len(hidden_states_data)):
-
-                h_states = torch.tensor(hidden_states_data[i], dtype=torch.bfloat16)
-                # Skip empty tensors
+            for hs in hidden_states_data:
+                h_states = torch.tensor(hs, dtype=torch.bfloat16)
                 if h_states.numel() == 0:
                     continue
-                # Ensure proper dimensions [1, hidden_dim] or [seq_len, hidden_dim]
                 if h_states.dim() == 1:
                     h_states = h_states.unsqueeze(0)
                 elif h_states.dim() == 3:
                     h_states = h_states.squeeze(0)
                 hidden_states_list.append(h_states)
 
-            # Concatenate non-empty tensors
-            if hidden_states_list:
-                hidden_states = torch.cat(hidden_states_list, dim=0)
-                engine_hidden_states.append(hidden_states)  # List[ Tensor([seq_len, hidden_dim])]
-            else:
-                logger.warning(f"No valid hidden states found for sample {idx}, skipping collection")
-
-            # Only collect data if we have valid hidden states
-            if engine_hidden_states:
-
-                # Create a filtered batch containing only samples with valid hidden states
-                filtered_batch = {}
-                batch = TensorDict(
+            if hidden_states_list and self.drafter_manager.trainer_backend is not None:
+                # [1, seq_len, hidden_dim]
+                engine_hidden_states = torch.cat(hidden_states_list, dim=0).unsqueeze(0)
+                input_ids = torch.cat([torch.tensor(prompt_ids), torch.tensor(token_ids)], dim=0).unsqueeze(0)
+                filtered_batch = TensorDict(
                     {
-                        "input_ids": torch.cat([torch.tensor(prompt_ids), torch.tensor(token_ids)], dim=0),
-                        "prompts": torch.tensor(prompt_ids),
-                        "responses": torch.tensor(token_ids)
+                        "input_ids": input_ids,
+                        "prompts": torch.tensor(prompt_ids).unsqueeze(0),
+                        "responses": torch.tensor(token_ids).unsqueeze(0),
                     }
                 )
-                for key, value in batch.items():
-                    if isinstance(value, torch.Tensor) and value.size(0) == len(output):
-                        # Filter batch tensor to include only valid indices
-                        filtered_batch[key] = value[valid_batch_indices]
-                    else:
-                        # Keep non-tensor or non-batch values as-is
-                        filtered_batch[key] = value
-
-                self.drafter_manager.background_trainer.collect_online_data(filtered_batch, engine_hidden_states, target_logprobs)
+                self.drafter_manager.trainer_backend.collect_online_data(
+                    filtered_batch, engine_hidden_states, target_logprobs
+                )
             else:
-                logger.warning(f"[Rank {self._rank}] No engine hidden states to collect for drafter training")
+                logger.warning("[SGLangHttpServer] No valid hidden states or trainer backend unavailable")
 
         return TokenOutput(
             token_ids=token_ids,
@@ -574,19 +560,34 @@ class SGLangHttpServer:
         """Set the global steps of the model weights."""
         self.global_steps = global_steps
 
-    async def build_drafter_trainer_backend(self, full_config=None):
+    async def build_drafter_trainer_backend(
+        self,
+        full_config=None,
+        training_device_mesh: DeviceMesh = None,
+        rollout_dp_rank: int | None = None,
+    ):
         if full_config is not None:
+            if training_device_mesh is None:
+                raise ValueError("training_device_mesh must be provided explicitly")
+            
             if full_config.rollout.drafter.speculative_algorithm == "EAGLE":
                 from verl.workers.drafter.eagle_trainer_backend import EagleTrainerBackend
-                trainer_backend = await EagleTrainerBackend(full_config, full_config.model)
+                trainer_backend = EagleTrainerBackend(full_config, full_config.model)
                 logger.info("EagleTrainerBackend initialized!")
             elif full_config.rollout.drafter.speculative_algorithm == "EAGLE3":
-                from verl.workers.drafter.eagle_trainer_backend import Eagle3TrainerBackend
-                trainer_backend = await Eagle3TrainerBackend(full_config, full_config.model)
+                from verl.workers.drafter.eagle3_trainer_backend import Eagle3TrainerBackend
+                trainer_backend = Eagle3TrainerBackend(full_config, full_config.model)
                 logger.info("Eagle3TrainerBackend initialized!")
             else:
                 raise ValueError(f"Unknown drafter algorithm {full_config.rollout.drafter.speculative_algorithm}")
-            self.drafter_manager.trainer_backend = await DrafterBaseTrainer(full_config, full_config.drafter.world_size, self.replica_rank, trainer_backend)
+            resolved_dp_rank = self.replica_rank if rollout_dp_rank is None else rollout_dp_rank
+            self.drafter_manager.trainer_backend = DrafterBaseTrainer(
+                full_config,
+                training_device_mesh.size(),
+                resolved_dp_rank,
+                training_device_mesh,
+                trainer_backend,
+            )
         else:
             raise ValueError(f"full_config is None")
 

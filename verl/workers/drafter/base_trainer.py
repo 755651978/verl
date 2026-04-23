@@ -1,10 +1,12 @@
 import logging
 import os
 import time
+import asyncio
 from collections import deque
 from typing import Optional
 from typing import List
 from omegaconf import open_dict
+from contextlib import nullcontext
 
 import torch
 import torch.distributed as dist
@@ -12,7 +14,6 @@ import torch.distributed.checkpoint as dcp
 from torch.distributed.device_mesh import DeviceMesh
 from torch.nn import SmoothL1Loss
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import StateDictType, ShardedStateDictConfig
 
 from verl.utils.device import get_device_name
 from verl.workers.drafter.data_buffer import DataBuffer
@@ -22,7 +23,9 @@ from verl.utils.fsdp_utils import (
     fsdp2_load_full_state_dict,
     load_fsdp_model_to_gpu,
     load_fsdp_optimizer,
-    MixedPrecisionPolicy
+    MixedPrecisionPolicy,
+    offload_fsdp_model_to_cpu,
+    offload_fsdp_optimizer,
 )
 
 logger = logging.getLogger(__name__)
@@ -36,8 +39,9 @@ class DrafterBaseTrainer:
         config,
         world_size: int,
         rollout_dp_rank: int,
+        training_device_mesh: DeviceMesh,
         backend
-    ):
+    ):   
         self.config = config
         self.world_size = world_size
         self.rollout_dp_rank = rollout_dp_rank
@@ -45,10 +49,12 @@ class DrafterBaseTrainer:
         self.rank = dist.get_rank() if dist.is_initialized() else 0
         self.use_data_buffer = config.rollout.drafter.training.get("use_data_buffer", False)
 
-        self.training_device_mesh = self._setup_device_mesh()
+        if training_device_mesh is None:
+            raise ValueError("training_device_mesh must be provided explicitly for DrafterBaseTrainer")
+        self.training_device_mesh = training_device_mesh
         
         self.device_id = get_device_id()
-        self.copy_stream = torch.accelerator.Stream()
+        self.copy_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
 
         self.is_offload_param = False
         self.is_offload_optimizer = False
@@ -89,13 +95,17 @@ class DrafterBaseTrainer:
         self.checkpoint_dir = self.config.rollout.drafter.get("checkpoint_path")
         self.step = self.config.rollout.drafter.training.step
 
-    def _setup_device_mesh(self):
-        infer_tp = self.config.rollout.tensor_model_parallel_size
-        dp_size = self.world_size // infer_tp
-        global_device_mesh_list = [
-            DeviceMesh(device_name, list(range(i * infer_tp, (i + 1) * infer_tp))) for i in range(dp_size)
-        ]
-        return global_device_mesh_list[self.rollout_dp_rank]
+    def _resolve_fsdp_config(self):
+        # Primary source: actor fsdp config used across PPO training stacks.
+        fsdp_config = None
+        if hasattr(self.config, "actor"):
+            fsdp_config = self.config.actor.get("fsdp_config")
+        # Optional fallback for drafter-local overrides.
+        if fsdp_config is None:
+            fsdp_config = self.config.rollout.drafter.training.get("fsdp_config")
+        if fsdp_config is None:
+            raise ValueError("FSDP config is missing: expect actor_rollout_ref.actor.fsdp_config or drafter override")
+        return fsdp_config
 
     def _build_draft_model(self):
         """build draft model"""
@@ -108,7 +118,7 @@ class DrafterBaseTrainer:
         full_state = raw_model.state_dict()
 
         # C. FSDP包装
-        fsdp_config = self.actor.fsdp_config
+        fsdp_config = self._resolve_fsdp_config()
         mp_policy = MixedPrecisionPolicy(
             param_dtype=torch.bfloat16, reduce_dtype=torch.float32, cast_forward_inputs=True
         )
@@ -210,15 +220,12 @@ class DrafterBaseTrainer:
         )
         return future
 
-    async def activate_training_model(
-        self, device_mesh: DeviceMesh, training_ranks: list[int], model_config=None
-    ) -> bool:
+    async def activate_training_model(self) -> bool:
         # 将模型和优化器状态从CPU加载到GPU，激活草稿模型进入训练状态
         start_ts = time.time()
         try:        
             logger.info(
                 f"[Trainer rank {getattr(self, 'rank', -1)}] activate_training_model enter "
-                f"training_ranks={training_ranks}"
             )
 
             if self.model is None:
@@ -229,7 +236,7 @@ class DrafterBaseTrainer:
             first_param = next(self.model.parameters(), None)
             is_on_cuda = first_param is not None and first_param.device.type == "cuda"
 
-            if self.is_offload_param or is_on_cuda:
+            if self.is_offload_param or not is_on_cuda:
                 # 调用工具将 FSDP 分片移动到 GPU
                 load_fsdp_model_to_gpu(self.model)
                 logger.debug("Loaded drafter model to GPU for training")
@@ -240,14 +247,11 @@ class DrafterBaseTrainer:
                 load_fsdp_optimizer(optimizer=self.optimizer, device_id=current_dev_id)
                 logger.debug("Loaded drafter optimizer to GPU for training")
 
-            self.training_device_mesh = device_mesh
-
             # 先标记初始化完成，然后开启 active 开关，确保训练循环不会读到中间状态
             self._training_initialized = True
             self._training_active = True
 
             logger.info(
-                f"Drafter training activated with device_mesh={device_mesh}, training_ranks={training_ranks}"
                 f"[EagleTrainer rank {getattr(self, 'rank', -1)}] activate_training_model success "
                 f"elapsed={time.time() - start_ts:.2f}s"
             )
@@ -498,7 +502,7 @@ class DrafterBaseTrainer:
                 f"Step {self.training_steps}: loss={float(loss.item()):.4f}, vloss={float(vloss.item()):.4f}, ploss={float(ploss.item()):.4f}"
             )
         # 异步进行checkpoint保存
-        if self.checkpoint_dir and (self.training_step // self.step) > self._last_ckpt_step:
+        if self.checkpoint_dir and (self.training_steps // self.step) > self._last_ckpt_step:
             # Wait for previous checkpoint to complete before starting a new one
             # This avoids queuing multiple checkpoints and excessive memory usage
             if self._pending_checkpoint_future is not None:
@@ -509,7 +513,7 @@ class DrafterBaseTrainer:
 
             # Launch async checkpoint save without blocking training
             self._pending_checkpoint_future = self._save_checkpoint_async(step, is_final=False)
-            self._last_ckpt_step = self.training_step // self.step
+            self._last_ckpt_step = self.training_steps // self.step
 
         return True
     
@@ -534,6 +538,66 @@ class DrafterBaseTrainer:
     async def cleanup_training(self):
         # First set training as inactive to prevent further steps
         self._training_active = False
+
+        # Wait for any pending async checkpoint save to complete
+        if self._pending_checkpoint_future is not None:
+            logger.debug(f"[Rank {self.rank}] Waiting for pending checkpoint save to complete...")
+            try:
+                # Run the blocking .result() call in executor to avoid blocking the event loop
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, self._pending_checkpoint_future.result)
+                logger.debug(f"[Rank {self.rank}] Pending checkpoint save completed")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"Pending checkpoint save failed: {e}")
+            self._pending_checkpoint_future = None
+
+         # Save final checkpoint and wait for it to complete
+        if self.checkpoint_dir and self.model is not None:
+            final_future = self._save_checkpoint_async(self.training_steps, is_final=True)
+            if final_future is not None:
+                try:
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(None, final_future.result)
+                    logger.info(f"[Rank {self.rank}] Final checkpoint save completed")
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"Final checkpoint save failed: {e}")
+
+        # Clean up distributed resources gracefully
+        if self.training_device_mesh is not None:
+            try:
+                # Give a moment for any pending operations to complete
+                await asyncio.sleep(0.1)
+                if self.training_device_mesh.size() > 1:
+                    # Try to destroy the process group if possible
+                    try:
+                        # Run barrier with timeout to avoid hanging
+                        await asyncio.wait_for(
+                            asyncio.get_event_loop().run_in_executor(
+                                None, lambda: torch.distributed.barrier(self.training_device_mesh.get_group())
+                            ),
+                            timeout=5.0,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Rank {self.rank} barrier timeout during cleanup, continuing anyway")
+                    except Exception:
+                        pass  # Ignore barrier errors during cleanup
+            except Exception as e:
+                logger.debug(f"Process group cleanup error (expected): {e}")
+
+        if self.model is not None:
+            try:
+                offload_fsdp_model_to_cpu(self.model)
+                logger.debug("Offloaded drafter model to CPU after training")
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"Failed to offload drafter model during cleanup: {e}")
+
+        if self.optimizer is not None:
+            try:
+                offload_fsdp_optimizer(self.optimizer)
+                logger.debug("Offloaded drafter optimizer state to CPU after training")
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"Failed to offload drafter optimizer during cleanup: {e}")
+        
         self.collected_data.clear()
         self.data_buffer.clear()  # Clear the cross-step data buffer
         self.training_device_mesh = None
