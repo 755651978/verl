@@ -17,13 +17,13 @@ import dataclasses
 import json
 import logging
 import os
+import math
 from typing import Any, Optional
 
 import ray
 import sglang
 import sglang.srt.entrypoints.engine
 import torch
-from torch.distributed.device_mesh import DeviceMesh
 from packaging import version
 from ray.actor import ActorHandle
 from sglang.srt.entrypoints.http_server import (
@@ -50,14 +50,44 @@ from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutpu
 from verl.workers.rollout.sglang_rollout.sglang_rollout import _set_envs_and_config
 from verl.workers.rollout.sglang_rollout.utils import SGLANG_LORA_NAME
 from verl.workers.rollout.utils import get_max_position_embeddings, run_uvicorn
-from verl.workers.drafter.manager import RolloutDrafterManager
-from verl.workers.drafter.base_trainer import DrafterBaseTrainer
-from tensordict import TensorDict
-
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
 visible_devices_keyword = get_visible_devices_keyword()
+
+
+def _top_logprobs_to_tensor(top_logprobs: list, topk: int) -> Optional[torch.Tensor]:
+    rows = []
+    for step_top_logprobs in top_logprobs:
+        if isinstance(step_top_logprobs, dict):
+            entries = list(step_top_logprobs.values())
+        else:
+            entries = list(step_top_logprobs or [])
+
+        row = []
+        for entry in entries[:topk]:
+            if isinstance(entry, dict):
+                logprob = entry.get("logprob", entry.get("log_probs", entry.get("log_prob")))
+                token_id = entry.get("token_id", entry.get("idx", entry.get("id")))
+            elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                logprob, token_id = entry[0], entry[1]
+            else:
+                continue
+
+            try:
+                row.append([float(logprob), float(int(token_id))])
+            except (TypeError, ValueError):
+                continue
+
+        if not row:
+            continue
+        while len(row) < topk:
+            row.append([-math.inf, 0.0])
+        rows.append(row)
+
+    if not rows:
+        return None
+    return torch.tensor(rows, dtype=torch.float32)
 
 
 class SGLangHttpServer:
@@ -143,13 +173,6 @@ class SGLangHttpServer:
                 f"SGLangHttpServer, replica_rank: {self.replica_rank}, "
                 f"master address: {self._master_address}, port: {self._master_port}"
             )
-        if self.config.drafter.enable:
-            self.drafter_manager = RolloutDrafterManager(rollout_config=self.config, dp_rank=self.replica_rank)
-
-    async def maybe_publish(self):
-        """Get drafter weights from drafter manager"""
-        return self.drafter_manager.maybe_publish()
-
     def get_master_address(self):
         """Get master address and port for init NCCL process group."""
         return self._master_address, self._master_port
@@ -359,9 +382,6 @@ class SGLangHttpServer:
             await self.tokenizer_manager.resume_memory_occupation(obj, None)
             await self.tokenizer_manager.flush_cache()
 
-        if self.config.drafter.enable and self.config.drafter.enable_drafter_training:
-            self.drafter_manager.update_rl_steps(self.global_steps)
-
     @property
     def lora_as_adapter(self) -> bool:
         return (
@@ -449,11 +469,14 @@ class SGLangHttpServer:
 
         # return hidden states
         should_collect = False
-        if (self.config.drafter.enable
+        collect_interval = max(1, int(self.config.drafter.training.collect_interval_steps))
+        collect_this_step = self.global_steps is None or (self.global_steps % collect_interval == 0)
+        if (
+            self.config.drafter.enable
             and self.config.drafter.enable_drafter_training
             and self.config.drafter.training.collect_hidden_states_from_sgl
-            and self.drafter_manager.should_collect_data_this_step()
-            ):
+            and collect_this_step
+        ):
             should_collect = True
             request.update({"return_hidden_states": True})
             if self.config.drafter.training.use_logits:
@@ -507,17 +530,19 @@ class SGLangHttpServer:
                     -1, hf_config.num_hidden_layers, hf_config.num_experts_per_tok
                 )
 
+        drafter_sample = None
         if should_collect:
             target_logprobs = None
             if self.config.drafter.training.use_logits:
                 input_top = output.get("meta_info", {}).get("input_top_logprobs", [])
                 output_top = output.get("meta_info", {}).get("output_top_logprobs", [])
                 if len(input_top) > 1:
-                    try:
-                        target_logprobs = torch.tensor(input_top[1:] + output_top, dtype=torch.float32).unsqueeze(0)
-                    except Exception:
+                    target_logprobs = _top_logprobs_to_tensor(
+                        input_top[1:] + output_top,
+                        int(self.config.drafter.training.logits_topk),
+                    )
+                    if target_logprobs is None:
                         logger.warning("Failed to convert top_logprobs to tensor; skip target_logprobs collection")
-                        target_logprobs = None
 
             hidden_states_data = output.get("meta_info", {}).get("hidden_states", [])
             hidden_states_list = []
@@ -531,68 +556,36 @@ class SGLangHttpServer:
                     h_states = h_states.squeeze(0)
                 hidden_states_list.append(h_states)
 
-            if hidden_states_list and self.drafter_manager.trainer_backend is not None:
-                # [1, seq_len, hidden_dim]
-                engine_hidden_states = torch.cat(hidden_states_list, dim=0).unsqueeze(0)
-                input_ids = torch.cat([torch.tensor(prompt_ids), torch.tensor(token_ids)], dim=0).unsqueeze(0)
-                filtered_batch = TensorDict(
-                    {
-                        "input_ids": input_ids,
-                        "prompts": torch.tensor(prompt_ids).unsqueeze(0),
-                        "responses": torch.tensor(token_ids).unsqueeze(0),
-                    }
-                )
-                self.drafter_manager.trainer_backend.collect_online_data(
-                    filtered_batch, engine_hidden_states, target_logprobs
-                )
+            if hidden_states_list:
+                prompt_tensor = torch.as_tensor(prompt_ids, dtype=torch.long).detach().cpu()
+                response_tensor = torch.tensor(token_ids, dtype=torch.long)
+                drafter_sample = {
+                    "input_ids": torch.cat([prompt_tensor, response_tensor], dim=0).unsqueeze(0),
+                    "prompts": prompt_tensor.unsqueeze(0),
+                    "responses": response_tensor.unsqueeze(0),
+                    "hidden_states": torch.cat(hidden_states_list, dim=0).unsqueeze(0).cpu(),
+                    "target_logprobs": target_logprobs.unsqueeze(0).cpu() if target_logprobs is not None else None,
+                    "global_step": self.global_steps,
+                    "replica_rank": self.replica_rank,
+                }
             else:
-                logger.warning("[SGLangHttpServer] No valid hidden states or trainer backend unavailable")
+                logger.warning("[SGLangHttpServer] No valid hidden states returned for drafter sample collection")
+
+        extra_fields = {"global_steps": self.global_steps}
+        if drafter_sample is not None:
+            extra_fields["drafter_sample"] = drafter_sample
 
         return TokenOutput(
             token_ids=token_ids,
             log_probs=log_probs,
             routed_experts=routed_experts,
             stop_reason=finish_reason,
-            extra_fields={"global_steps": self.global_steps},
+            extra_fields=extra_fields,
         )
 
     async def set_global_steps(self, global_steps: int):
         """Set the global steps of the model weights."""
         self.global_steps = global_steps
-
-    async def build_drafter_trainer_backend(
-        self,
-        full_config=None,
-        training_device_mesh: DeviceMesh = None,
-        rollout_dp_rank: int | None = None,
-    ):
-        if full_config is not None:
-            if training_device_mesh is None:
-                raise ValueError("training_device_mesh must be provided explicitly")
-            
-            if full_config.rollout.drafter.speculative_algorithm == "EAGLE":
-                from verl.workers.drafter.eagle_trainer_backend import EagleTrainerBackend
-                trainer_backend = EagleTrainerBackend(full_config, full_config.model)
-                logger.info("EagleTrainerBackend initialized!")
-            elif full_config.rollout.drafter.speculative_algorithm == "EAGLE3":
-                from verl.workers.drafter.eagle3_trainer_backend import Eagle3TrainerBackend
-                trainer_backend = Eagle3TrainerBackend(full_config, full_config.model)
-                logger.info("Eagle3TrainerBackend initialized!")
-            else:
-                raise ValueError(f"Unknown drafter algorithm {full_config.rollout.drafter.speculative_algorithm}")
-            resolved_dp_rank = self.replica_rank if rollout_dp_rank is None else rollout_dp_rank
-            self.drafter_manager.trainer_backend = DrafterBaseTrainer(
-                full_config,
-                training_device_mesh.size(),
-                resolved_dp_rank,
-                training_device_mesh,
-                trainer_backend,
-            )
-        else:
-            raise ValueError(f"full_config is None")
-
-    async def update_drafter(self):
-        await self.drafter_manager.run_training_loop()
 
     async def abort_all_requests(self):
         await self.tokenizer_manager.pause_generation(PauseGenerationReqInput(mode="abort"))

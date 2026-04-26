@@ -14,6 +14,7 @@
 import functools
 import logging
 import os
+import time
 from contextlib import nullcontext
 from copy import deepcopy
 from functools import partial
@@ -28,7 +29,12 @@ from torch.distributed.device_mesh import init_device_mesh
 
 from verl.checkpoint_engine import CheckpointEngineRegistry
 from verl.single_controller.base import Worker
-from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
+from verl.single_controller.base.decorator import (
+    Dispatch,
+    make_nd_compute_dataproto_dispatch_fn,
+    make_nd_compute_dispatch_fn,
+    register,
+)
 from verl.trainer.distillation import distillation_ppo_loss, is_distillation_enabled
 from verl.utils import tensordict_utils as tu
 from verl.utils.config import omega_conf_to_dataclass
@@ -50,11 +56,17 @@ from verl.workers.config import (
     RolloutConfig,
     TrainingWorkerConfig,
 )
+from verl.workers.engine.fsdp.utils import (
+    build_drafter_training_device_mesh,
+    build_rollout_parallel_layout,
+)
 from verl.workers.rollout.base import BaseRollout, get_rollout_class
 from verl.workers.utils.losses import diffusion_loss, ppo_loss
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+DRAFTER_OWNER_ROUTE_MESH = "drafter_owner_route"
 
 
 def _with_routing_replay_flag(enabled: bool):
@@ -650,9 +662,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         output = self.actor.train_mini_batch(data=data)
         return output.cpu() if output is not None else None
 
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
-    def update_drafter(self):
-        self.rollout.update_drafter()
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    async def update_draft_weights(self, weights: dict[str, torch.Tensor], global_steps: int = None):
+        if not self.config.rollout.drafter.enable:
+            return
+        await self.rollout.update_draft_weights(weights, global_steps=global_steps)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
@@ -741,3 +755,241 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         """
         return getattr(self.checkpoint_engine, method)(*args, **kwargs)
+
+
+class DrafterWorker(Worker):
+    """Standalone drafter worker that runs in parallel with actor/rollout workers.
+
+    The worker receives CPU rollout features from the PPO trainer and trains the
+    drafter model periodically according to global RL steps.
+    """
+
+    def __init__(self, config: DictConfig, role: str = "drafter", **kwargs):
+        Worker.__init__(self)
+        initialize_global_process_group_ray(timeout_second=None)
+        set_numa_affinity()
+        self.config = config
+        self.role = role
+        self.trainer = None
+        self.last_global_step = None
+        self.last_trained_step = None
+        self.training_process_group = None
+        self.dp_process_group = None
+        self.training_group_ranks = []
+        self.training_group_world_size = 1
+        self.dp_group_ranks = []
+        self.dp_group_world_size = 1
+        self.num_rollout_replicas = 1
+        self.training_device_mesh = None
+        self._training_group_initialized = False
+
+        rank = int(os.environ.get("RANK", "0"))
+        self.rank = dist.get_rank() if dist.is_initialized() else rank
+        self.rollout_tp = int(self.config.rollout.tensor_model_parallel_size)
+        self.rollout_dp = int(self.config.rollout.data_parallel_size)
+        self.infer_tp = self.rollout_tp * self.rollout_dp
+        infer_pp = self.config.rollout.pipeline_model_parallel_size
+        self.rollout_world_size = self.infer_tp * infer_pp
+        self.rollout_rank = rank % self.rollout_world_size
+        self.replica_rank = rank // self.rollout_world_size
+        self.local_infer_tp_rank = self.rollout_rank // infer_pp
+        self.local_infer_pp_rank = self.rollout_rank % infer_pp
+        self.local_drafter_sp_rank = None
+        self.in_drafter_train_group = False
+        self.is_drafter_group_leader = False
+        self.global_publish_leader_rank = None
+        self.is_global_publish_leader = False
+
+        self.enable_drafter = bool(
+            self.config.rollout.drafter.enable and self.config.rollout.drafter.enable_drafter_training
+        )
+        self.training_interval_steps = int(self.config.rollout.drafter.training.get("training_interval_steps", 1))
+        self.train_steps_per_trigger = int(self.config.rollout.drafter.training.get("step", 100))
+
+    def _ensure_training_group_initialized(self):
+        if self._training_group_initialized or not dist.is_initialized():
+            return
+
+        world_size = dist.get_world_size()
+        rollout_layout = build_rollout_parallel_layout(
+            world_size=world_size,
+            rollout_tp=self.rollout_tp,
+            rollout_dp=self.rollout_dp,
+            rollout_pp=self.config.rollout.pipeline_model_parallel_size,
+        )
+        self.num_rollout_replicas = rollout_layout.num_replicas
+
+        self.global_publish_leader_rank = (
+            rollout_layout.replica_training_ranks[0][0] if rollout_layout.replica_training_ranks else None
+        )
+        self.is_global_publish_leader = self.rank == self.global_publish_leader_rank
+        self.training_device_mesh = build_drafter_training_device_mesh(get_device_name(), rollout_layout)
+        owner_route_rank = self.num_rollout_replicas
+        owner_route_collect = False
+
+        mesh_coordinate = self.training_device_mesh.get_coordinate()
+        self.in_drafter_train_group = mesh_coordinate is not None
+        if self.in_drafter_train_group:
+            mesh_dp_rank, mesh_sp_rank = mesh_coordinate
+            if mesh_dp_rank != self.replica_rank:
+                raise ValueError(
+                    "Drafter mesh dp coordinate does not match rollout replica rank: "
+                    f"mesh_dp_rank={mesh_dp_rank}, rollout_replica_rank={self.replica_rank}, global_rank={self.rank}"
+                )
+            self.training_process_group = self.training_device_mesh["sp"].get_group()
+            self.dp_process_group = self.training_device_mesh["dp"].get_group()
+            self.training_group_ranks = list(rollout_layout.replica_training_ranks[mesh_dp_rank])
+            self.dp_group_ranks = [
+                rollout_layout.replica_training_ranks[replica_rank][mesh_sp_rank]
+                for replica_rank in range(rollout_layout.num_replicas)
+            ]
+            self.training_group_world_size = self.training_device_mesh["sp"].size()
+            self.dp_group_world_size = self.training_device_mesh["dp"].size()
+            self.local_drafter_sp_rank = mesh_sp_rank
+            self.is_drafter_group_leader = mesh_sp_rank == 0
+            owner_route_rank = self.replica_rank
+            owner_route_collect = self.is_drafter_group_leader
+
+        self._register_dispatch_collect_info(
+            mesh_name=DRAFTER_OWNER_ROUTE_MESH,
+            dp_rank=owner_route_rank,
+            is_collect=owner_route_collect,
+        )
+        self._training_group_initialized = True
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def init_model(self):
+        if not self.enable_drafter:
+            return
+
+        self._ensure_training_group_initialized()
+        if not self.in_drafter_train_group:
+            return
+
+        from verl.workers.drafter.base_trainer import DrafterBaseTrainer
+        from verl.workers.drafter.eagle3_trainer_backend import Eagle3TrainerBackend
+        from verl.workers.drafter.eagle_trainer_backend import EagleTrainerBackend
+
+        algo = str(self.config.rollout.drafter.speculative_algorithm).upper()
+        if algo == "EAGLE":
+            trainer_backend = EagleTrainerBackend(self.config, self.config.model)
+        elif algo == "EAGLE3":
+            trainer_backend = Eagle3TrainerBackend(self.config, self.config.model)
+        else:
+            raise ValueError(f"Unknown drafter algorithm: {self.config.rollout.drafter.speculative_algorithm}")
+
+        # Build drafter around an explicit training mesh; process groups are now
+        # derived views from the mesh for compatibility with APIs that still take groups.
+        self.trainer = DrafterBaseTrainer(
+            config=self.config,
+            world_size=self.training_group_world_size,
+            rollout_dp_rank=self.replica_rank,
+            training_device_mesh=self.training_device_mesh,
+            backend=trainer_backend,
+        )
+
+    def _store_rollout_sample(
+        self,
+        batch: dict,
+        hidden_states: torch.Tensor,
+        target_logprobs: Optional[torch.Tensor] = None,
+    ):
+        if not self.enable_drafter or not self.in_drafter_train_group or self.trainer is None:
+            return
+        self.trainer.collect_online_data(batch, hidden_states, target_logprobs)
+
+    @register(dispatch_mode=make_nd_compute_dispatch_fn(mesh_name=DRAFTER_OWNER_ROUTE_MESH))
+    def collect_rollout_features(self, samples: list[dict]):
+        if not samples:
+            return
+        for sample in samples:
+            if not sample:
+                continue
+            batch = {
+                "input_ids": sample["input_ids"],
+                "prompts": sample["prompts"],
+                "responses": sample["responses"],
+            }
+            self._store_rollout_sample(
+                batch=batch,
+                hidden_states=sample["hidden_states"],
+                target_logprobs=sample.get("target_logprobs"),
+            )
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def set_global_step(self, global_step: int):
+        if not self.enable_drafter or not self.in_drafter_train_group or self.trainer is None:
+            return
+        if global_step is None:
+            return
+        if self.last_global_step == global_step:
+            return
+        self.last_global_step = global_step
+        self.trainer.increment_rl_step(global_step)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    async def train_drafter(self):
+        result = {
+            "trained": False,
+            "triggered": False,
+            "successful_steps": 0,
+            "attempted_steps": 0,
+            "elapsed_sec": 0.0,
+            "reason": "",
+        }
+        if not self.enable_drafter:
+            result["reason"] = "disabled"
+            return result
+        if not self.in_drafter_train_group or self.trainer is None:
+            result["reason"] = "not_in_training_group"
+            return result
+        if self.last_global_step is None:
+            result["reason"] = "missing_global_step"
+            return result
+        if self.training_interval_steps <= 0:
+            result["reason"] = "invalid_interval"
+            return result
+        if self.last_global_step % self.training_interval_steps != 0:
+            result["reason"] = "interval_not_reached"
+            return result
+
+        result["triggered"] = True
+        start_ts = time.time()
+        success = await self.trainer.activate_training_model()
+        if not success:
+            logger.error(
+                f"[DrafterWorker replica={self.replica_rank}] failed to activate trainer at step {self.last_global_step}"
+            )
+            await self.trainer.cleanup_training(clear_data=False)
+            result["reason"] = "activation_failed"
+            result["elapsed_sec"] = time.time() - start_ts
+            return result
+
+        try:
+            for _ in range(self.train_steps_per_trigger):
+                result["attempted_steps"] += 1
+                step_ok = await self.trainer.training_step(self.last_global_step)
+                if step_ok:
+                    result["successful_steps"] += 1
+        finally:
+            await self.trainer.cleanup_training(clear_data=result["successful_steps"] > 0)
+
+        result["trained"] = result["successful_steps"] > 0
+        result["reason"] = "trained" if result["trained"] else "no_trainable_batch"
+        if result["trained"]:
+            self.last_trained_step = self.last_global_step
+        result["elapsed_sec"] = time.time() - start_ts
+        return result
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def maybe_publish(self):
+        if not self.enable_drafter or not self.in_drafter_train_group or self.trainer is None:
+            return None
+        if self.last_global_step is None:
+            return None
+        if self.training_interval_steps <= 0 or self.last_global_step % self.training_interval_steps != 0:
+            return None
+        if self.last_trained_step != self.last_global_step:
+            return None
+        weights = self.trainer.get_model_state_dict()
+        return weights if self.is_global_publish_leader else None

@@ -1640,6 +1640,20 @@ class TaskRunner:
             self.role_worker_mapping[Role.Critic] = ray.remote(TrainingWorker)
             self.mapping[Role.Critic] = "global_pool"
 
+    def add_drafter_worker(self, config):
+        """Add drafter worker to mapping when drafter online training is enabled."""
+        enable_drafter = bool(
+            config.actor_rollout_ref.rollout.drafter.enable
+            and config.actor_rollout_ref.rollout.drafter.enable_drafter_training
+        )
+        if not enable_drafter:
+            return
+
+        from verl.workers.engine_workers import DrafterWorker
+
+        self.role_worker_mapping[Role.Drafter] = ray.remote(DrafterWorker)
+        self.mapping[Role.Drafter] = "global_pool"
+
     def init_resource_pool_mgr(self, config):
         """Initialize resource pool manager."""
 
@@ -1686,6 +1700,7 @@ class TaskRunner:
 
         self.add_actor_rollout_worker(config)
         self.add_critic_worker(config)
+        self.add_drafter_worker(config)
         self.init_resource_pool_mgr(config)
 
         trainer = PPOTrainer(

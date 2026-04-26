@@ -27,6 +27,7 @@ from pprint import pprint
 from typing import Any, Optional
 
 import numpy as np
+import ray
 import torch
 from omegaconf import OmegaConf, open_dict
 from torch.utils.data import Dataset, Sampler
@@ -70,6 +71,7 @@ from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import DistillationConfig, EngineConfig
+from verl.workers.engine.fsdp.utils import build_rollout_parallel_layout
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
 
@@ -294,6 +296,12 @@ class RayPPOTrainer:
         self.use_rm = need_reward_model(self.config)
 
         self.use_critic = need_critic(self.config)
+        self.use_drafter = bool(
+            self.config.actor_rollout_ref.rollout.drafter.enable
+            and self.config.actor_rollout_ref.rollout.drafter.enable_drafter_training
+            and Role.Drafter in role_worker_mapping
+        )
+        self.drafter_wg = None
         self.ray_worker_group_cls = ray_worker_group_cls
         self.device_name = device_name if device_name else self.config.trainer.device
         self.validation_generations_logger = ValidationGenerationsLogger(
@@ -746,6 +754,14 @@ class RayPPOTrainer:
                 role=str(Role.RefPolicy),
             )
             self.resource_pool_to_cls[resource_pool][str(Role.RefPolicy)] = ref_policy_cls
+        if self.use_drafter:
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.Drafter)
+            drafter_cls = RayClassWithInitArgs(
+                cls=self.role_worker_mapping[Role.Drafter],
+                config=self.config.actor_rollout_ref,
+                role=str(Role.Drafter),
+            )
+            self.resource_pool_to_cls[resource_pool][str(Role.Drafter)] = drafter_cls
 
         # initialize WorkerGroup
         # NOTE: if you want to use a different resource pool for each role, which can support different parallel size,
@@ -804,6 +820,9 @@ class RayPPOTrainer:
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
         self.actor_rollout_wg = all_wg[str(actor_role)]
         self.actor_rollout_wg.init_model()
+        if self.use_drafter:
+            self.drafter_wg = all_wg[str(Role.Drafter)]
+            self.drafter_wg.init_model()
 
         if self.ref_in_actor:
             self.ref_policy_wg = self.actor_rollout_wg
@@ -862,7 +881,6 @@ class RayPPOTrainer:
             reward_loop_worker_handles=reward_loop_worker_handles,
             teacher_model_manager=self.teacher_model_manager,
         )
-
         checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
         # Support custom CheckpointEngineManager via config
         checkpoint_manager_class_fqn = self.config.actor_rollout_ref.rollout.get("checkpoint_manager_class")
@@ -878,6 +896,128 @@ class RayPPOTrainer:
 
         # sleep all replicas to load checkpoint
         self.checkpoint_manager.sleep_replicas()
+
+    def _collect_drafter_rollout_features(self, gen_batch_output: DataProto) -> int:
+        if not self.use_drafter or self.drafter_wg is None:
+            return 0
+
+        samples_array = gen_batch_output.non_tensor_batch.pop("drafter_sample", None)
+        if samples_array is None:
+            return 0
+
+        if isinstance(samples_array, np.ndarray):
+            raw_samples = samples_array.tolist()
+        else:
+            raw_samples = list(samples_array)
+
+        samples = [sample for sample in raw_samples if sample is not None]
+        if not samples:
+            return 0
+
+        owner_buckets = self._bucket_drafter_samples_by_owner(samples)
+        self.drafter_wg.collect_rollout_features(owner_buckets)
+        return len(samples)
+
+    def _bucket_drafter_samples_by_owner(self, samples: list[dict]) -> list[list[dict]]:
+        rollout_cfg = self.config.actor_rollout_ref.rollout
+        rollout_layout = build_rollout_parallel_layout(
+            world_size=self.drafter_wg.world_size,
+            rollout_tp=rollout_cfg.tensor_model_parallel_size,
+            rollout_dp=rollout_cfg.data_parallel_size,
+            rollout_pp=rollout_cfg.pipeline_model_parallel_size,
+        )
+        num_replicas = rollout_layout.num_replicas
+        owner_route_mesh = "drafter_owner_route"
+        owner_route_mapping = self.drafter_wg._dispatch_info.get(owner_route_mesh)
+        if owner_route_mapping is None:
+            owner_route_mapping = self.drafter_wg._query_dispatch_info(owner_route_mesh)
+            self.drafter_wg._dispatch_info[owner_route_mesh] = owner_route_mapping
+
+        owner_bucket_count = max(int(dp_rank) for dp_rank in owner_route_mapping) + 1
+        if owner_bucket_count < num_replicas:
+            raise ValueError(
+                "Drafter owner routing mapping must cover every rollout replica: "
+                f"owner_bucket_count={owner_bucket_count}, num_replicas={num_replicas}"
+            )
+        owner_buckets = [[] for _ in range(owner_bucket_count)]
+
+        for sample in samples:
+            replica_rank = sample.get("replica_rank")
+            if replica_rank is None:
+                raise ValueError("drafter_sample is missing replica_rank for owner routing")
+
+            owner_rank = int(replica_rank)
+            if owner_rank < 0 or owner_rank >= num_replicas:
+                raise ValueError(
+                    "drafter_sample replica_rank is out of range for owner routing: "
+                    f"replica_rank={owner_rank}, num_replicas={num_replicas}"
+                )
+            owner_buckets[owner_rank].append(sample)
+
+        return owner_buckets
+
+    def _get_published_drafter_weights(self) -> Optional[dict[str, torch.Tensor]]:
+        if not self.use_drafter or self.drafter_wg is None:
+            return None
+
+        published_weights = self.drafter_wg.maybe_publish() or []
+        non_null_weights = [weights for weights in published_weights if weights is not None]
+        if not non_null_weights:
+            return None
+        if len(non_null_weights) > 1:
+            raise RuntimeError(
+                "Expected at most one published drafter weight snapshot, "
+                f"but received {len(non_null_weights)} results."
+            )
+        return non_null_weights[0]
+
+    def _summarize_drafter_train_results(self, drafter_train_results: list[Any]) -> dict[str, float]:
+        summary = {
+            "drafter/triggered": 0,
+            "drafter/trained": 0,
+            "drafter/skipped": 1,
+            "drafter/successful_steps": 0,
+            "drafter/attempted_steps": 0,
+            "drafter/elapsed_sec": 0.0,
+            "drafter/skip_interval": 0,
+            "drafter/no_trainable_batch": 0,
+            "drafter/activation_failed": 0,
+        }
+        if not drafter_train_results:
+            return summary
+
+        normalized_results = []
+        for result in drafter_train_results:
+            if isinstance(result, dict):
+                normalized_results.append(result)
+            else:
+                normalized_results.append(
+                    {
+                        "trained": bool(result),
+                        "triggered": bool(result),
+                        "successful_steps": int(bool(result)),
+                        "attempted_steps": int(bool(result)),
+                        "elapsed_sec": 0.0,
+                        "reason": "legacy_bool_result",
+                    }
+                )
+
+        summary["drafter/triggered"] = int(any(bool(r.get("triggered")) for r in normalized_results))
+        summary["drafter/trained"] = int(any(bool(r.get("trained")) for r in normalized_results))
+        summary["drafter/skipped"] = int(not summary["drafter/trained"])
+        summary["drafter/successful_steps"] = max(int(r.get("successful_steps", 0)) for r in normalized_results)
+        summary["drafter/attempted_steps"] = max(int(r.get("attempted_steps", 0)) for r in normalized_results)
+        summary["drafter/elapsed_sec"] = max(float(r.get("elapsed_sec", 0.0)) for r in normalized_results)
+        summary["drafter/skip_interval"] = int(
+            any(r.get("reason") == "interval_not_reached" for r in normalized_results)
+        )
+        summary["drafter/no_trainable_batch"] = int(
+            any(r.get("reason") == "no_trainable_batch" for r in normalized_results)
+        )
+        summary["drafter/activation_failed"] = int(
+            any(r.get("reason") == "activation_failed" for r in normalized_results)
+        )
+        return summary
 
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
@@ -1356,6 +1496,11 @@ class RayPPOTrainer:
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
+                        if self.use_drafter and self.drafter_wg is not None:
+                            with marked_timer("collect_drafter", timing_raw):
+                                collected_drafter_samples = self._collect_drafter_rollout_features(gen_batch_output)
+                            metrics["drafter/collected_samples"] = collected_drafter_samples
+                            metrics["drafter/owner_routed_samples"] = collected_drafter_samples
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with marked_timer("gen_max", timing_raw, color="purple"):
@@ -1540,9 +1685,6 @@ class RayPPOTrainer:
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self._update_actor(batch)
 
-                        if self.config.actor_rollout_ref.rollout.drafter.enable_drafter_training:
-                            self.self.actor_rollout_wg.update_drafter()
-
                         # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                         esi_close_to_expiration = should_save_ckpt_esi(
                             max_steps_duration=self.max_steps_duration,
@@ -1568,6 +1710,31 @@ class RayPPOTrainer:
                         # update weights from trainer to rollout
                         with marked_timer("update_weights", timing_raw, color="red"):
                             self.checkpoint_manager.update_weights(self.global_steps)
+
+                        if self.use_drafter and self.drafter_wg is not None:
+                            with marked_timer("train_drafter", timing_raw, color="red"):
+                                self.drafter_wg.set_global_step(self.global_steps)
+                                drafter_train_refs = self.drafter_wg.train_drafter()
+                                drafter_train_results = ray.get(drafter_train_refs) if drafter_train_refs else []
+
+                            drafter_metrics = self._summarize_drafter_train_results(drafter_train_results)
+                            metrics.update(drafter_metrics)
+                            drafter_trained = bool(drafter_metrics["drafter/trained"])
+
+                            if drafter_trained:
+                                with marked_timer("publish_drafter", timing_raw, color="red"):
+                                    metrics["drafter/publish_attempted"] = 1
+                                    drafter_weights = self._get_published_drafter_weights()
+                                    if drafter_weights is not None:
+                                        self.actor_rollout_wg.update_draft_weights(
+                                            drafter_weights, global_steps=self.global_steps
+                                        )
+                                        metrics["drafter/published"] = 1
+                                    else:
+                                        metrics["drafter/published"] = 0
+                            else:
+                                metrics["drafter/publish_attempted"] = 0
+                                metrics["drafter/published"] = 0
 
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)

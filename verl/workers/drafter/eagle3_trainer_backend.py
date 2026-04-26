@@ -10,13 +10,36 @@ import numpy as np
 from .model.auto import AutoDraftModelConfig, AutoEagle3DraftModel
 from .eagle_trainer_backend import EagleTrainerBackend
 from .model.target.target_head import TargetHead
+from verl.utils.fsdp_utils import get_device_id
+from verl.utils.device import get_device_name
 
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
+device_name = get_device_name()
+
 
 def reconstruct_logits(target_topk_logprobs, topk, vocab_size):
+    if isinstance(target_topk_logprobs, torch.Tensor):
+        if target_topk_logprobs.numel() == 0:
+            return torch.empty(
+                target_topk_logprobs.shape[0],
+                vocab_size,
+                dtype=target_topk_logprobs.dtype,
+                device=target_topk_logprobs.device,
+            )
+        logprobs = target_topk_logprobs[..., 0]
+        indices = target_topk_logprobs[..., 1].long().clamp_(0, vocab_size - 1)
+        full_logits = torch.full(
+            (logprobs.size(0), vocab_size),
+            float("-inf"),
+            dtype=logprobs.dtype,
+            device=logprobs.device,
+        )
+        row_indices = torch.arange(logprobs.size(0), device=logprobs.device).unsqueeze(1).expand_as(indices)
+        full_logits[row_indices, indices] = logprobs
+        return full_logits
 
     dtype = [('logprobs', 'f4'), ('idx', 'i4'), ('none', 'O')]
 
@@ -30,11 +53,11 @@ def reconstruct_logits(target_topk_logprobs, topk, vocab_size):
     final_topk_logprobs = torch.from_numpy(logprobs_flat).reshape(l, topk)
     final_topk_indices = torch.from_numpy(indices_flat).reshape(l, topk)
     # logprob转为概率
-    final_topk_logits = torch.exp(final_topk_logprobs)
+    final_topk_logits = final_topk_logprobs
     # 初始化全为0的张量
-    full_logits = torch.full((l, vocab_size), float(0), device=final_topk_logits.device)
+    full_logits = torch.full((l, vocab_size), float("-inf"), device=final_topk_logprobs.device)
     # 构建行索引
-    row_indeces = torch.arange(l, device=final_topk_logits.device).unsqueeze(1).expand(-1, topk)
+    row_indeces = torch.arange(l, device=final_topk_logprobs.device).unsqueeze(1).expand(-1, topk)
     # 填入logits
     full_logits[row_indeces, final_topk_indices] = final_topk_logits
 
@@ -99,7 +122,10 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
 
         use_logits = self.config.rollout.drafter.training.get("use_logits", False)
         if not use_logits:
-            self.target_model = self._build_target_model(target_model_path)
+            target_device = torch.device(f"{device_name}:{get_device_id()}") if device_name != "cpu" else torch.device("cpu")
+            self.target_model = self._build_target_model(target_model_path).to(target_device).eval()
+            for param in self.target_model.parameters():
+                param.requires_grad_(False)
 
         return drafter_module, drafter_config
 
@@ -118,7 +144,7 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
         """
         针对单条数据：裁剪窗口、生成Mask、确保维度对齐
         """
-        res = {'ids':[], 'h_states':[], 'masks': [], 'last_h_states': []}
+        res = {'ids':[], 'h_states':[], 'masks': [], 'last_h_states': [], 'target_logprobs': []}
         max_window = 512
         pad_id = int(getattr(model_config, "pad_token_id", 0) or 0)
         h_dim = model_config.hidden_size
@@ -139,14 +165,16 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
             last_h_states = full_h[:, 3*h_dim:]
 
             # Compute loss_mask if not present (for DataBuffer items)
+            full_len = ids.size(0)
             if "loss_mask" not in item:
                 item_loss_mask = torch.zeros_like(ids, dtype=torch.float32)
                 if "prompts" in item and "responses" in item:
                     prompt_len = item["prompts"].size(0)
                     response_len = item["responses"].size(0)
                     for j in range(response_len):
-                        if item["responses"][j] != pad_id:
-                            item_loss_mask[prompt_len + j] = 1.0
+                        token_idx = prompt_len + j
+                        if token_idx < full_len and item["responses"][j] != pad_id:
+                            item_loss_mask[token_idx] = 1.0
                 elif "responses" in item:
                     response_start = full_len - item["responses"].size(0)
                     response_mask = (item["responses"] != pad_id).float()
@@ -159,7 +187,6 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
             
             # Select window around response tokens
             nonzero = torch.nonzero(item_loss_mask)
-            full_len = ids.size(0)
 
             if nonzero.numel() > 0:
                 # 获取 Response 的起止点
@@ -176,6 +203,8 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
             res['h_states'].append(h_states[start:end])
             res['last_h_states'].append(last_h_states[start:end])
             res['masks'].append(item_loss_mask[start:end])
+            if item.get("target_logprobs") is not None:
+                res["target_logprobs"].append(item["target_logprobs"].to(device, dtype=torch.float32)[start:end])
         
         return res
 
@@ -189,7 +218,8 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
         attention_mask = batch["attention_mask"]
         loss_mask = batch["loss_mask"]
         position_ids = batch["position_ids"]
-        use_logits = self.config.drafter.training.use_logits
+        use_logits = self.config.rollout.drafter.training.use_logits
+        draft_model = model.module if hasattr(model, "module") else model
 
         # 前向传播
         outputs = model(
@@ -209,7 +239,7 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
 
             all_step_logits = [
                 gather_outputs_and_unpad(
-                    hidden_states.squeeze(0),
+                    l.squeeze(0),
                     gather_dim=0,
                     unpad_dim=0,
                     padding_size=_current_pad_size,
@@ -218,7 +248,7 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
 
             all_step_position_mask = [
                 gather_outputs_and_unpad(
-                    logits.squeeze(0), gather_dim=0, unpad_dim=0, padding_size=_current_pad_size
+                    m.squeeze(0), gather_dim=0, unpad_dim=0, padding_size=_current_pad_size
                 ).unsqueeze(0) for m in all_step_position_mask
             ]
 
@@ -236,7 +266,11 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
                     unpad_dim=0,
                     padding_size=_current_pad_size,
                 ).unsqueeze(0)
-                target_logits = reconstruct_logits(target_topk_logprobs[1:], topk=self.config.rollout.drafter.training.logits_topk, vocab_size=self.vocab_size)
+                target_logits = reconstruct_logits(
+                    target_topk_logprobs.squeeze(0),
+                    topk=self.config.rollout.drafter.training.logits_topk,
+                    vocab_size=self.vocab_size,
+                ).unsqueeze(0)
             else:
                 if last_hidden_states is None:
                     raise ValueError("last_hidden_states is required when use_target_model=False")
@@ -253,8 +287,12 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
             all_step_position_mask = all_step_position_mask
             loss_mask = loss_mask
             if use_logits:
-                target_topk_logits = batch["target_logits"]
-                target_logits = reconstruct_logits(target_topk_logits[1:], topk=self.config.drafter.training.logits_topk, vocab_size=self.vocab_size)
+                target_topk_logits = batch["target_logprobs"]
+                target_logits = reconstruct_logits(
+                    target_topk_logits.squeeze(0),
+                    topk=self.config.rollout.drafter.training.logits_topk,
+                    vocab_size=self.vocab_size,
+                ).unsqueeze(0)
             else:
                 if last_hidden_states is None:
                     raise ValueError("last_hidden_states is required when use_target_model=False")
@@ -266,7 +304,7 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
 
         target_p_padded, position_mask = self._compute_target_p_padded(
             target=target_logits,
-            t2d=model.t2d,
+            t2d=draft_model.t2d,
             loss_mask=loss_mask,
             length=length,
         )

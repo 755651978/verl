@@ -279,6 +279,34 @@ def dispatch_lazy_compute_data_proto(mesh_name, worker_group, *args, **kwargs):
     return dispatch_nd_compute_dataproto(dp_rank_mapping, dp_size, worker_group, *args, **kwargs)
 
 
+def dispatch_lazy_compute(mesh_name, worker_group, *args, **kwargs):
+    from verl.single_controller.base.worker_group import WorkerGroup
+
+    assert isinstance(worker_group, WorkerGroup)
+
+    if mesh_name not in worker_group._dispatch_info:
+        worker_group._dispatch_info[mesh_name] = worker_group._query_dispatch_info(mesh_name)
+        assert len(worker_group._dispatch_info[mesh_name]) == worker_group.world_size
+
+    dp_rank_mapping = worker_group._dispatch_info[mesh_name]
+    dp_size = max(dp_rank_mapping) + 1
+    return dispatch_nd_compute(dp_rank_mapping, dp_size, worker_group, *args, **kwargs)
+
+
+def collect_lazy_compute(mesh_name, worker_group, *args, **kwargs):
+    from verl.single_controller.base.worker_group import WorkerGroup
+
+    assert isinstance(worker_group, WorkerGroup)
+    assert mesh_name in worker_group._dispatch_info
+
+    if mesh_name not in worker_group._collect_info:
+        worker_group._collect_info[mesh_name] = worker_group._query_collect_info(mesh_name)
+        assert len(worker_group._collect_info[mesh_name]) == worker_group.world_size
+
+    collect_mask = worker_group._collect_info[mesh_name]
+    return collect_nd_compute(collect_mask, worker_group, *args, **kwargs)
+
+
 def collect_lazy_compute_data_proto(mesh_name, worker_group, *args, **kwargs):
     from verl.single_controller.base.worker_group import WorkerGroup
 
@@ -301,6 +329,13 @@ def make_nd_compute_dataproto_dispatch_fn(mesh_name):
     return {
         "dispatch_fn": partial(dispatch_lazy_compute_data_proto, mesh_name),
         "collect_fn": partial(collect_lazy_compute_data_proto, mesh_name),
+    }
+
+
+def make_nd_compute_dispatch_fn(mesh_name):
+    return {
+        "dispatch_fn": partial(dispatch_lazy_compute, mesh_name),
+        "collect_fn": partial(collect_lazy_compute, mesh_name),
     }
 
 

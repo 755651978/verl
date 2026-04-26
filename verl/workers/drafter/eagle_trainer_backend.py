@@ -130,14 +130,16 @@ class EagleTrainerBackend:
                 h_states = raw_h.to(device, dtype=torch.bfloat16)
 
             # Compute loss_mask if not present (for DataBuffer items)
+            full_len = ids.size(0)
             if "loss_mask" not in item:
                 item_loss_mask = torch.zeros_like(ids, dtype=torch.float32)
                 if "prompts" in item and "responses" in item:
                     prompt_len = item["prompts"].size(0)
                     response_len = item["responses"].size(0)
                     for j in range(response_len):
-                        if item["responses"][j] != pad_id:
-                            item_loss_mask[prompt_len + j] = 1.0
+                        token_idx = prompt_len + j
+                        if token_idx < full_len and item["responses"][j] != pad_id:
+                            item_loss_mask[token_idx] = 1.0
                 elif "responses" in item:
                     response_start = full_len - item["responses"].size(0)
                     response_mask = (item["responses"] != pad_id).float()
@@ -150,7 +152,6 @@ class EagleTrainerBackend:
             
             # Select window around response tokens
             nonzero = torch.nonzero(item_loss_mask)
-            full_len = ids.size(0)
 
             if nonzero.numel() > 0:
                 # 获取 Response 的起止点
@@ -174,6 +175,7 @@ class EagleTrainerBackend:
         计算 Eagle 特有的V-Loss 和 P-Loss
         """
         # 前向传播
+        draft_model = model.module if hasattr(model, "module") else model
         outputs = model(
             input_ids=batch["input_ids"],
             hidden_states=batch["hidden_states"],
@@ -222,7 +224,7 @@ class EagleTrainerBackend:
 
         # P-Loss: 概率分布对齐损失
         with torch.no_grad():
-            target_p = F.softmax(model.lm_head(target), dim=1)
+            target_p = F.softmax(draft_model.lm_head(target), dim=-1)
 
         log_prod = F.log_softmax(logits,  dim=-1)
         ploss_per_token = -(target_p * log_prod).sum(dim=-1) # [B, T]
@@ -233,8 +235,9 @@ class EagleTrainerBackend:
         local_num_tokens = loss_mask.sum()
 
         # 读取权重并返回 Loss 字典
-        w_v = float(self.config.get("vloss_weight", 0.5))
-        w_p = float(self.config.get("ploss_weight", 0.5))
+        train_config = getattr(self, "train_config", self.config.rollout.drafter.training)
+        w_v = float(train_config.get("vloss_weight", 0.5))
+        w_p = float(train_config.get("ploss_weight", 0.5))
 
         return {
             "total_local_vloss": total_local_vloss,

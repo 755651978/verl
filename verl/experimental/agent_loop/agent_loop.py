@@ -985,6 +985,7 @@ class AgentLoopWorker:
             "min_global_steps",
             "max_global_steps",
             "extras",
+            "drafter_sample",
         }
         all_keys = set(key for input_item in inputs for key in input_item.extra_fields) | default_extra_keys
         for key in all_keys:

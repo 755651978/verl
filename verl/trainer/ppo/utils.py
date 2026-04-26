@@ -38,6 +38,7 @@ class Role(Enum):
     ActorRolloutRef = 6
     Env = 7
     TeacherModel = 8
+    Drafter = 9
 
     def __str__(self):
         return self._get_role_string()
@@ -52,6 +53,7 @@ class Role(Enum):
             Role.RewardModel: "rm",
             Role.ActorRolloutRef: "actor_rollout_ref",
             Role.TeacherModel: "teacher",
+            Role.Drafter: "drafter",
         }
         return role_mapping.get(self, self.name.lower())
 
@@ -65,6 +67,7 @@ class Role(Enum):
             "ref": cls.RefPolicy,
             "rm": cls.RewardModel,
             "actor_rollout_ref": cls.ActorRolloutRef,
+            "drafter": cls.Drafter,
         }
         role = string_mapping.get(name.lower())
         if role is None:

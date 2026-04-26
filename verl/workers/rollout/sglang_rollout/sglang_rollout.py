@@ -24,7 +24,9 @@ from typing import Generator
 import ray
 import sglang.srt.entrypoints.engine
 import torch
+import torch.distributed as dist
 from peft import LoraConfig
+from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -34,7 +36,6 @@ from sglang.srt.utils import (
     set_ulimit,
 )
 from sglang.srt.weight_sync.utils import _preprocess_tensor_for_update_weights
-from sglang.srt.weight_sync.utils import update_weights as sgl_update_weights
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 from verl.utils.net_utils import is_valid_ipv6_address
@@ -88,6 +89,63 @@ def _set_envs_and_config(server_args: ServerArgs):
 
 
 sglang.srt.entrypoints.engine._set_envs_and_config = _set_envs_and_config
+
+
+async def _sgl_update_weights_with_route(
+    engine,
+    params_batch: list[tuple[str, torch.Tensor]],
+    device_mesh_key: str,
+    device_mesh: DeviceMesh,
+    disable_draft_model: bool,
+    load_format: str | None = None,
+):
+    """Update SGLang weights through the official request path with explicit target/draft routing."""
+    from sglang.srt.model_executor.model_runner import LocalSerializedTensor
+    from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+
+    infer_tp_mesh = device_mesh[device_mesh_key]
+    infer_tp_size = infer_tp_mesh.mesh.size()[0]
+    infer_tp_rank = infer_tp_mesh.get_local_rank()
+
+    monkey_patch_torch_reductions()
+
+    named_tensors_batch = [
+        (
+            name,
+            MultiprocessingSerializer.serialize(_preprocess_tensor_for_update_weights(tensor.detach())),
+        )
+        for name, tensor in params_batch
+    ]
+
+    gathered_serialized_batches = [None for _ in range(infer_tp_size)] if infer_tp_rank == 0 else None
+
+    dist.gather_object(
+        obj=named_tensors_batch,
+        object_gather_list=gathered_serialized_batches,
+        dst=infer_tp_mesh.mesh.tolist()[0],
+        group=infer_tp_mesh.get_group(),
+    )
+
+    if infer_tp_rank != 0:
+        return None
+
+    logical_tensors = zip(*gathered_serialized_batches, strict=True)
+    named_tensors = [
+        (
+            tensor_group[0][0],
+            LocalSerializedTensor(values=[rank_part[1] for rank_part in tensor_group]),
+        )
+        for tensor_group in logical_tensors
+    ]
+
+    update_weights_request = UpdateWeightsFromTensorReqInput(
+        serialized_named_tensors=[
+            MultiprocessingSerializer.serialize(named_tensors) for _ in range(infer_tp_size)
+        ],
+        load_format=load_format,
+    )
+    setattr(update_weights_request, "disable_draft_model", disable_draft_model)
+    return await engine.update_weights_from_tensor(update_weights_request)
 
 
 # because chatCompletion is an async method, it makes the whole ray actor be an async actor
@@ -180,17 +238,7 @@ class ServerAdapter(BaseRollout):
             trust_remote_code=self.model_config.trust_remote_code,
         )
 
-        if (self.config.drafter.enable
-            and self.config.drafter.enable_drafter_training):
-            print("build drafter trainer backend")
-            if self.device_mesh is None:
-                raise RuntimeError("device_mesh is required to initialize drafter trainer backend")
-            drafter_training_mesh = self.device_mesh["infer_tp"]
-            await self.server_actor.build_drafter_trainer_backend.remote(
-                self.full_config,
-                drafter_training_mesh,
-                self.replica_rank,
-            )
+        # Drafter trainer is managed by standalone DrafterWorker(s) in parallel role.
 
 
     async def resume(self, tags: list[str]):
@@ -269,25 +317,34 @@ class ServerAdapter(BaseRollout):
             else:
                 weights = weights
 
-            if self.config.drafter.enable:
-                # update target model
-                async for params_batch in get_named_tensor_buckets(weights, update_weights_bucket_bytes):
-                    await self.sgl_update_weights_drafter(params_batch=params_batch)
-                # get drafter weights
-                if self.device_mesh["infer_tp"].get_local_rank() == 0:
-                    drafter_weights = await self.server_actor.maybe_publish.remote()
-                    if drafter_weights is not None:
-                        async for params_batch in get_named_tensor_buckets(drafter_weights,
-                                                                           update_weights_bucket_bytes):
-                            await self.sgl_update_weights_drafter(params_batch=params_batch, is_draft_model=True)
-            else:
-                async for params_batch in get_named_tensor_buckets(weights, update_weights_bucket_bytes):
-                    await sgl_update_weights(
-                        engine=self._engine,
-                        params_batch=params_batch,
-                        device_mesh_key="infer_tp",
-                        device_mesh=self.device_mesh,
-                    )
+            async for params_batch in get_named_tensor_buckets(weights, update_weights_bucket_bytes):
+                await _sgl_update_weights_with_route(
+                    engine=self._engine,
+                    params_batch=params_batch,
+                    device_mesh_key="infer_tp",
+                    device_mesh=self.device_mesh,
+                    disable_draft_model=True,
+                )
+
+        if self.device_mesh["infer_tp"].get_local_rank() == 0:
+            await self._engine.flush_cache()
+            if global_steps is not None:
+                await self.server_actor.set_global_steps.remote(global_steps)
+
+    async def update_draft_weights(self, weights: dict[str, torch.Tensor], global_steps: int = None):
+        await self._init_server_adapter()
+        if not self.config.drafter.enable or not weights:
+            return
+
+        update_weights_bucket_bytes = int(self.config.checkpoint_engine.update_weights_bucket_megabytes) << 20
+        async for params_batch in get_named_tensor_buckets(weights.items(), update_weights_bucket_bytes):
+            await _sgl_update_weights_with_route(
+                engine=self._engine,
+                params_batch=params_batch,
+                device_mesh_key="infer_tp",
+                device_mesh=self.device_mesh,
+                disable_draft_model=False,
+            )
 
         if self.device_mesh["infer_tp"].get_local_rank() == 0:
             await self._engine.flush_cache()
@@ -313,27 +370,3 @@ class ServerAdapter(BaseRollout):
             serialized_named_tensors.append(serialized_tensors)
 
         return peft_config_json, serialized_named_tensors
-
-    async def train_drafter(self):
-        await self.server_actor.train_drafter.remote()
-
-    async def sgl_update_weights_drafter(
-            self,
-            params_batch: list[tuple[str, torch.Tensor]],
-            is_draft_model: bool = False
-    ):
-        for name, tensor in params_batch:
-            if is_draft_model:
-                if hasattr(self._engine, "draft_model"):
-                    parts = name.split('.')
-                    param = self._engine.draft_model
-                    for part in parts:
-                        param = getattr(param, part)
-                    param.data.copy_(tensor.to(param.device))
-            else:
-                if hasattr(self._engine, "model"):
-                    parts = name.split('.')
-                    param = self._engine.model
-                    for part in parts:
-                        param = getattr(param, part)
-                    param.data.copy_(tensor.to(param.device))

@@ -2,22 +2,26 @@ import logging
 import os
 import time
 import asyncio
+import random
 from collections import deque
 from typing import Optional
 from typing import List
 from omegaconf import open_dict
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.fsdp import CPUOffload, MixedPrecision, ShardingStrategy
 from torch.nn import SmoothL1Loss
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
-from verl.utils.device import get_device_name
+from verl.utils.device import get_device_name, get_torch_device
 from verl.workers.drafter.data_buffer import DataBuffer
 from verl.utils.fsdp_utils import (
+    get_fsdp_full_state_dict,
+    get_fsdp_wrap_policy,
     get_device_id,
     apply_fsdp2,
     fsdp2_load_full_state_dict,
@@ -27,6 +31,7 @@ from verl.utils.fsdp_utils import (
     offload_fsdp_model_to_cpu,
     offload_fsdp_optimizer,
 )
+from verl.utils.ulysses import get_ulysses_sequence_parallel_group, set_ulysses_sequence_parallel_group
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -39,22 +44,45 @@ class DrafterBaseTrainer:
         config,
         world_size: int,
         rollout_dp_rank: int,
-        training_device_mesh: DeviceMesh,
-        backend
+        training_device_mesh: Optional[DeviceMesh],
+        backend,
+        training_process_group=None,
+        data_parallel_process_group=None,
     ):   
         self.config = config
         self.world_size = world_size
         self.rollout_dp_rank = rollout_dp_rank
         self.backend = backend
-        self.rank = dist.get_rank() if dist.is_initialized() else 0
-        self.use_data_buffer = config.rollout.drafter.training.get("use_data_buffer", False)
-
-        if training_device_mesh is None:
-            raise ValueError("training_device_mesh must be provided explicitly for DrafterBaseTrainer")
         self.training_device_mesh = training_device_mesh
+        if self.training_device_mesh is not None:
+            self.training_process_group = self.training_device_mesh["sp"].get_group()
+            self.data_parallel_process_group = self.training_device_mesh["dp"].get_group()
+            self.training_group_world_size = self.training_device_mesh["sp"].size()
+            self.dp_group_world_size = self.training_device_mesh["dp"].size()
+            self.rank = self.training_device_mesh["sp"].get_local_rank()
+            self.dp_rank = self.training_device_mesh["dp"].get_local_rank()
+        else:
+            self.training_process_group = training_process_group
+            self.data_parallel_process_group = data_parallel_process_group
+            self.training_group_world_size = (
+                dist.get_world_size(training_process_group) if training_process_group is not None else 1
+            )
+            self.dp_group_world_size = (
+                dist.get_world_size(data_parallel_process_group) if data_parallel_process_group is not None else 1
+            )
+            self.rank = dist.get_rank(training_process_group) if training_process_group is not None else (
+                dist.get_rank() if dist.is_initialized() else 0
+            )
+            self.dp_rank = dist.get_rank(data_parallel_process_group) if data_parallel_process_group is not None else 0
+        self.use_data_buffer = config.rollout.drafter.training.get("use_data_buffer", False)
+        self.current_rl_step = 0
         
         self.device_id = get_device_id()
-        self.copy_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+        self.device_module = get_torch_device()
+        self.runtime_device = (
+            torch.device(f"{device_name}:{self.device_id}") if device_name != "cpu" else torch.device("cpu")
+        )
+        self.copy_stream = self._create_copy_stream()
 
         self.is_offload_param = False
         self.is_offload_optimizer = False
@@ -86,14 +114,68 @@ class DrafterBaseTrainer:
         self.optimizer = None
         self.lr_scheduler = None
         self.drafter_train_config = None
-        self._frozen_param_names = {"model.embed_tokens.weight", "lm_head.weight"}
+        self._frozen_param_names = {"model.embed_tokens.weight"}
 
         # Ulysses Sequence Parallelism configuration
-        self.ulysses_sequence_parallel_size = self.config.rollout.get("tensor_model_parallel_size", 1)
-        self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
+        self.ulysses_sequence_parallel_size = min(
+            int(self.config.rollout.get("tensor_model_parallel_size", 1)),
+            self.training_group_world_size,
+        )
+        self.use_ulysses_sp = self.training_group_world_size > 1 and self.ulysses_sequence_parallel_size > 1
+        setattr(self.backend, "use_ulysses_sp", self.use_ulysses_sp)
+        self.use_native_dp_sp = self.training_group_world_size > 1 and self.dp_group_world_size > 1
 
         self.checkpoint_dir = self.config.rollout.drafter.get("checkpoint_path")
         self.step = self.config.rollout.drafter.training.step
+
+    def _create_copy_stream(self):
+        if device_name == "cpu":
+            return None
+        stream_cls = getattr(self.device_module, "Stream", None)
+        if stream_cls is None:
+            return None
+        try:
+            return stream_cls()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"Failed to create drafter copy stream on {device_name}: {exc}")
+            return None
+
+    def _has_mesh_dim(self, dim_name: str) -> bool:
+        return (
+            self.training_device_mesh is not None
+            and getattr(self.training_device_mesh, "mesh_dim_names", None) is not None
+            and dim_name in self.training_device_mesh.mesh_dim_names
+        )
+
+    def _get_sp_group(self):
+        if self._has_mesh_dim("sp"):
+            return self.training_device_mesh["sp"].get_group()
+        return self.training_process_group
+
+    def _get_dp_group(self):
+        if self._has_mesh_dim("dp"):
+            return self.training_device_mesh["dp"].get_group()
+        return self.data_parallel_process_group
+
+    def _get_sp_world_size(self) -> int:
+        if self._has_mesh_dim("sp"):
+            return self.training_device_mesh["sp"].size()
+        return self.training_group_world_size
+
+    def _get_dp_world_size(self) -> int:
+        if self._has_mesh_dim("dp"):
+            return self.training_device_mesh["dp"].size()
+        return self.dp_group_world_size
+
+    def _get_sp_local_rank(self) -> int:
+        if self._has_mesh_dim("sp"):
+            return self.training_device_mesh["sp"].get_local_rank()
+        return self.rank
+
+    def _get_dp_local_rank(self) -> int:
+        if self._has_mesh_dim("dp"):
+            return self.training_device_mesh["dp"].get_local_rank()
+        return self.dp_rank
 
     def _resolve_fsdp_config(self):
         # Primary source: actor fsdp config used across PPO training stacks.
@@ -112,33 +194,66 @@ class DrafterBaseTrainer:
         logger.info(f"[Rank {self.rollout_dp_rank}] Building drafter model...")
         # A. 实例化模型（委托给backend）
         raw_model, drafter_model_config = self.backend.build_model()
-        raw_model.cuda()
+        raw_model.to(self.runtime_device)
 
         # B. 获取全量状态用于 FSDP 初始化
-        full_state = raw_model.state_dict()
 
         # C. FSDP包装
-        fsdp_config = self._resolve_fsdp_config()
-        mp_policy = MixedPrecisionPolicy(
-            param_dtype=torch.bfloat16, reduce_dtype=torch.float32, cast_forward_inputs=True
-        )
+        if self.training_device_mesh is not None and dist.is_initialized():
+            fsdp_config = self._resolve_fsdp_config()
+            mp_policy = MixedPrecisionPolicy(
+                param_dtype=torch.bfloat16, reduce_dtype=torch.float32, cast_forward_inputs=True
+            )
 
-        fsdp_kwargs = {
-            "mesh": self.training_device_mesh,
-            "mp_policy": mp_policy,
-            "offload_policy": None,
-        }
-        logger.info("Inside building drafter model (Before FSDP2)")
-        
-        apply_fsdp2(raw_model, fsdp_kwargs, fsdp_config)
+            fsdp_kwargs = {
+                "mesh": self.training_device_mesh,
+                "mp_policy": mp_policy,
+                "offload_policy": None,
+            }
+            logger.info("Building drafter model with mesh-centered dp x sp FSDP2")
 
-        # Load full state dict using the same mesh as used by drafter FSDP wrapping
-        fsdp2_load_full_state_dict(raw_model, full_state, self.training_device_mesh, None)
-        self.model = raw_model
-        del full_state
+            full_state = raw_model.state_dict()
+            apply_fsdp2(raw_model, fsdp_kwargs, fsdp_config)
+
+            # Load full state dict using the same mesh as used by drafter FSDP wrapping
+            fsdp2_load_full_state_dict(raw_model, full_state, self.training_device_mesh, None)
+            self.model = raw_model
+            del full_state
+        elif self.training_process_group is not None and self.training_group_world_size > 1 and dist.is_initialized():
+            fsdp_config = self._resolve_fsdp_config()
+            auto_wrap_policy = get_fsdp_wrap_policy(module=raw_model, config=fsdp_config.wrap_policy)
+            mixed_precision = MixedPrecision(
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.float32,
+                buffer_dtype=torch.float32,
+            )
+            sharding_strategy = ShardingStrategy.FULL_SHARD
+            process_group = self.training_process_group
+            if self.use_native_dp_sp:
+                logger.info("Building drafter model with native dp x sp hybrid-shard FSDP")
+                sharding_strategy = ShardingStrategy.HYBRID_SHARD
+                process_group = (self.training_process_group, self.data_parallel_process_group)
+            else:
+                logger.info("Building drafter model with subgroup FSDP")
+            self.model = FSDP(
+                raw_model,
+                auto_wrap_policy=auto_wrap_policy,
+                device_id=get_device_id(),
+                sharding_strategy=sharding_strategy,
+                mixed_precision=mixed_precision,
+                sync_module_states=True,
+                process_group=process_group,
+                use_orig_params=fsdp_config.use_orig_params,
+                forward_prefetch=fsdp_config.forward_prefetch,
+                cpu_offload=None,
+            )
+        else:
+            logger.info("Building drafter model without FSDP (standalone/local trainer mode)")
+            self.model = raw_model
 
         # D. 构建优化器和调度器
         drafter_train_config = self._prepare_training_config(self.config.rollout)
+        setattr(self.backend, "train_config", drafter_train_config)
 
         self.optimizer = self.backend.setup_optimizer(self.model, drafter_train_config)
         self.lr_scheduler = self.backend.setup_scheduler(self.optimizer, drafter_train_config)
@@ -176,13 +291,20 @@ class DrafterBaseTrainer:
 
     
     def _get_trainable_state_dict(self) -> dict[str, torch.Tensor]:
-        """Get state dict excluding frozen layers (embed_tokens, lm_head)."""
-        full_state_dict = self.model.state_dict()
+        """Get state dict excluding weights shared with the target model."""
+        if isinstance(self.model, FSDP) or (self.training_device_mesh is not None and dist.is_initialized()):
+            full_state_dict = get_fsdp_full_state_dict(self.model, offload_to_cpu=True, rank0_only=True)
+        else:
+            full_state_dict = self.model.state_dict()
+        if not full_state_dict:
+            return {}
         trainable_state_dict = {}
 
         for name, param in full_state_dict.items():
-            # Skip frozen parameters
-            if any(frozen_name in name for frozen_name in self._frozen_param_names):
+            # EAGLE shares target lm_head, while EAGLE3 trains and publishes its own lm_head.
+            if any(frozen_name in name for frozen_name in self._frozen_param_names) or (
+                "lm_head.weight" in name and getattr(self.backend, "model_type", None) != "eagle3"
+            ):
                 logger.debug(f"Skipping frozen parameter: {name}")
                 continue
             trainable_state_dict[name] = param
@@ -205,12 +327,24 @@ class DrafterBaseTrainer:
 
         checkpoint_path = os.path.join(self.checkpoint_dir, f"eagle_step_{step}")
         os.makedirs(checkpoint_path, exist_ok=True)
-            
+
         # Get trainable state dict (excluding frozen layers)
         model_state_dict = self._get_trainable_state_dict()
-        optimizer_state_dict = self.optimizer.state_dict() if self.optimizer else {}
+        is_fsdp_wrapped = isinstance(self.model, FSDP) or self.training_device_mesh is not None
+        is_checkpoint_leader = self.rollout_dp_rank == 0 and self._get_sp_local_rank() == 0
+        optimizer_state_dict = self.optimizer.state_dict() if self.optimizer and is_checkpoint_leader else {}
 
         state_dict = {"model": model_state_dict, "optimizer": optimizer_state_dict, "step": step}
+
+        if is_fsdp_wrapped:
+            if is_checkpoint_leader and model_state_dict:
+                torch.save(state_dict, os.path.join(checkpoint_path, "model.pt"))
+            return None
+
+        # Standalone mode: no distributed mesh, save locally.
+        if self.training_device_mesh is None or not dist.is_initialized():
+            torch.save(state_dict, os.path.join(checkpoint_path, "model.pt"))
+            return None
 
         # Use DCP async_save - returns a future that can be checked later
         future = dcp.async_save(
@@ -234,7 +368,7 @@ class DrafterBaseTrainer:
 
             # 只有当配置了 offload 或者当前模型不在 CUDA 上时执行加载
             first_param = next(self.model.parameters(), None)
-            is_on_cuda = first_param is not None and first_param.device.type == "cuda"
+            is_on_cuda = first_param is not None and first_param.device.type == device_name
 
             if self.is_offload_param or not is_on_cuda:
                 # 调用工具将 FSDP 分片移动到 GPU
@@ -246,6 +380,10 @@ class DrafterBaseTrainer:
                 current_dev_id = get_device_id()
                 load_fsdp_optimizer(optimizer=self.optimizer, device_id=current_dev_id)
                 logger.debug("Loaded drafter optimizer to GPU for training")
+
+            target_model = getattr(self.backend, "target_model", None)
+            if target_model is not None:
+                target_model.to(self.runtime_device)
 
             # 先标记初始化完成，然后开启 active 开关，确保训练循环不会读到中间状态
             self._training_initialized = True
@@ -262,7 +400,7 @@ class DrafterBaseTrainer:
             self._training_active = False
             return False
 
-    def collect_online_data(self, batch: dict, hidden_states: torch.Tensor, target_logprobs: List = None) -> torch.Tensor:
+    def collect_online_data(self, batch: dict, hidden_states: torch.Tensor, target_logprobs: List = None) -> None:
         """Collect online data from inference for Eagle training.
 
         This method collects data both to the local collected_data deque (for immediate use)
@@ -276,19 +414,44 @@ class DrafterBaseTrainer:
             return
 
         # 1、异步拷贝，GPU在后台进行数据搬运，避免阻塞Rollout Stream
-        with torch.cuda.stream(self.copy_stream):
-            cpu_input_ids = input_ids.to('cpu', non_blocking=True)
-            cpu_h_states = hidden_states.to('cpu', non_blocking=True)
-            cpu_target_logprobs = target_logprobs.to('cpu', non_blocking=True) if target_logprobs is not None else None
-            cpu_responses = batch.get("responses").to('cpu', non_blocking=True) if "responses" in batch else None
-            cpu_prompts = batch.get("prompts").to('cpu', non_blocking=True) if "prompts" in batch else None
+        if target_logprobs is not None and not isinstance(target_logprobs, torch.Tensor):
+            logger.warning(f"[Rank {self.rank}] Unsupported target_logprobs type: {type(target_logprobs)}")
+            target_logprobs = None
 
-        torch.cuda.current_stream().wait_stream(self.copy_stream)
+        source_tensors = [input_ids, hidden_states]
+        if target_logprobs is not None:
+            source_tensors.append(target_logprobs)
+        if "responses" in batch and batch["responses"] is not None:
+            source_tensors.append(batch["responses"])
+        if "prompts" in batch and batch["prompts"] is not None:
+            source_tensors.append(batch["prompts"])
+
+        use_copy_stream = self.copy_stream is not None and any(
+            isinstance(t, torch.Tensor) and t.device.type == device_name for t in source_tensors
+        )
+
+        if use_copy_stream:
+            with self.device_module.stream(self.copy_stream):
+                cpu_input_ids = input_ids.to('cpu', non_blocking=True)
+                cpu_h_states = hidden_states.to('cpu', non_blocking=True)
+                cpu_target_logprobs = (
+                    target_logprobs.to('cpu', non_blocking=True) if target_logprobs is not None else None
+                )
+                cpu_responses = batch.get("responses").to('cpu', non_blocking=True) if "responses" in batch else None
+                cpu_prompts = batch.get("prompts").to('cpu', non_blocking=True) if "prompts" in batch else None
+
+            self.device_module.current_stream().wait_stream(self.copy_stream)
+        else:
+            cpu_input_ids = input_ids.to('cpu')
+            cpu_h_states = hidden_states.to('cpu')
+            cpu_target_logprobs = target_logprobs.to('cpu') if target_logprobs is not None else None
+            cpu_responses = batch.get("responses").to('cpu') if "responses" in batch else None
+            cpu_prompts = batch.get("prompts").to('cpu') if "prompts" in batch else None
 
         batch_size = cpu_input_ids.size(0)
 
         # 动态计算最小序列长度
-        if cpu_target_logprobs:
+        if cpu_target_logprobs is not None:
             seq_length = min(cpu_target_logprobs.size(1), cpu_input_ids.size(1), cpu_h_states.size(1))
         else:
             seq_length = min(cpu_input_ids.size(1), cpu_h_states.size(1))
@@ -332,9 +495,8 @@ class DrafterBaseTrainer:
                     return None
             else:
                 # Randomly sample from available data to ensure diversity
-                import random
-
-                items = random.sample(available_data, min(len(available_data), effective_batch_size))
+                rng = random.Random(int(self.current_rl_step))
+                items = rng.sample(available_data, min(len(available_data), effective_batch_size))
         else:
             # Fall back to current step data only
             if len(self.collected_data) < effective_batch_size:
@@ -345,8 +507,11 @@ class DrafterBaseTrainer:
             else:
                 items = list(self.collected_data)[:effective_batch_size]
         
-        # Filter out items without hidden_states (defensive check)
+        # Filter out items without the tensors required by the selected loss path.
+        use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))
         items = [item for item in items if "hidden_states" in item]
+        if self.backend.model_type == "eagle3" and use_logits:
+            items = [item for item in items if item.get("target_logprobs") is not None]
         if len(items) == 0:
             logger.warning(f"[Rank {self.rank}] No items with hidden_states found, cannot prepare batch")
             return None
@@ -368,50 +533,63 @@ class DrafterBaseTrainer:
 
         if self.backend.model_type == "eagle3":
             last_hidden_states_concat = torch.cat(preprocessed_lists['last_h_states'], dim=0).unsqueeze(0)
+            if use_logits:
+                target_logprobs_concat = torch.cat(preprocessed_lists["target_logprobs"], dim=0).unsqueeze(0)
 
-        # Create attention mask (all 1s since no padding)
         total_seq_len = input_ids_concat.size(1)
-        attn_mask = torch.ones((1, total_seq_len), dtype=torch.long, device=dev)
+        if total_seq_len < 2:
+            return None
+
+        loss_mask = loss_mask_concat[:, 1:].contiguous()
+        input_ids = input_ids_concat[:, :-1].contiguous()
+        attn_mask = torch.ones_like(input_ids, dtype=torch.long, device=dev)
+        base_h = hidden_states_concat[:, :-1].contiguous()
+        position_ids = torch.arange(total_seq_len, device=dev).unsqueeze(0)[:, :-1].contiguous()
+
+        if self.backend.model_type == "eagle3":
+            last_hidden_states = last_hidden_states_concat[:, 1:].contiguous()
+            if use_logits:
+                target_logprobs = target_logprobs_concat[:, 1:].contiguous()
+        elif self.backend.model_type == "eagle":
+            target = hidden_states_concat[:, 1:].contiguous()
 
         # Use Ulysses SP to pad and slice if needed
         if self.use_ulysses_sp:
             from verl.utils.ulysses import slice_input_tensor, ulysses_pad_and_slice_inputs
             # Pad to be divisible by SP size and slice across ranks
-            input_ids_concat, sharded_pos, pad_size = ulysses_pad_and_slice_inputs(
-                input_ids_concat, None, sp_size=self.ulysses_sequence_parallel_size
+            input_ids, position_ids, pad_size = ulysses_pad_and_slice_inputs(
+                input_ids, position_ids, sp_size=self.ulysses_sequence_parallel_size
             )
-
-            position_ids = sharded_pos
 
             # Pad loss_mask and hidden_states to match
             if pad_size > 0:
-                loss_mask_concat = torch.nn.functional.pad(loss_mask_concat, (0, pad_size), value=0.0)
-                hidden_states_concat = torch.nn.functional.pad(hidden_states_concat, (0, 0, 0, pad_size), value=0.0)
+                loss_mask = torch.nn.functional.pad(loss_mask, (0, pad_size), value=0.0)
+                base_h = torch.nn.functional.pad(base_h, (0, 0, 0, pad_size), value=0.0)
                 attn_mask = torch.nn.functional.pad(attn_mask, (0, pad_size), value=0)
                 if self.backend.model_type == "eagle3":
-                    last_hidden_states_concat = torch.nn.functional.pad(last_hidden_states_concat, (0, 0, 0, pad_size), value=0.0)
+                    last_hidden_states = torch.nn.functional.pad(last_hidden_states, (0, 0, 0, pad_size), value=0.0)
+                    if use_logits:
+                        target_logprobs = torch.nn.functional.pad(
+                            target_logprobs, (0, 0, 0, 0, 0, pad_size), value=0.0
+                        )
+                elif self.backend.model_type == "eagle":
+                    target = torch.nn.functional.pad(target, (0, 0, 0, pad_size), value=0.0)
 
             # Slice for this rank
-            from verl.utils.ulysses import slice_input_tensor
-
-            loss_mask_concat = slice_input_tensor(loss_mask_concat, dim=1, padding=False)
-            hidden_states_concat = slice_input_tensor(hidden_states_concat, dim=1, padding=False)
+            loss_mask = slice_input_tensor(loss_mask, dim=1, padding=False)
+            base_h = slice_input_tensor(base_h, dim=1, padding=False)
             attn_mask = slice_input_tensor(attn_mask, dim=1, padding=False)
             if self.backend.model_type == "eagle3":
-                last_hidden_states_concat = slice_input_tensor(last_hidden_states_concat, dim=1, padding=False)
+                last_hidden_states = slice_input_tensor(last_hidden_states, dim=1, padding=False)
+                if use_logits:
+                    target_logprobs = slice_input_tensor(target_logprobs, dim=1, padding=False)
+            elif self.backend.model_type == "eagle":
+                target = slice_input_tensor(target, dim=1, padding=False)
 
             # Store pad_size for later gathering
             self._current_pad_size = pad_size
         else:
-            position_ids = torch.arange(total_seq_len, device=dev).unsqueeze(0)
             self._current_pad_size = 0
-
-        # Shift for next token prediction
-        loss_mask = loss_mask_concat[:, 1:].contiguous()
-        input_ids = input_ids_concat[:, :-1].contiguous()
-        attn_mask = attn_mask[:, :-1].contiguous()
-        base_h = hidden_states_concat[:, :-1].contiguous()
-        position_ids = position_ids[:, :-1].contiguous()
 
         batch = {
             "input_ids": input_ids,
@@ -422,12 +600,27 @@ class DrafterBaseTrainer:
         }
 
         if self.backend.model_type == "eagle3":
-            batch["last_hidden_states"] = last_hidden_states_concat[:, 1:].contiguous()
+            batch["last_hidden_states"] = last_hidden_states
+            if use_logits:
+                batch["target_logprobs"] = target_logprobs
         elif self.backend.model_type == "eagle":
-            batch["target"] = hidden_states_concat[:, 1:].contiguous()
+            batch["target"] = target
 
         return batch
-    
+
+    def _sync_batch_readiness(self, has_local_batch: bool) -> bool:
+        dp_group = self._get_dp_group()
+        if dp_group is None or self._get_dp_world_size() <= 1:
+            return has_local_batch
+
+        readiness = torch.tensor(
+            [1 if has_local_batch else 0],
+            device=self.runtime_device,
+            dtype=torch.int32,
+        )
+        dist.all_reduce(readiness, op=dist.ReduceOp.MIN, group=dp_group)
+        return bool(readiness.item())
+
     async def training_step(self, step: int) -> bool:
         try:
             with torch.enable_grad():
@@ -435,6 +628,21 @@ class DrafterBaseTrainer:
         except Exception as e:  # noqa: BLE001
             logger.exception(f"Training step {step} failed with error: {e}")
             return False
+
+    @contextmanager
+    def _ulysses_group_context(self):
+        sp_group = self._get_sp_group()
+        if not self.use_ulysses_sp or sp_group is None:
+            with nullcontext():
+                yield
+            return
+
+        prev_group = get_ulysses_sequence_parallel_group()
+        set_ulysses_sequence_parallel_group(sp_group)
+        try:
+            yield
+        finally:
+            set_ulysses_sequence_parallel_group(prev_group)
         
     async def _training_step_impl(self, step: int) -> bool:
         """Execute a single training step."""
@@ -451,7 +659,11 @@ class DrafterBaseTrainer:
             )
             return False
 
-        batch = self._prepare_training_batch()
+        with self._ulysses_group_context():
+            batch = self._prepare_training_batch()
+        if not self._sync_batch_readiness(batch is not None):
+            logger.debug(f"[EagleTrainer rank {self.rank}] Skipping step {step} due to missing drafter batch")
+            return False
         if batch is None:
             logger.debug(
                 f"[EagleTrainer rank {self.rank}] Not enough data at step {step} "
@@ -464,15 +676,28 @@ class DrafterBaseTrainer:
         self.optimizer.zero_grad(set_to_none=True)
 
         # 前向传播
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            loss_dict = self.backend.compute_loss(self.model, batch, self._current_pad_size)
+        with self._ulysses_group_context():
+            with torch.amp.autocast(device_type=device_name, dtype=torch.bfloat16):
+                loss_dict = self.backend.compute_loss(self.model, batch, self._current_pad_size)
 
-            l_v = loss_dict["total_local_vloss"]
-            l_p = loss_dict["total_local_ploss"]
-            l_n = loss_dict["local_num_tokens"]
+                l_v = loss_dict["total_local_vloss"]
+                l_p = loss_dict["total_local_ploss"]
+                l_n = loss_dict["local_num_tokens"]
 
         # 分布式同步（Global Reduction）,如果使用序列并行，仅在这里进行一次标量同步
-        if self.training_device_mesh is not None and self.training_device_mesh.size() > 1:
+        sp_group = self._get_sp_group()
+        dp_group = self._get_dp_group()
+        if sp_group is not None and self._get_sp_world_size() > 1:
+            metrics = torch.stack([l_v, l_p, l_n])
+            dist.all_reduce(metrics, group=sp_group)
+            if dp_group is not None and self._get_dp_world_size() > 1:
+                dist.all_reduce(metrics, group=dp_group)
+            global_vloss, global_ploss, global_tokens = metrics[0], metrics[1], metrics[2]
+        elif dp_group is not None and self._get_dp_world_size() > 1:
+            metrics = torch.stack([l_v, l_p, l_n])
+            dist.all_reduce(metrics, group=dp_group)
+            global_vloss, global_ploss, global_tokens = metrics[0], metrics[1], metrics[2]
+        elif self.training_device_mesh is not None and self.training_device_mesh.size() > 1:
             metrics = torch.stack([l_v, l_p, l_n])
             dist.all_reduce(metrics, group=self.training_device_mesh.get_group())
             global_vloss, global_ploss, global_tokens = metrics[0], metrics[1], metrics[2]
@@ -517,12 +742,16 @@ class DrafterBaseTrainer:
 
         return True
     
-    def increment_rl_step(self):
+    def increment_rl_step(self, global_step: Optional[int] = None):
         """Increment the RL step counter in the data buffer.
 
         Should be called at the end of each RL training step to mark the boundary.
         """
-        self.data_buffer.increment_step()
+        if global_step is None:
+            self.current_rl_step += 1
+        else:
+            self.current_rl_step = int(global_step)
+        self.data_buffer.update_rl_step(self.current_rl_step)
         logger.debug(
             f"[Rank {self.rank}] DataBuffer RL step incremented to {self.data_buffer.get_current_step()}, "
             f"total samples: {len(self.data_buffer)}"
@@ -532,10 +761,23 @@ class DrafterBaseTrainer:
         """Get trainable model state dict (excluding frozen layers)."""
         if not self.model:
             return None
-        trainable_state = self._get_trainable_state_dict()
-        return {k: v.detach().cpu() for k, v in trainable_state.items() if v.requires_grad}
+
+        first_param = next(self.model.parameters(), None)
+        was_on_device = first_param is not None and first_param.device.type == device_name
+        is_fsdp_wrapped = isinstance(self.model, FSDP) or self.training_device_mesh is not None
+        if is_fsdp_wrapped and not was_on_device:
+            load_fsdp_model_to_gpu(self.model)
+
+        try:
+            trainable_state = self._get_trainable_state_dict()
+            if not trainable_state:
+                return None
+            return {k: v.detach().cpu() for k, v in trainable_state.items()}
+        finally:
+            if is_fsdp_wrapped and not was_on_device:
+                offload_fsdp_model_to_cpu(self.model)
     
-    async def cleanup_training(self):
+    async def cleanup_training(self, clear_data: bool = True):
         # First set training as inactive to prevent further steps
         self._training_active = False
 
@@ -552,8 +794,9 @@ class DrafterBaseTrainer:
             self._pending_checkpoint_future = None
 
          # Save final checkpoint and wait for it to complete
-        if self.checkpoint_dir and self.model is not None:
-            final_future = self._save_checkpoint_async(self.training_steps, is_final=True)
+        if self.checkpoint_dir and self.model is not None and self.training_steps > 0:
+            final_ckpt_step = self.current_rl_step if self.current_rl_step > 0 else self.training_steps
+            final_future = self._save_checkpoint_async(final_ckpt_step, is_final=True)
             if final_future is not None:
                 try:
                     loop = asyncio.get_event_loop()
@@ -563,7 +806,41 @@ class DrafterBaseTrainer:
                     logger.warning(f"Final checkpoint save failed: {e}")
 
         # Clean up distributed resources gracefully
-        if self.training_device_mesh is not None:
+        sp_group = self._get_sp_group()
+        dp_group = self._get_dp_group()
+        if sp_group is not None and self._get_sp_world_size() > 1:
+            try:
+                await asyncio.sleep(0.1)
+                try:
+                    await asyncio.wait_for(
+                        asyncio.get_event_loop().run_in_executor(
+                            None, lambda: torch.distributed.barrier(sp_group)
+                        ),
+                        timeout=5.0,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(f"Rank {self.rank} subgroup barrier timeout during cleanup, continuing anyway")
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.debug(f"Subgroup cleanup error (expected): {e}")
+        if dp_group is not None and self._get_dp_world_size() > 1:
+            try:
+                await asyncio.sleep(0.1)
+                try:
+                    await asyncio.wait_for(
+                        asyncio.get_event_loop().run_in_executor(
+                            None, lambda: torch.distributed.barrier(dp_group)
+                        ),
+                        timeout=5.0,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(f"Rank {self.rank} dp-group barrier timeout during cleanup, continuing anyway")
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.debug(f"DP-group cleanup error (expected): {e}")
+        elif self.training_device_mesh is not None:
             try:
                 # Give a moment for any pending operations to complete
                 await asyncio.sleep(0.1)
@@ -597,11 +874,19 @@ class DrafterBaseTrainer:
                 logger.debug("Offloaded drafter optimizer state to CPU after training")
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Failed to offload drafter optimizer during cleanup: {e}")
+
+        target_model = getattr(self.backend, "target_model", None)
+        if target_model is not None:
+            try:
+                target_model.to("cpu")
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"Failed to offload drafter target model during cleanup: {e}")
         
-        self.collected_data.clear()
-        self.data_buffer.clear()  # Clear the cross-step data buffer
-        self.training_device_mesh = None
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if clear_data:
+            self.collected_data.clear()
+            self.data_buffer.clear()  # Clear the cross-step data buffer
+        if device_name != "cpu" and hasattr(self.device_module, "empty_cache"):
+            self.device_module.empty_cache()
         self._training_initialized = False
+        self._last_ckpt_step = -1
         self.training_steps = 0

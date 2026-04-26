@@ -370,6 +370,7 @@ class HttpServerAdapter(EngineBase):
         named_tensors = req.serialized_named_tensors
         load_format = req.load_format
         flush_cache = req.flush_cache
+        disable_draft_model = getattr(req, "disable_draft_model", None)
 
         if named_tensors:
             serialized_named_tensors = [
@@ -378,14 +379,15 @@ class HttpServerAdapter(EngineBase):
         else:
             serialized_named_tensors = []
 
-        return self._make_request(
-            "update_weights_from_tensor",
-            {
-                "serialized_named_tensors": serialized_named_tensors,
-                "load_format": load_format,
-                "flush_cache": flush_cache,
-            },
-        )
+        payload = {
+            "serialized_named_tensors": serialized_named_tensors,
+            "load_format": load_format,
+            "flush_cache": flush_cache,
+        }
+        if disable_draft_model is not None:
+            payload["disable_draft_model"] = disable_draft_model
+
+        return self._make_request("update_weights_from_tensor", payload)
 
     def shutdown(self) -> None:
         """Shutdown the HTTP server and clean up resources.
@@ -763,16 +765,18 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
         named_tensors = req.serialized_named_tensors
         load_format = req.load_format
         flush_cache = req.flush_cache
+        disable_draft_model = getattr(req, "disable_draft_model", None)
 
         serialized_named_tensors = [base64.b64encode(named_tensor).decode("utf-8") for named_tensor in named_tensors]
-        return await self._make_async_request(
-            "update_weights_from_tensor",
-            {
-                "serialized_named_tensors": serialized_named_tensors,
-                "load_format": load_format,
-                "flush_cache": flush_cache,
-            },
-        )
+        payload = {
+            "serialized_named_tensors": serialized_named_tensors,
+            "load_format": load_format,
+            "flush_cache": flush_cache,
+        }
+        if disable_draft_model is not None:
+            payload["disable_draft_model"] = disable_draft_model
+
+        return await self._make_async_request("update_weights_from_tensor", payload)
 
     async def load_lora_adapter_from_tensor(self, req):
         return await self._make_async_request(

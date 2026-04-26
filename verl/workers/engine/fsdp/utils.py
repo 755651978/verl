@@ -13,14 +13,24 @@
 # limitations under the License.
 import logging
 import os
+from dataclasses import dataclass
 
 import torch
-from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 from verl.utils.device import get_device_name, is_npu_available
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+@dataclass(frozen=True)
+class RolloutParallelLayout:
+    infer_tp: int
+    infer_pp: int
+    rollout_world_size: int
+    num_replicas: int
+    replica_training_ranks: list[list[int]]
 
 
 def apply_npu_fsdp_patches():
@@ -54,6 +64,49 @@ def create_device_mesh(world_size, fsdp_size):
             device_name, mesh_shape=(world_size // fsdp_size, fsdp_size), mesh_dim_names=["ddp", "fsdp"]
         )
     return device_mesh
+
+
+def build_rollout_parallel_layout(
+    world_size: int,
+    rollout_tp: int,
+    rollout_dp: int,
+    rollout_pp: int,
+) -> RolloutParallelLayout:
+    infer_tp = int(rollout_tp) * int(rollout_dp)
+    infer_pp = int(rollout_pp)
+    rollout_world_size = infer_tp * infer_pp
+    if rollout_world_size <= 0:
+        raise ValueError(
+            "rollout_world_size must be positive: "
+            f"rollout_tp={rollout_tp}, rollout_dp={rollout_dp}, rollout_pp={rollout_pp}"
+        )
+    if world_size % rollout_world_size != 0:
+        raise ValueError(
+            "world_size must be divisible by rollout replica world size: "
+            f"world_size={world_size}, rollout_world_size={rollout_world_size}"
+        )
+
+    num_replicas = world_size // rollout_world_size
+    replica_training_ranks = []
+    for replica_rank in range(num_replicas):
+        replica_base = replica_rank * rollout_world_size
+        replica_training_ranks.append([replica_base + tp_rank * infer_pp for tp_rank in range(int(rollout_tp))])
+
+    return RolloutParallelLayout(
+        infer_tp=infer_tp,
+        infer_pp=infer_pp,
+        rollout_world_size=rollout_world_size,
+        num_replicas=num_replicas,
+        replica_training_ranks=replica_training_ranks,
+    )
+
+
+def build_drafter_training_device_mesh(device_type: str, layout: RolloutParallelLayout) -> DeviceMesh:
+    return DeviceMesh(
+        device_type=device_type,
+        mesh=torch.tensor(layout.replica_training_ranks, dtype=torch.int64),
+        mesh_dim_names=("dp", "sp"),
+    )
 
 
 def get_sharding_strategy(device_mesh):
