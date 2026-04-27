@@ -5,7 +5,6 @@ from copy import deepcopy
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-import numpy as np
 
 from .model.auto import AutoDraftModelConfig, AutoEagle3DraftModel
 from .eagle_trainer_backend import EagleTrainerBackend
@@ -20,8 +19,32 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 device_name = get_device_name()
 
 
-def reconstruct_logits(target_topk_logprobs, topk, vocab_size):
+def _scatter_sparse_logprobs(logprobs: torch.Tensor, indices: torch.Tensor, vocab_size: int) -> torch.Tensor:
+    full_logits = torch.full(
+        (logprobs.size(0), vocab_size),
+        float("-inf"),
+        dtype=logprobs.dtype,
+        device=logprobs.device,
+    )
+    if logprobs.numel() == 0:
+        return full_logits
+
+    valid = torch.isfinite(logprobs) & (indices >= 0) & (indices < vocab_size)
+    if not valid.any():
+        return full_logits
+
+    row_indices = torch.arange(logprobs.size(0), device=logprobs.device).unsqueeze(1).expand_as(indices)
+    full_logits[row_indices[valid], indices[valid]] = logprobs[valid]
+    return full_logits
+
+
+def reconstruct_sparse_logprob_view(target_topk_logprobs, topk, vocab_size):
     if isinstance(target_topk_logprobs, torch.Tensor):
+        if target_topk_logprobs.dim() != 3 or target_topk_logprobs.size(-1) < 2:
+            raise ValueError(
+                "target_topk_logprobs must have shape [seq, topk, 2+] when reconstructing a sparse logprob view, "
+                f"but got shape={tuple(target_topk_logprobs.shape)}"
+            )
         if target_topk_logprobs.numel() == 0:
             return torch.empty(
                 target_topk_logprobs.shape[0],
@@ -30,38 +53,44 @@ def reconstruct_logits(target_topk_logprobs, topk, vocab_size):
                 device=target_topk_logprobs.device,
             )
         logprobs = target_topk_logprobs[..., 0]
-        indices = target_topk_logprobs[..., 1].long().clamp_(0, vocab_size - 1)
-        full_logits = torch.full(
-            (logprobs.size(0), vocab_size),
-            float("-inf"),
-            dtype=logprobs.dtype,
-            device=logprobs.device,
-        )
-        row_indices = torch.arange(logprobs.size(0), device=logprobs.device).unsqueeze(1).expand_as(indices)
-        full_logits[row_indices, indices] = logprobs
-        return full_logits
+        indices = target_topk_logprobs[..., 1].to(torch.long)
+        return _scatter_sparse_logprobs(logprobs, indices, vocab_size)
 
-    dtype = [('logprobs', 'f4'), ('idx', 'i4'), ('none', 'O')]
+    rows = []
+    for step_top_logprobs in target_topk_logprobs:
+        if isinstance(step_top_logprobs, dict):
+            entries = list(step_top_logprobs.values())
+        else:
+            entries = list(step_top_logprobs or [])
 
-    flat_topk_logprobs_list = np.array([item for step in target_topk_logprobs for item in step], dtype=dtype)
+        row = []
+        for entry in entries[:topk]:
+            if isinstance(entry, dict):
+                logprob = entry.get("logprob", entry.get("log_probs", entry.get("log_prob")))
+                token_id = entry.get("token_id", entry.get("idx", entry.get("id")))
+            elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                logprob, token_id = entry[0], entry[1]
+            else:
+                continue
 
-    logprobs_flat = flat_topk_logprobs_list['logprobs']
-    indices_flat = flat_topk_logprobs_list['idx']
+            try:
+                row.append([float(logprob), int(token_id)])
+            except (TypeError, ValueError):
+                continue
 
-    l = len(target_topk_logprobs)
+        if not row:
+            continue
+        while len(row) < topk:
+            row.append([float("-inf"), -1])
+        rows.append(row)
 
-    final_topk_logprobs = torch.from_numpy(logprobs_flat).reshape(l, topk)
-    final_topk_indices = torch.from_numpy(indices_flat).reshape(l, topk)
-    # logprob转为概率
-    final_topk_logits = final_topk_logprobs
-    # 初始化全为0的张量
-    full_logits = torch.full((l, vocab_size), float("-inf"), device=final_topk_logprobs.device)
-    # 构建行索引
-    row_indeces = torch.arange(l, device=final_topk_logprobs.device).unsqueeze(1).expand(-1, topk)
-    # 填入logits
-    full_logits[row_indeces, final_topk_indices] = final_topk_logits
+    if not rows:
+        return torch.empty((0, vocab_size), dtype=torch.float32)
 
-    return full_logits
+    rows_tensor = torch.tensor(rows, dtype=torch.float32)
+    logprobs = rows_tensor[..., 0]
+    indices = rows_tensor[..., 1].to(torch.long)
+    return _scatter_sparse_logprobs(logprobs, indices, vocab_size)
 
 
 class Eagle3TrainerBackend(EagleTrainerBackend):
@@ -266,7 +295,7 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
                     unpad_dim=0,
                     padding_size=_current_pad_size,
                 ).unsqueeze(0)
-                target_logits = reconstruct_logits(
+                target_scores = reconstruct_sparse_logprob_view(
                     target_topk_logprobs.squeeze(0),
                     topk=self.config.rollout.drafter.training.logits_topk,
                     vocab_size=self.vocab_size,
@@ -281,15 +310,15 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
                     padding_size=_current_pad_size,
                 ).unsqueeze(0)
                 with torch.no_grad():
-                    target_logits = self.target_model(last_hidden_states)
+                    target_scores = self.target_model(last_hidden_states)
         else:
             all_step_logits = all_step_logits
             all_step_position_mask = all_step_position_mask
             loss_mask = loss_mask
             if use_logits:
-                target_topk_logits = batch["target_logprobs"]
-                target_logits = reconstruct_logits(
-                    target_topk_logits.squeeze(0),
+                target_topk_logprobs = batch["target_logprobs"]
+                target_scores = reconstruct_sparse_logprob_view(
+                    target_topk_logprobs.squeeze(0),
                     topk=self.config.rollout.drafter.training.logits_topk,
                     vocab_size=self.vocab_size,
                 ).unsqueeze(0)
@@ -297,20 +326,20 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
                 if last_hidden_states is None:
                     raise ValueError("last_hidden_states is required when use_target_model=False")
                 with torch.no_grad():
-                    target_logits = self.target_model(last_hidden_states)
+                    target_scores = self.target_model(last_hidden_states)
         
         length = len(all_step_logits)
         seq_length = input_ids.shape[1]
 
         target_p_padded, position_mask = self._compute_target_p_padded(
-            target=target_logits,
+            target_scores=target_scores,
             t2d=draft_model.t2d,
             loss_mask=loss_mask,
             length=length,
         )
 
         # Clean up large tensors to free memory
-        del target_logits
+        del target_scores
 
         total_local_ploss = 0
         gamma = 0.8
@@ -340,10 +369,10 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
             "p_weight": 1.0 / length
         }
     
-    def _compute_target_p_padded(self, target, t2d, loss_mask, length):
+    def _compute_target_p_padded(self, target_scores, t2d, loss_mask, length):
         with torch.no_grad():
             target_p, position_mask = self._compute_target_p(
-                target=target,
+                target_scores=target_scores,
                 t2d=t2d,
                 loss_mask=loss_mask,
             )
@@ -360,15 +389,15 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
             return target_p_padded, position_mask
 
 
-    def _compute_target_p(self, target, t2d, loss_mask):
-        target_head = target
-        target_max_token = target_head.argmax(-1)
+    def _compute_target_p(self, target_scores, t2d, loss_mask):
+        target_subset_scores = target_scores
+        target_max_token = target_subset_scores.argmax(-1)
         target_mask = t2d[target_max_token]
         target_mask = target_mask[..., None].int()
         position_mask = target_mask * loss_mask
-        target_head = target_head[..., t2d]
-        target_head = target_head.float()
-        target_p = nn.Softmax(dim=2)(target_head)
+        target_subset_scores = target_subset_scores[..., t2d]
+        target_subset_scores = target_subset_scores.float()
+        target_p = nn.Softmax(dim=2)(target_subset_scores)
         target_p = target_p.detach()
         return target_p, position_mask
         

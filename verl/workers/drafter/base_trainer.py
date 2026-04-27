@@ -450,17 +450,24 @@ class DrafterBaseTrainer:
 
         batch_size = cpu_input_ids.size(0)
 
-        # 动态计算最小序列长度
-        if cpu_target_logprobs is not None:
-            seq_length = min(cpu_target_logprobs.size(1), cpu_input_ids.size(1), cpu_h_states.size(1))
-        else:
-            seq_length = min(cpu_input_ids.size(1), cpu_h_states.size(1))
+        # Keep feature tensors at their full shared length. For token-level teacher
+        # targets such as target_logprobs, we preserve their own length instead of
+        # truncating input_ids/hidden_states down to match them. This lets the
+        # training batch build the standard next-token alignment:
+        #   inputs/hidden states at [0..T-2]
+        #   target logprobs / loss mask at [1..T-1]
+        feature_seq_length = min(cpu_input_ids.size(1), cpu_h_states.size(1))
+        target_seq_length = (
+            min(cpu_target_logprobs.size(1), feature_seq_length) if cpu_target_logprobs is not None else None
+        )
         
         for i in range(batch_size):
             data_item = { 
-                "input_ids": cpu_input_ids[i, :seq_length], 
-                "hidden_states": cpu_h_states[i, :seq_length, :], 
-                "target_logprobs": cpu_target_logprobs[i, :seq_length, ...] if cpu_target_logprobs is not None else None,
+                "input_ids": cpu_input_ids[i, :feature_seq_length],
+                "hidden_states": cpu_h_states[i, :feature_seq_length, :],
+                "target_logprobs": (
+                    cpu_target_logprobs[i, :target_seq_length, ...] if cpu_target_logprobs is not None else None
+                ),
                 "responses": cpu_responses[i] if cpu_responses is not None else None, 
                 "prompts": cpu_prompts[i] if cpu_prompts is not None else None, 
             }
@@ -547,9 +554,27 @@ class DrafterBaseTrainer:
         position_ids = torch.arange(total_seq_len, device=dev).unsqueeze(0)[:, :-1].contiguous()
 
         if self.backend.model_type == "eagle3":
-            last_hidden_states = last_hidden_states_concat[:, 1:].contiguous()
             if use_logits:
-                target_logprobs = target_logprobs_concat[:, 1:].contiguous()
+                # rollout already returns token-level teacher targets aligned to
+                # positions [1..T-1]. Keep them as-is and match them against the
+                # standard next-token inputs built above from [0..T-2].
+                train_seq_len = min(
+                    input_ids.size(1),
+                    loss_mask.size(1),
+                    base_h.size(1),
+                    target_logprobs_concat.size(1),
+                )
+                if train_seq_len < 1:
+                    return None
+                input_ids = input_ids[:, :train_seq_len].contiguous()
+                attn_mask = attn_mask[:, :train_seq_len].contiguous()
+                base_h = base_h[:, :train_seq_len].contiguous()
+                position_ids = position_ids[:, :train_seq_len].contiguous()
+                loss_mask = loss_mask[:, :train_seq_len].contiguous()
+                target_logprobs = target_logprobs_concat[:, :train_seq_len].contiguous()
+                last_hidden_states = last_hidden_states_concat[:, 1 : 1 + train_seq_len].contiguous()
+            else:
+                last_hidden_states = last_hidden_states_concat[:, 1:].contiguous()
         elif self.backend.model_type == "eagle":
             target = hidden_states_concat[:, 1:].contiguous()
 

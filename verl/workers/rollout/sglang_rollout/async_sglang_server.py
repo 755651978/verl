@@ -82,7 +82,7 @@ def _top_logprobs_to_tensor(top_logprobs: list, topk: int) -> Optional[torch.Ten
         if not row:
             continue
         while len(row) < topk:
-            row.append([-math.inf, 0.0])
+            row.append([-math.inf, -1.0])
         rows.append(row)
 
     if not rows:
