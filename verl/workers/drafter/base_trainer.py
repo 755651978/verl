@@ -594,9 +594,16 @@ class DrafterBaseTrainer:
                 if self.backend.model_type == "eagle3":
                     last_hidden_states = torch.nn.functional.pad(last_hidden_states, (0, 0, 0, pad_size), value=0.0)
                     if use_logits:
-                        target_logprobs = torch.nn.functional.pad(
-                            target_logprobs, (0, 0, 0, 0, 0, pad_size), value=0.0
+                        pad_shape = list(target_logprobs.shape)
+                        pad_shape[1] = pad_size
+                        target_logprobs_pad = torch.zeros(
+                            pad_shape,
+                            dtype=target_logprobs.dtype,
+                            device=target_logprobs.device,
                         )
+                        target_logprobs_pad[..., 0] = float("-inf")
+                        target_logprobs_pad[..., 1] = -1.0
+                        target_logprobs = torch.cat((target_logprobs, target_logprobs_pad), dim=1)
                 elif self.backend.model_type == "eagle":
                     target = torch.nn.functional.pad(target, (0, 0, 0, pad_size), value=0.0)
 

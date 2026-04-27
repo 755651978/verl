@@ -57,6 +57,9 @@ visible_devices_keyword = get_visible_devices_keyword()
 
 
 def _top_logprobs_to_tensor(top_logprobs: list, topk: int) -> Optional[torch.Tensor]:
+    if topk <= 0:
+        return None
+
     rows = []
     for step_top_logprobs in top_logprobs:
         if isinstance(step_top_logprobs, dict):
@@ -80,7 +83,7 @@ def _top_logprobs_to_tensor(top_logprobs: list, topk: int) -> Optional[torch.Ten
                 continue
 
         if not row:
-            continue
+            row = [[-math.inf, -1.0] for _ in range(topk)]
         while len(row) < topk:
             row.append([-math.inf, -1.0])
         rows.append(row)

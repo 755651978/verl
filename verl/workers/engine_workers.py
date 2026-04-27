@@ -790,8 +790,8 @@ class DrafterWorker(Worker):
         self.infer_tp = self.rollout_tp * self.rollout_dp
         infer_pp = self.config.rollout.pipeline_model_parallel_size
         self.rollout_world_size = self.infer_tp * infer_pp
-        self.rollout_rank = rank % self.rollout_world_size
-        self.replica_rank = rank // self.rollout_world_size
+        self.rollout_rank = self.rank % self.rollout_world_size
+        self.replica_rank = self.rank // self.rollout_world_size
         self.local_infer_tp_rank = self.rollout_rank // infer_pp
         self.local_infer_pp_rank = self.rollout_rank % infer_pp
         self.local_drafter_sp_rank = None

@@ -20,25 +20,27 @@ device_name = get_device_name()
 
 
 def _scatter_sparse_logprobs(logprobs: torch.Tensor, indices: torch.Tensor, vocab_size: int) -> torch.Tensor:
-    full_logits = torch.full(
+    full_logprob_view = torch.full(
         (logprobs.size(0), vocab_size),
         float("-inf"),
         dtype=logprobs.dtype,
         device=logprobs.device,
     )
     if logprobs.numel() == 0:
-        return full_logits
+        return full_logprob_view
 
     valid = torch.isfinite(logprobs) & (indices >= 0) & (indices < vocab_size)
     if not valid.any():
-        return full_logits
+        return full_logprob_view
 
     row_indices = torch.arange(logprobs.size(0), device=logprobs.device).unsqueeze(1).expand_as(indices)
-    full_logits[row_indices[valid], indices[valid]] = logprobs[valid]
-    return full_logits
+    full_logprob_view[row_indices[valid], indices[valid]] = logprobs[valid]
+    return full_logprob_view
 
 
 def reconstruct_sparse_logprob_view(target_topk_logprobs, topk, vocab_size):
+    if topk <= 0:
+        raise ValueError(f"topk must be positive when reconstructing sparse logprob view, got {topk}")
     if isinstance(target_topk_logprobs, torch.Tensor):
         if target_topk_logprobs.dim() != 3 or target_topk_logprobs.size(-1) < 2:
             raise ValueError(
@@ -46,9 +48,12 @@ def reconstruct_sparse_logprob_view(target_topk_logprobs, topk, vocab_size):
                 f"but got shape={tuple(target_topk_logprobs.shape)}"
             )
         if target_topk_logprobs.numel() == 0:
-            return torch.empty(
-                target_topk_logprobs.shape[0],
-                vocab_size,
+            return torch.full(
+                (
+                    target_topk_logprobs.shape[0],
+                    vocab_size,
+                ),
+                float("-inf"),
                 dtype=target_topk_logprobs.dtype,
                 device=target_topk_logprobs.device,
             )
@@ -79,7 +84,7 @@ def reconstruct_sparse_logprob_view(target_topk_logprobs, topk, vocab_size):
                 continue
 
         if not row:
-            continue
+            row = [[float("-inf"), -1] for _ in range(topk)]
         while len(row) < topk:
             row.append([float("-inf"), -1])
         rows.append(row)
@@ -331,7 +336,7 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
         length = len(all_step_logits)
         seq_length = input_ids.shape[1]
 
-        target_p_padded, position_mask = self._compute_target_p_padded(
+        target_p_padded, target_position_mask_padded = self._compute_target_p_padded(
             target_scores=target_scores,
             t2d=draft_model.t2d,
             loss_mask=loss_mask,
@@ -350,9 +355,13 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
             # 这里的关键是 target_p 会随着 idx 往后偏移
             target_p = target_p_padded[:, idx : idx + seq_length, :].contiguous()
             logits = all_step_logits[idx]
-            position_mask = all_step_position_mask[idx]
-            if position_mask.dim() == 3:
-                position_mask = position_mask.squeeze(-1)
+            step_position_mask = all_step_position_mask[idx]
+            if step_position_mask.dim() == 3:
+                step_position_mask = step_position_mask.squeeze(-1)
+            target_position_mask = target_position_mask_padded[:, idx : idx + seq_length]
+            if target_position_mask.dim() == 3:
+                target_position_mask = target_position_mask.squeeze(-1)
+            position_mask = step_position_mask * target_position_mask
 
             log_probs = F.log_softmax(logits, dim=-1)
             
@@ -382,21 +391,34 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
                 target_p,
                 pad=(0, 0, 0, length),
                 mode="constant",
-                # For bitwise equality with previous code
+                # Future-shift padding is masked out by position_mask_padded.
                 value=1 / target_p.shape[-1],
             )
+            position_mask_padded = F.pad(
+                position_mask,
+                pad=(0, length),
+                mode="constant",
+                value=0.0,
+            )
 
-            return target_p_padded, position_mask
+            return target_p_padded, position_mask_padded
 
 
     def _compute_target_p(self, target_scores, t2d, loss_mask):
         target_subset_scores = target_scores
         target_max_token = target_subset_scores.argmax(-1)
-        target_mask = t2d[target_max_token]
-        target_mask = target_mask[..., None].int()
-        position_mask = target_mask * loss_mask
+        target_mask = t2d[target_max_token].to(loss_mask.device)
         target_subset_scores = target_subset_scores[..., t2d]
+        if target_subset_scores.size(-1) == 0:
+            raise ValueError("EAGLE3 target-to-draft vocab mask selects zero tokens")
+        finite_target_mask = torch.isfinite(target_subset_scores).any(dim=-1)
+        position_mask = target_mask.float() * finite_target_mask.float() * loss_mask.float()
         target_subset_scores = target_subset_scores.float()
+        target_subset_scores = torch.where(
+            finite_target_mask.unsqueeze(-1),
+            target_subset_scores,
+            torch.zeros_like(target_subset_scores),
+        )
         target_p = nn.Softmax(dim=2)(target_subset_scores)
         target_p = target_p.detach()
         return target_p, position_mask
