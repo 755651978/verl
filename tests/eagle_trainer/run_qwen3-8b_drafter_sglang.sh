@@ -53,6 +53,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.drafter.model_path=${DRAFTER_PATH} \
     actor_rollout_ref.rollout.drafter.speculative_algorithm="EAGLE3" \
     actor_rollout_ref.rollout.drafter.training.collect_hidden_states_from_sgl=False \
+    actor_rollout_ref.rollout.drafter.training.use_logits=True \
     actor_rollout_ref.rollout.drafter.rollout.spec_steps=3 \
     actor_rollout_ref.rollout.drafter.rollout.spec_topk=1 \
     actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens=4 \
