@@ -22,6 +22,7 @@ from itertools import chain
 from typing import Optional
 
 import torch
+import torch.distributed as dist
 from codetiming import Timer
 from omegaconf import DictConfig, open_dict
 from tensordict import NonTensorData, TensorDict
