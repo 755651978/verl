@@ -1322,31 +1322,28 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         self.quant_config = quant_config
 
         self.vocab_size = config.vocab_size
-        self.draft_vocab_size = config.draft_vocab_size
+        self.draft_vocab_size = getattr(config, "draft_vocab_size", config.vocab_size)
+        self.target_hidden_size = getattr(config, "target_hidden_size", config.hidden_size)
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
         self.midlayer = LlamaDecoderLayer(config, attention_backend=attention_backend)
 
-        if hasattr(config, "target_hidden_size"):
-            self.fc = torch.nn.Linear(
-                config.target_hidden_size * 3, config.hidden_size, bias=False
-            )
-        else:
-            self.fc = torch.nn.Linear(
-                config.hidden_size * 3, config.hidden_size, bias=False
-            )
+        self.fc = torch.nn.Linear(
+            self.target_hidden_size * 3, config.hidden_size, bias=False
+        )
 
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = nn.Linear(
-            config.hidden_size, config.draft_vocab_size, bias=False
+            config.hidden_size, self.draft_vocab_size, bias=False
         )
 
         self.post_init()
 
         # create vocab buffers
-        t2d = torch.ones(self.vocab_size, dtype=torch.bool)
-        d2t = torch.zeros(self.draft_vocab_size, dtype=torch.int64)
+        t2d = torch.zeros(self.vocab_size, dtype=torch.bool)
+        t2d[: self.draft_vocab_size] = True
+        d2t = torch.arange(self.draft_vocab_size, dtype=torch.int64)
         self.register_buffer("t2d", t2d)
         self.register_buffer("d2t", d2t)
 
@@ -1457,7 +1454,12 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
 
     def project_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # eagle 3 requires hidden states from 3 layers
-        assert hidden_states.size(-1) == self.config.hidden_size * 3
+        expected_hidden_size = self.target_hidden_size * 3
+        if hidden_states.size(-1) != expected_hidden_size:
+            raise ValueError(
+                f"EAGLE3 expects hidden_states last dim {expected_hidden_size}, "
+                f"got {hidden_states.size(-1)}"
+            )
         return self.fc(hidden_states)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1490,7 +1492,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         """实现 Teacher Forcing 下的右移填充：舍弃首位，末位补0"""
         # x: (batch, seq) -> (batch, seq)
         # 逻辑：将序列整体向左推一格，模拟序列的步进
-        return torch.cat([x[:, 1:], torch.zeros_like(x[:, :1])], dim=-1)
+        return torch.cat([x[:, 1:], torch.zeros_like(x[:, :1])], dim=1)
 
 
 class LlamaForCausalLMEagle(EagleDraftModel):
