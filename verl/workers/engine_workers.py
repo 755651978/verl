@@ -69,13 +69,15 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 DRAFTER_OWNER_ROUTE_MESH = "drafter_owner_route"
 
 
-def _resolve_drafter_init_backend(device_name: Optional[str] = None) -> str:
-    device_name = device_name
+def _resolve_drafter_init_backend(device_name: str) -> str:
+    device_name = str(device_name).lower()
     if device_name == "npu":
         return "cpu:gloo,npu:hccl"
     if device_name == "cuda":
         return "cpu:gloo,cuda:nccl"
-    return "cpu:gloo"
+    if device_name == "cpu":
+        return "cpu:gloo"
+    raise ValueError(f"Unsupported drafter device_name={device_name!r}")
 
 
 def _with_routing_replay_flag(enabled: bool):
@@ -775,14 +777,11 @@ class DrafterWorker(Worker):
 
     def __init__(self, config: DictConfig, role: str = "drafter", device_name: Optional[str] = None, **kwargs):
         Worker.__init__(self)
-        self.device_name = device_name
-        initialize_global_process_group_ray(
-            timeout_second=None,
-            backend=_resolve_drafter_init_backend(self.device_name),
-        )
-        set_numa_affinity()
         self.config = config
         self.role = role
+        if device_name is None:
+            raise ValueError("DrafterWorker requires an explicit device_name from the trainer initialization path")
+        self.device_name = str(device_name).lower()
         self.trainer = None
         self.last_global_step = None
         self.last_trained_step = None
@@ -794,6 +793,7 @@ class DrafterWorker(Worker):
         self.dp_group_world_size = 1
         self.num_rollout_replicas = 1
         self.training_device_mesh = None
+        self._process_group_initialized = False
         self._training_group_initialized = False
 
         rank = int(os.environ.get("RANK", "0"))
@@ -819,8 +819,24 @@ class DrafterWorker(Worker):
         self.training_interval_steps = int(self.config.rollout.drafter.training.get("training_interval_steps", 1))
         self.train_steps_per_trigger = int(self.config.rollout.drafter.training.get("step", 100))
 
+    def _ensure_process_group_initialized(self):
+        if not dist.is_initialized():
+            initialize_global_process_group_ray(
+                timeout_second=None,
+                backend=_resolve_drafter_init_backend(self.device_name),
+            )
+        if not self._process_group_initialized:
+            set_numa_affinity()
+            self._process_group_initialized = True
+        if dist.is_initialized():
+            self.rank = dist.get_rank()
+
     def _ensure_training_group_initialized(self):
-        if self._training_group_initialized or not dist.is_initialized():
+        if self._training_group_initialized:
+            return
+
+        self._ensure_process_group_initialized()
+        if not dist.is_initialized():
             return
 
         world_size = dist.get_world_size()
@@ -836,7 +852,7 @@ class DrafterWorker(Worker):
             rollout_layout.replica_training_ranks[0][0] if rollout_layout.replica_training_ranks else None
         )
         self.is_global_publish_leader = self.rank == self.global_publish_leader_rank
-        self.training_device_mesh = build_drafter_training_device_mesh(get_device_name(), rollout_layout)
+        self.training_device_mesh = build_drafter_training_device_mesh(self.device_name, rollout_layout)
         owner_route_rank = self.num_rollout_replicas
         owner_route_collect = False
 

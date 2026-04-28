@@ -1652,7 +1652,10 @@ class TaskRunner:
         from verl.workers.engine_workers import DrafterWorker
 
         self.role_worker_mapping[Role.Drafter] = ray.remote(DrafterWorker)
-        self.mapping[Role.Drafter] = "global_pool"
+        self.mapping[Role.Drafter] = self.mapping.get(
+            Role.ActorRollout,
+            self.mapping.get(Role.ActorRolloutRef, "global_pool"),
+        )
 
     def init_resource_pool_mgr(self, config):
         """Initialize resource pool manager."""
