@@ -50,6 +50,42 @@ from verl.workers.rollout.sglang_rollout.utils import (
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+VERL_SGLANG_TARGET_WEIGHT_LOADER = (
+    "verl.workers.rollout.sglang_rollout.sglang_rollout.verl_sglang_target_weight_loader"
+)
+VERL_SGLANG_DRAFT_WEIGHT_LOADER = (
+    "verl.workers.rollout.sglang_rollout.sglang_rollout.verl_sglang_draft_weight_loader"
+)
+
+
+def _is_sglang_eagle_draft_model(model) -> bool:
+    config = getattr(model, "config", None)
+    class_name = type(model).__name__.lower()
+    architectures = getattr(config, "architectures", None) or []
+    return (
+        "eagle" in class_name
+        or any("eagle" in str(architecture).lower() for architecture in architectures)
+        or getattr(config, "draft_vocab_size", None) is not None
+    )
+
+
+def _supports_sglang_custom_weight_loader() -> bool:
+    return "custom_weight_loader" in getattr(ServerArgs, "__dataclass_fields__", {})
+
+
+def verl_sglang_target_weight_loader(model, named_tensors):
+    """Load weights only into the target model when SGLang routes through EAGLEWorker."""
+    if _is_sglang_eagle_draft_model(model):
+        return
+    return model.load_weights(named_tensors)
+
+
+def verl_sglang_draft_weight_loader(model, named_tensors):
+    """Load weights only into the EAGLE draft model when EAGLEWorker also calls the target worker."""
+    if not _is_sglang_eagle_draft_model(model):
+        return
+    return model.load_weights(named_tensors)
+
 
 # patch to avoid issue https://github.com/sgl-project/sglang/issues/6723
 def _set_envs_and_config(server_args: ServerArgs):
@@ -317,6 +353,11 @@ class ServerAdapter(BaseRollout):
             else:
                 weights = weights
 
+            load_format = (
+                VERL_SGLANG_TARGET_WEIGHT_LOADER
+                if self.config.drafter.enable and _supports_sglang_custom_weight_loader()
+                else None
+            )
             async for params_batch in get_named_tensor_buckets(weights, update_weights_bucket_bytes):
                 await _sgl_update_weights_with_route(
                     engine=self._engine,
@@ -324,6 +365,7 @@ class ServerAdapter(BaseRollout):
                     device_mesh_key="infer_tp",
                     device_mesh=self.device_mesh,
                     disable_draft_model=True,
+                    load_format=load_format,
                 )
 
         if self.device_mesh["infer_tp"].get_local_rank() == 0:
@@ -344,6 +386,9 @@ class ServerAdapter(BaseRollout):
                 device_mesh_key="infer_tp",
                 device_mesh=self.device_mesh,
                 disable_draft_model=False,
+                load_format=(
+                    VERL_SGLANG_DRAFT_WEIGHT_LOADER if _supports_sglang_custom_weight_loader() else None
+                ),
             )
 
         if self.device_mesh["infer_tp"].get_local_rank() == 0:
