@@ -45,6 +45,7 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_visible_devices_keyword
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.utils.profiler import DistProfiler, build_sglang_profiler_args
+from verl.workers.drafter.sglang_patch import install_sglang_verl_patches
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
 from verl.workers.rollout.sglang_rollout.sglang_rollout import (
@@ -283,7 +284,7 @@ class SGLangHttpServer:
         if self.config.enable_rollout_routing_replay:
             args.update({"enable_return_routed_experts": True})
 
-        if "custom_weight_loader" in [f.name for f in dataclasses.fields(ServerArgs)]:
+        if self.config.drafter.enable and "custom_weight_loader" in [f.name for f in dataclasses.fields(ServerArgs)]:
             custom_weight_loaders = list(args.get("custom_weight_loader") or [])
             for loader in (VERL_SGLANG_TARGET_WEIGHT_LOADER, VERL_SGLANG_DRAFT_WEIGHT_LOADER):
                 if loader not in custom_weight_loaders:
@@ -320,6 +321,12 @@ class SGLangHttpServer:
 
         # NOTE: We can't directly call SGLang's launch_server since it's not an async function.
         # https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/entrypoints/http_server.py
+        if self.config.drafter.enable:
+            install_sglang_verl_patches(
+                set_envs_and_config=_set_envs_and_config,
+                target_weight_loader=VERL_SGLANG_TARGET_WEIGHT_LOADER,
+                draft_weight_loader=VERL_SGLANG_DRAFT_WEIGHT_LOADER,
+            )
         sglang.srt.entrypoints.engine._set_envs_and_config = _set_envs_and_config
         os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
         server_args = ServerArgs(**args)

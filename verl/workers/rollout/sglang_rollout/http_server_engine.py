@@ -371,6 +371,7 @@ class HttpServerAdapter(EngineBase):
         load_format = req.load_format
         flush_cache = req.flush_cache
         disable_draft_model = getattr(req, "disable_draft_model", None)
+        disable_target_model = getattr(req, "disable_target_model", None)
 
         if named_tensors:
             serialized_named_tensors = [
@@ -386,6 +387,8 @@ class HttpServerAdapter(EngineBase):
         }
         if disable_draft_model is not None:
             payload["disable_draft_model"] = disable_draft_model
+        if disable_target_model is not None:
+            payload["disable_target_model"] = disable_target_model
 
         return self._make_request("update_weights_from_tensor", payload)
 
@@ -766,6 +769,7 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
         load_format = req.load_format
         flush_cache = req.flush_cache
         disable_draft_model = getattr(req, "disable_draft_model", None)
+        disable_target_model = getattr(req, "disable_target_model", None)
 
         serialized_named_tensors = [base64.b64encode(named_tensor).decode("utf-8") for named_tensor in named_tensors]
         payload = {
@@ -775,6 +779,8 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
         }
         if disable_draft_model is not None:
             payload["disable_draft_model"] = disable_draft_model
+        if disable_target_model is not None:
+            payload["disable_target_model"] = disable_target_model
 
         return await self._make_async_request("update_weights_from_tensor", payload)
 

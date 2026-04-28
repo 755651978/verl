@@ -132,7 +132,8 @@ async def _sgl_update_weights_with_route(
     params_batch: list[tuple[str, torch.Tensor]],
     device_mesh_key: str,
     device_mesh: DeviceMesh,
-    disable_draft_model: bool,
+    disable_draft_model: bool | None,
+    disable_target_model: bool | None,
     load_format: str | None = None,
 ):
     """Update SGLang weights through the official request path with explicit target/draft routing."""
@@ -180,7 +181,10 @@ async def _sgl_update_weights_with_route(
         ],
         load_format=load_format,
     )
-    setattr(update_weights_request, "disable_draft_model", disable_draft_model)
+    if disable_draft_model is not None:
+        setattr(update_weights_request, "disable_draft_model", disable_draft_model)
+    if disable_target_model is not None:
+        setattr(update_weights_request, "disable_target_model", disable_target_model)
     return await engine.update_weights_from_tensor(update_weights_request)
 
 
@@ -358,13 +362,16 @@ class ServerAdapter(BaseRollout):
                 if self.config.drafter.enable and _supports_sglang_custom_weight_loader()
                 else None
             )
+            disable_draft_model = True if self.config.drafter.enable else None
+            disable_target_model = False if self.config.drafter.enable else None
             async for params_batch in get_named_tensor_buckets(weights, update_weights_bucket_bytes):
                 await _sgl_update_weights_with_route(
                     engine=self._engine,
                     params_batch=params_batch,
                     device_mesh_key="infer_tp",
                     device_mesh=self.device_mesh,
-                    disable_draft_model=True,
+                    disable_draft_model=disable_draft_model,
+                    disable_target_model=disable_target_model,
                     load_format=load_format,
                 )
 
@@ -386,6 +393,7 @@ class ServerAdapter(BaseRollout):
                 device_mesh_key="infer_tp",
                 device_mesh=self.device_mesh,
                 disable_draft_model=False,
+                disable_target_model=True,
                 load_format=(
                     VERL_SGLANG_DRAFT_WEIGHT_LOADER if _supports_sglang_custom_weight_loader() else None
                 ),
