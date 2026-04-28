@@ -760,6 +760,7 @@ class RayPPOTrainer:
                 cls=self.role_worker_mapping[Role.Drafter],
                 config=self.config.actor_rollout_ref,
                 role=str(Role.Drafter),
+                device_name=self.device_name,
             )
             self.resource_pool_to_cls[resource_pool][str(Role.Drafter)] = drafter_cls
 

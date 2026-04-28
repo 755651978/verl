@@ -69,8 +69,8 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 DRAFTER_OWNER_ROUTE_MESH = "drafter_owner_route"
 
 
-def _resolve_drafter_init_backend() -> str:
-    device_name = get_device_name()
+def _resolve_drafter_init_backend(device_name: Optional[str] = None) -> str:
+    device_name = device_name
     if device_name == "npu":
         return "cpu:gloo,npu:hccl"
     if device_name == "cuda":
@@ -773,9 +773,13 @@ class DrafterWorker(Worker):
     drafter model periodically according to global RL steps.
     """
 
-    def __init__(self, config: DictConfig, role: str = "drafter", **kwargs):
+    def __init__(self, config: DictConfig, role: str = "drafter", device_name: Optional[str] = None, **kwargs):
         Worker.__init__(self)
-        initialize_global_process_group_ray(timeout_second=None, backend=_resolve_drafter_init_backend())
+        self.device_name = device_name
+        initialize_global_process_group_ray(
+            timeout_second=None,
+            backend=_resolve_drafter_init_backend(self.device_name),
+        )
         set_numa_affinity()
         self.config = config
         self.role = role
