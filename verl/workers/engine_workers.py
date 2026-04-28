@@ -69,6 +69,15 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 DRAFTER_OWNER_ROUTE_MESH = "drafter_owner_route"
 
 
+def _resolve_drafter_init_backend() -> str:
+    device_name = get_device_name()
+    if device_name == "npu":
+        return "cpu:gloo,npu:hccl"
+    if device_name == "cuda":
+        return "cpu:gloo,cuda:nccl"
+    return "cpu:gloo"
+
+
 def _with_routing_replay_flag(enabled: bool):
     """Decorator to set 'enable_routing_replay' flag on the data TensorDict."""
 
@@ -766,7 +775,7 @@ class DrafterWorker(Worker):
 
     def __init__(self, config: DictConfig, role: str = "drafter", **kwargs):
         Worker.__init__(self)
-        initialize_global_process_group_ray(timeout_second=None)
+        initialize_global_process_group_ray(timeout_second=None, backend=_resolve_drafter_init_backend())
         set_numa_affinity()
         self.config = config
         self.role = role
