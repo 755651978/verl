@@ -476,6 +476,8 @@ drafter:
     warmup_style: constant
     use_logits: false
     logits_topk: 128
+    ttt_length: 1
+    vocab_mapping_path: null
     current_max_samples: 2000
     data_buffer_max_size: 10000
 

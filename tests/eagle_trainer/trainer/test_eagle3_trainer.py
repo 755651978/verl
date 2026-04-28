@@ -1,115 +1,184 @@
+import asyncio
 import os
+import shutil
+import tempfile
+from pathlib import Path
+
+import pytest
 import torch
 import torch.distributed as dist
 from omegaconf import OmegaConf
-from unittest.mock import MagicMock
-from transformers import AutoConfig
-from torch.distributed.device_mesh import init_device_mesh
+from transformers import AutoConfig, LlamaConfig, LlamaForCausalLM
 
-from verl.workers.drafter.eagle3_trainer_backend import Eagle3TrainerBackend
 from verl.workers.drafter.base_trainer import DrafterBaseTrainer
+from verl.workers.drafter.eagle3_trainer_backend import Eagle3TrainerBackend
 from verl.workers.drafter.model.eagle import LlamaForCausalLMEagle3
 
 
-def setup_real_dist():
-    # 1. 初始化分布式环境（FSDP2 依赖）
+def _init_dist() -> tuple[int, int]:
+    if not torch.cuda.is_available():
+        pytest.skip("EAGLE3 multi-card integration test requires CUDA")
+    if "LOCAL_RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
+        pytest.skip("Run with torchrun, for example: torchrun --standalone --nproc-per-node=2 this_file.py")
+
     if not dist.is_initialized():
-        dist.init_process_group(backend="cpu:gloo,cuda:nccl")
-        local_rank = int(os.environ["LOCAL_RANK"])
-        torch.cuda.set_device(local_rank)
-        return local_rank
-        
-    return dist.get_rank()
-    
-def test_eagle_training_flow():
-    # 1、初始化分布式环境
-    rank = setup_real_dist()
-    device = torch.device(f"cuda:{rank}")
-    world_size = dist.get_world_size()
-       
-    # 2、配置加载
-    config = OmegaConf.load("/nas/disk6/ls/workspace/verl-spec-3/tests/eagle_trainer/config/eagle3_trainer.yaml")
+        dist.init_process_group(backend="nccl")
 
-    # 3、准备模型配置
-    target_config = AutoConfig.from_pretrained("/nas/disk6/ls/angelslim-qwen3-8b-eagle3", trust_remote_code=True)
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    return local_rank, dist.get_world_size()
 
-    # 4. 实例化 Backend
-    backend = Eagle3TrainerBackend(
-        config=config,
-        target_model_config=target_config,
+
+def _tiny_llama_config() -> LlamaConfig:
+    return LlamaConfig(
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=128,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+        tie_word_embeddings=False,
     )
 
-    # 5. 实例化 Trainer
+
+def _create_tiny_checkpoints(root: Path) -> tuple[Path, Path]:
+    target_dir = root / "target"
+    drafter_dir = root / "drafter"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    drafter_dir.mkdir(parents=True, exist_ok=True)
+
+    target_config = _tiny_llama_config()
+    target_model = LlamaForCausalLM(target_config)
+    target_model.save_pretrained(target_dir, safe_serialization=True, max_shard_size="10KB")
+
+    drafter_config = _tiny_llama_config()
+    drafter_config.architectures = ["LlamaForCausalLMEagle3"]
+    drafter_config.draft_vocab_size = drafter_config.vocab_size
+    drafter_config.target_hidden_size = target_config.hidden_size
+    drafter_config.num_hidden_layers = 1
+    drafter_model = LlamaForCausalLMEagle3(drafter_config)
+    drafter_model.save_pretrained(drafter_dir, safe_serialization=True, max_shard_size="10KB")
+
+    return target_dir, drafter_dir
+
+
+def _build_config(target_dir: Path, drafter_dir: Path):
+    return OmegaConf.create(
+        {
+            "model": {
+                "path": str(target_dir),
+                "local_hf_config_path": str(target_dir),
+                "trust_remote_code": False,
+            },
+            "rollout": {
+                "tensor_model_parallel_size": 1,
+                "drafter": {
+                    "enable": True,
+                    "enable_drafter_training": True,
+                    "speculative_algorithm": "EAGLE3",
+                    "model_path": str(drafter_dir),
+                    "checkpoint_path": None,
+                    "training": {
+                        "collect_hidden_states_from_sgl": True,
+                        "use_data_buffer": False,
+                        "batch_size_per_gpu": 2,
+                        "step": 100,
+                        "lr": 1e-4,
+                        "lr_warmup_steps": 0,
+                        "warmup_style": "constant",
+                        "use_logits": False,
+                        "ttt_length": 2,
+                        "current_max_samples": 16,
+                        "data_buffer_max_size": 16,
+                        "fsdp_config": {
+                            "wrap_policy": {"min_num_params": 0},
+                            "use_orig_params": True,
+                            "forward_prefetch": False,
+                        },
+                    },
+                },
+            },
+        }
+    )
+
+
+def _mock_rollout_batch(config: LlamaConfig, batch_size: int = 2, seq_len: int = 24, prompt_len: int = 8):
+    response_len = seq_len - prompt_len
+    input_ids = torch.randint(3, config.vocab_size, (batch_size, seq_len), device="cuda")
+    prompts = input_ids[:, :prompt_len].contiguous()
+    responses = input_ids[:, prompt_len:].contiguous()
+
+    hidden_states = torch.randn(
+        batch_size,
+        seq_len,
+        config.hidden_size * 4,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    return {
+        "input_ids": input_ids,
+        "prompts": prompts,
+        "responses": responses,
+    }, hidden_states
+
+
+def test_eagle3_multigpu_model_and_training_flow():
+    _, world_size = _init_dist()
+    root = Path(os.environ.get("EAGLE3_TEST_TMPDIR", tempfile.gettempdir())) / (
+        f"verl_eagle3_tiny_{os.environ.get('MASTER_PORT', 'standalone')}"
+    )
+
+    if dist.get_rank() == 0:
+        shutil.rmtree(root, ignore_errors=True)
+        target_dir, drafter_dir = _create_tiny_checkpoints(root)
+    dist.barrier()
+    target_dir, drafter_dir = root / "target", root / "drafter"
+
+    config = _build_config(target_dir, drafter_dir)
+    target_config = AutoConfig.from_pretrained(target_dir)
+    backend = Eagle3TrainerBackend(config=config, target_model_config=target_config)
     trainer = DrafterBaseTrainer(
         config=config,
         world_size=world_size,
-        rollout_dp_rank=rank,
-        backend=backend
+        rollout_dp_rank=dist.get_rank(),
+        training_device_mesh=None,
+        backend=backend,
+        training_process_group=dist.group.WORLD,
     )
 
-    # 6. 数据采集测试
-    print("--- 步骤 1: 采集在线数据 ---")
-    # 定义 batch 大小和序列长度
-    batch_size = 2  # 对应你 config 里的 batch_size_per_gpu
-    seq_len = 256
-    prompt_len = 128
-    response_len = 128 # 确保 prompt_len + response_len = seq_len
-    hidden_dim = target_config.hidden_size
+    try:
+        assert asyncio.run(trainer.activate_training_model())
+        assert isinstance(backend.target_model, torch.nn.Module)
 
-    # 构造 Mock 数据，所有 Tensor 第一维必须是 batch_size
-    mock_batch = {
-        "input_ids": torch.randint(0, target_config.vocab_size, (batch_size, seq_len)),
-        "responses": torch.randint(0, target_config.vocab_size, (batch_size, response_len)),
-        "prompts": torch.randint(0, target_config.vocab_size, (batch_size, prompt_len)),
-    }
-    # 模拟隐藏层状态
-    mock_hiddens_states = torch.randn(batch_size, seq_len, hidden_dim*4)
+        raw_model = trainer.model.module if hasattr(trainer.model, "module") else trainer.model
+        assert raw_model.draft_vocab_size == target_config.vocab_size
+        assert raw_model.target_hidden_size == target_config.hidden_size
 
-    trainer.collect_online_data(mock_batch, mock_hiddens_states)
-    print(f"Data collect. Buffer size: {len(trainer.data_buffer)}")
+        batch, hidden_states = _mock_rollout_batch(target_config)
+        trainer.collect_online_data(batch, hidden_states)
+        assert len(trainer.collected_data) == batch["input_ids"].size(0)
 
-     # 7. 模型初始化
-    print("--- 步骤 2: 激活模型 ---")
-    import asyncio
-    mesh = init_device_mesh("cuda", (world_size,))
-    training_ranks = list(range(world_size))
-    async def activate_model():
-        success = await trainer.activate_training_model(mesh, training_ranks)
-        return success
-    loop = asyncio.get_event_loop() 
-    active_success = loop.run_until_complete(activate_model()) 
-    
-    if active_success:
-        print("\n ✔ 激活模型成功")
-        print(f"模型架构：{type(trainer.model)}")
-        print(f"主模型 Head(TargetHead)：{type(backend.target_model)}")
-        # 检查模型是否正确移至 GPU
-        first_param_device = next(trainer.model.parameters()).device
-        print(f"模型当前所在设备：{first_param_device}")
-    else:
-        print("\n ❌ 模型激活失败")
-        return
+        train_batch = trainer._prepare_training_batch()
+        assert train_batch is not None
+        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+            outputs = trainer.backend.compute_loss(trainer.model, train_batch, trainer._current_pad_size)
+        assert outputs["total_local_ploss"].requires_grad
+        assert outputs["local_num_tokens"].item() > 0
 
+        assert asyncio.run(trainer.training_step(step=1))
+        assert trainer.training_steps == 1
+    finally:
+        dist.barrier()
+        if dist.get_rank() == 0:
+            shutil.rmtree(root, ignore_errors=True)
+        dist.barrier()
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
-    # 8. 训练步执行测试
-    print("--- 步骤 3: 执行训练步 ---")
-    async def run_step():
-        success = await trainer.training_step(step=1)
-        return success
-    
-    loop = asyncio.get_event_loop() 
-    step_success = loop.run_until_complete(run_step()) 
-
-    if step_success: 
-        print("Congratulations! The training_step finished successfully.") 
-        print(f"Current training steps counter: {trainer.training_steps}") 
-    else: 
-        print("training_step failed (check logs for 'Not enough data' or other warnings).") 
-        return
-    print("--- 集成测试完成！ ---")
 
 if __name__ == "__main__":
-    test_eagle_training_flow()
-
-    
-
+    test_eagle3_multigpu_model_and_training_flow()

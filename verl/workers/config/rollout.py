@@ -98,6 +98,8 @@ class DrafterTrainingConfig(BaseConfig):
     warmup_style: str = "constant"
     use_logits: bool = False
     logits_topk: int = 128
+    ttt_length: int = 1
+    vocab_mapping_path: Optional[str] = None
     current_max_samples: int = 2000
     data_buffer_max_size: int = 10000
 

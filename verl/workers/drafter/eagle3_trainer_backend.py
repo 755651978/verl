@@ -5,6 +5,7 @@ from copy import deepcopy
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from transformers import AutoConfig
 
 from .model.auto import AutoDraftModelConfig, AutoEagle3DraftModel
 from .eagle_trainer_backend import EagleTrainerBackend
@@ -114,21 +115,46 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
     def model_type(self):
         return "eagle3"
 
+    def _get_target_hf_config(self):
+        target_hf_config = getattr(self.target_model_config, "hf_config", None)
+        if target_hf_config is not None:
+            return target_hf_config
+        if hasattr(self.target_model_config, "hidden_size") and hasattr(self.target_model_config, "vocab_size"):
+            return self.target_model_config
+
+        config_path = (
+            getattr(self.target_model_config, "local_hf_config_path", None)
+            or getattr(self.target_model_config, "hf_config_path", None)
+            or getattr(self.target_model_config, "path", None)
+        )
+        if config_path is None:
+            raise ValueError("Cannot resolve target HF config for EAGLE3 drafter")
+        return AutoConfig.from_pretrained(
+            config_path,
+            trust_remote_code=bool(getattr(self.target_model_config, "trust_remote_code", False)),
+        )
+
     def build_model(self):
         """build eagle3 draft model"""
-        logger.info(f"Initializing Eagle3 model with type: {self.target_model_config.model_type}")
+        logger.info(f"Initializing Eagle3 model with type: {getattr(self.target_model_config, 'model_type', None)}")
         spec_model_path = self.config.rollout.drafter.model_path
         config_path = os.path.join(spec_model_path, "config.json")
+        target_hf_config = self._get_target_hf_config()
 
         # 1、加载 Config
         if os.path.exists(config_path):
             drafter_config = AutoDraftModelConfig.from_file(config_path)
         else:
-            drafter_config = deepcopy(self.target_model_config)
+            drafter_config = deepcopy(target_hf_config)
             drafter_config.num_hidden_layers = 1
             drafter_config.torch_dtype = torch.bfloat16
             drafter_config.tie_word_embeddings = False
             drafter_config.architectures = ["LlamaForCausalLMEagle3"]
+
+        if not hasattr(drafter_config, "draft_vocab_size"):
+            drafter_config.draft_vocab_size = drafter_config.vocab_size
+        if not hasattr(drafter_config, "target_hidden_size"):
+            drafter_config.target_hidden_size = target_hf_config.hidden_size
 
         self.vocab_size = drafter_config.vocab_size
 
@@ -147,14 +173,25 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
         drafter_module.load_embedding(target_model_path)
         drafter_module.freeze_embedding()
         
-        # EAGLE-3 特有逻辑：加载词表映射
-        # mapping_path = getattr(eagle_cfg, "vocab_mapping_path", None)
+        training_cfg = self.config.rollout.drafter.training
+        mapping_path = training_cfg.get("vocab_mapping_path", None)
+        if mapping_path:
+            if not os.path.exists(mapping_path):
+                raise FileNotFoundError(f"EAGLE3 vocab_mapping_path does not exist: {mapping_path}")
+            drafter_module.load_vocab_mapping(mapping_path)
+            logger.info(f"Loaded EAGLE3 vocab mapping from {mapping_path}")
+        elif drafter_module.draft_vocab_size != drafter_module.vocab_size:
+            raise ValueError(
+                "EAGLE3 draft_vocab_size differs from target vocab_size, but no vocab_mapping_path was provided"
+            )
+        selected_vocab_size = int(drafter_module.t2d.sum().item())
+        if selected_vocab_size != drafter_module.draft_vocab_size:
+            raise ValueError(
+                f"EAGLE3 vocab mapping selects {selected_vocab_size} tokens, "
+                f"but draft_vocab_size is {drafter_module.draft_vocab_size}"
+            )
 
-        # if mapping_path and os.path.exists(mapping_path):
-        #     drafter_module.load_vocab_mapping(mapping_path)
-        #     logger.info(f"Loaded EAGLE-3 vocab mapping from {mapping_path}")
-
-        use_logits = self.config.rollout.drafter.training.get("use_logits", False)
+        use_logits = training_cfg.get("use_logits", False)
         if not use_logits:
             target_device = torch.device(f"{device_name}:{get_device_id()}") if device_name != "cpu" else torch.device("cpu")
             self.target_model = self._build_target_model(target_model_path).to(target_device).eval()
@@ -181,7 +218,8 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
         res = {'ids':[], 'h_states':[], 'masks': [], 'last_h_states': [], 'target_logprobs': []}
         max_window = 512
         pad_id = int(getattr(model_config, "pad_token_id", 0) or 0)
-        h_dim = model_config.hidden_size
+        h_dim = getattr(model_config, "target_hidden_size", model_config.hidden_size)
+        use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))
 
         for item in items:
             # 1. 搬运到GPU
@@ -195,8 +233,15 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
             else:
                 full_h = raw_h.to(device, dtype=torch.bfloat16)
 
-            h_states = full_h[:, :3*h_dim]
-            last_h_states = full_h[:, 3*h_dim:]
+            min_hidden_size = 3 * h_dim if use_logits else 4 * h_dim
+            if full_h.size(-1) < min_hidden_size:
+                raise ValueError(
+                    f"EAGLE3 expected at least {min_hidden_size} hidden dims "
+                    f"({'3' if use_logits else '4'} target layers of size {h_dim}), got {full_h.size(-1)}"
+                )
+
+            h_states = full_h[:, : 3 * h_dim]
+            last_h_states = full_h[:, 3 * h_dim : 4 * h_dim]
 
             # Compute loss_mask if not present (for DataBuffer items)
             full_len = ids.size(0)
@@ -253,6 +298,9 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
         loss_mask = batch["loss_mask"]
         position_ids = batch["position_ids"]
         use_logits = self.config.rollout.drafter.training.use_logits
+        ttt_length = int(self.config.rollout.drafter.training.get("ttt_length", 1))
+        if ttt_length < 1:
+            raise ValueError(f"EAGLE3 ttt_length must be >= 1, got {ttt_length}")
         draft_model = model.module if hasattr(model, "module") else model
 
         # 前向传播
@@ -262,6 +310,7 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
             attention_mask=attention_mask,
             loss_mask=loss_mask,
             position_ids=position_ids,
+            ttt_length=ttt_length,
         )
 
         all_step_logits = outputs["logits"]

@@ -138,9 +138,15 @@ class Eagle3DraftModel(DraftModel):
         assert hasattr(self, "t2d") and hasattr(
             self, "d2t"
         ), "t2d and d2t buffersare not found in the draft model, please check your draft model implementation"
-        vocab_mapping = torch.load(file_path)
-        self.t2d.copy_(vocab_mapping["t2d"])
-        self.d2t.copy_(vocab_mapping["d2t"])
+        vocab_mapping = torch.load(file_path, map_location=self.t2d.device)
+        t2d = vocab_mapping["t2d"].to(device=self.t2d.device, dtype=self.t2d.dtype)
+        d2t = vocab_mapping["d2t"].to(device=self.d2t.device, dtype=self.d2t.dtype)
+        if t2d.shape != self.t2d.shape:
+            raise ValueError(f"Expected t2d shape {tuple(self.t2d.shape)}, got {tuple(t2d.shape)}")
+        if d2t.shape != self.d2t.shape:
+            raise ValueError(f"Expected d2t shape {tuple(self.d2t.shape)}, got {tuple(d2t.shape)}")
+        self.t2d.copy_(t2d)
+        self.d2t.copy_(d2t)
         self.vocab_mapping_loaded = True
 
 class EagleDraftModel(DraftModel):
