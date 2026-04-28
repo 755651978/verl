@@ -797,17 +797,15 @@ class DrafterWorker(Worker):
         self._process_group_initialized = False
         self._training_group_initialized = False
 
-        rank = int(os.environ.get("RANK", "0"))
-        self.rank = dist.get_rank() if dist.is_initialized() else rank
         self.rollout_tp = int(self.config.rollout.tensor_model_parallel_size)
         self.rollout_dp = int(self.config.rollout.data_parallel_size)
         self.infer_tp = self.rollout_tp * self.rollout_dp
-        infer_pp = self.config.rollout.pipeline_model_parallel_size
-        self.rollout_world_size = self.infer_tp * infer_pp
+        self.rollout_pp = int(self.config.rollout.pipeline_model_parallel_size)
+        self.rollout_world_size = self.infer_tp * self.rollout_pp
         self.rollout_rank = self.rank % self.rollout_world_size
         self.replica_rank = self.rank // self.rollout_world_size
-        self.local_infer_tp_rank = self.rollout_rank // infer_pp
-        self.local_infer_pp_rank = self.rollout_rank % infer_pp
+        self.local_infer_tp_rank = self.rollout_rank // self.rollout_pp
+        self.local_infer_pp_rank = self.rollout_rank % self.rollout_pp
         self.local_drafter_sp_rank = None
         self.in_drafter_train_group = False
         self.is_drafter_group_leader = False
@@ -829,8 +827,10 @@ class DrafterWorker(Worker):
         if not self._process_group_initialized:
             set_numa_affinity()
             self._process_group_initialized = True
-        if dist.is_initialized():
-            self.rank = dist.get_rank()
+        if dist.is_initialized() and dist.get_rank() != self.rank:
+            raise RuntimeError(
+                f"DrafterWorker rank mismatch: worker_rank={self.rank}, dist_rank={dist.get_rank()}"
+            )
 
     def _ensure_training_group_initialized(self):
         if self._training_group_initialized:
@@ -864,7 +864,8 @@ class DrafterWorker(Worker):
             if mesh_dp_rank != self.replica_rank:
                 raise ValueError(
                     "Drafter mesh dp coordinate does not match rollout replica rank: "
-                    f"mesh_dp_rank={mesh_dp_rank}, rollout_replica_rank={self.replica_rank}, global_rank={self.rank}"
+                    f"mesh_dp_rank={mesh_dp_rank}, rollout_replica_rank={self.replica_rank}, "
+                    f"global_rank={self.rank}"
                 )
             self.training_process_group = self.training_device_mesh["sp"].get_group()
             self.dp_process_group = self.training_device_mesh["dp"].get_group()
