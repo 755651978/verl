@@ -38,6 +38,7 @@ from sglang.srt.utils import (
 from sglang.srt.weight_sync.utils import _preprocess_tensor_for_update_weights
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
+from verl.utils.device import get_device_name, get_torch_device
 from verl.utils.net_utils import is_valid_ipv6_address
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
@@ -49,6 +50,7 @@ from verl.workers.rollout.sglang_rollout.utils import (
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+device_name = get_device_name()
 
 VERL_SGLANG_TARGET_WEIGHT_LOADER = (
     "verl.workers.rollout.sglang_rollout.sglang_rollout.verl_sglang_target_weight_loader"
@@ -135,6 +137,7 @@ async def _sgl_update_weights_with_route(
     disable_draft_model: bool | None,
     disable_target_model: bool | None,
     load_format: str | None = None,
+    stage_cpu_tensors_to_device: bool = False,
 ):
     """Update SGLang weights through the official request path with explicit target/draft routing."""
     from sglang.srt.model_executor.model_runner import LocalSerializedTensor
@@ -146,10 +149,20 @@ async def _sgl_update_weights_with_route(
 
     monkey_patch_torch_reductions()
 
+    def _prepare_update_tensor(tensor: torch.Tensor) -> torch.Tensor:
+        tensor = tensor.detach()
+        if stage_cpu_tensors_to_device and tensor.device.type == "cpu" and device_name != "cpu":
+            device_module = get_torch_device()
+            tensor = tensor.to(
+                torch.device(f"{device_name}:{device_module.current_device()}"),
+                non_blocking=True,
+            )
+        return _preprocess_tensor_for_update_weights(tensor)
+
     named_tensors_batch = [
         (
             name,
-            MultiprocessingSerializer.serialize(_preprocess_tensor_for_update_weights(tensor.detach())),
+            MultiprocessingSerializer.serialize(_prepare_update_tensor(tensor)),
         )
         for name, tensor in params_batch
     ]
@@ -397,6 +410,7 @@ class ServerAdapter(BaseRollout):
                 load_format=(
                     VERL_SGLANG_DRAFT_WEIGHT_LOADER if _supports_sglang_custom_weight_loader() else None
                 ),
+                stage_cpu_tensors_to_device=True,
             )
 
         if self.device_mesh["infer_tp"].get_local_rank() == 0:

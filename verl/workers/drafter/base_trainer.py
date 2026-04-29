@@ -748,12 +748,28 @@ class DrafterBaseTrainer:
 
         # 使用 backend 传回的权重合成最终 Loss
         loss = loss_dict["v_weight"] * vloss + loss_dict["p_weight"] * ploss
+        if not torch.isfinite(loss):
+            logger.error(
+                f"Step {self.training_steps + 1}: non-finite drafter loss, "
+                f"loss={float(loss.detach().float().item())}, "
+                f"vloss={float(vloss.detach().float().item())}, "
+                f"ploss={float(ploss.detach().float().item())}, "
+                f"tokens={float(global_tokens.detach().float().item())}"
+            )
+            return False
 
         # 反向传播
         loss.backward()
 
         # 更新权重
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        if not torch.isfinite(grad_norm):
+            logger.error(
+                f"Step {self.training_steps + 1}: non-finite drafter grad norm, "
+                f"grad_norm={float(grad_norm.detach().float().item())}"
+            )
+            self.optimizer.zero_grad(set_to_none=True)
+            return False
         self.optimizer.step()
         if self.lr_scheduler is not None:
             self.lr_scheduler.step()

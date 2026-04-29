@@ -3,7 +3,6 @@ import os
 from copy import deepcopy
 
 import torch
-import torch.nn as nn
 from torch.nn import functional as F
 from transformers import AutoConfig
 
@@ -454,9 +453,17 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
                 target_position_mask = target_position_mask.squeeze(-1)
             position_mask = step_position_mask * target_position_mask
 
-            log_probs = F.log_softmax(logits, dim=-1)
-            
-            step_loss_sum = (-(target_p * log_probs).sum(dim=-1) * position_mask).sum()
+            log_probs = F.log_softmax(logits.float(), dim=-1)
+            per_token_ploss = -(target_p.float() * log_probs).sum(dim=-1)
+            valid_position = position_mask > 0
+            if valid_position.any() and not torch.isfinite(per_token_ploss[valid_position]).all():
+                raise ValueError("EAGLE3 ploss contains non-finite values on valid target positions")
+            per_token_ploss = torch.where(
+                valid_position,
+                per_token_ploss,
+                torch.zeros_like(per_token_ploss),
+            )
+            step_loss_sum = per_token_ploss.sum()
             
             # 应用Eagle3的时间步衰减
             total_local_ploss += (gamma ** idx) * step_loss_sum
@@ -505,12 +512,24 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
         finite_target_mask = torch.isfinite(target_subset_scores).any(dim=-1)
         position_mask = target_mask.float() * finite_target_mask.float() * loss_mask.float()
         target_subset_scores = target_subset_scores.float()
+        finite_scores = torch.isfinite(target_subset_scores)
+        finite_floor = torch.finfo(target_subset_scores.dtype).min
+        target_subset_scores = torch.where(
+            finite_scores,
+            target_subset_scores,
+            torch.full_like(target_subset_scores, finite_floor),
+        )
         target_subset_scores = torch.where(
             finite_target_mask.unsqueeze(-1),
             target_subset_scores,
             torch.zeros_like(target_subset_scores),
         )
-        target_p = nn.Softmax(dim=2)(target_subset_scores)
+        target_p = F.softmax(target_subset_scores, dim=-1)
+        target_p = torch.where(
+            finite_scores & finite_target_mask.unsqueeze(-1),
+            target_p,
+            torch.zeros_like(target_p),
+        )
         target_p = target_p.detach()
         return target_p, position_mask
         
