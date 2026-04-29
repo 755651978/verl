@@ -14,11 +14,13 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import logging
 import os
 from functools import wraps
 from typing import Callable
 
+import torch
 import sglang.srt.entrypoints.engine
 from sglang.srt.utils import MultiprocessingSerializer
 
@@ -32,6 +34,7 @@ _target_weight_loader: str | None = os.environ.get(_TARGET_WEIGHT_LOADER_ENV)
 _draft_weight_loader: str | None = os.environ.get(_DRAFT_WEIGHT_LOADER_ENV)
 _ORIGINAL_SGLANG_RUN_SCHEDULER_PROCESS = sglang.srt.entrypoints.engine.run_scheduler_process
 _SGLANG_EAGLE_UPDATE_PATCHED = False
+_SGLANG_TRANSFORMERS_EAGLE3_CAPTURE_PATCHED = False
 
 
 def configure_sglang_eagle_weight_update_patch(
@@ -190,7 +193,291 @@ def patch_sglang_eagle_update_weights_from_tensor() -> None:
         logger.info("Patched SGLang EAGLE routed weight update for %s", ", ".join(patched_classes))
 
 
+def _extract_hf_hidden_states(outputs):
+    if hasattr(outputs, "hidden_states"):
+        return outputs.hidden_states
+
+    if not isinstance(outputs, (tuple, list)):
+        return None
+
+    for item in outputs[1:]:
+        if not isinstance(item, (tuple, list)) or len(item) == 0:
+            continue
+        first = item[0]
+        if torch.is_tensor(first) and first.dim() >= 3:
+            return item
+
+    return None
+
+
+def _normalize_eagle3_capture_layers(layer_ids, num_layers: int) -> list[int]:
+    if layer_ids is None:
+        capture_layers = [2, num_layers // 2, num_layers - 3]
+    else:
+        # Match SGLang native Llama semantics: layer id i captures the output
+        # of layer i, which is hidden_states[i + 1] in HF output_hidden_states.
+        capture_layers = [int(layer_id) + 1 for layer_id in layer_ids]
+
+    return [layer_id for layer_id in capture_layers if 0 <= layer_id <= num_layers]
+
+
+def _call_sglang_forward_with_supported_kwargs(original_forward, self, *args, **kwargs):
+    try:
+        parameters = inspect.signature(original_forward).parameters
+    except (TypeError, ValueError):
+        return original_forward(self, *args, **kwargs)
+
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()):
+        supported_kwargs = kwargs
+    else:
+        supported_kwargs = {key: value for key, value in kwargs.items() if key in parameters}
+    return original_forward(self, *args, **supported_kwargs)
+
+
+def _call_module_with_supported_kwargs(module: torch.nn.Module, **kwargs):
+    try:
+        parameters = inspect.signature(module.forward).parameters
+    except (TypeError, ValueError):
+        return module(**kwargs)
+
+    if not any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()):
+        kwargs = {key: value for key, value in kwargs.items() if key in parameters}
+    return module(**kwargs)
+
+
+def _format_transformers_position_ids(model_obj, positions):
+    if hasattr(model_obj, "_format_position_ids"):
+        return model_obj._format_position_ids(positions)
+
+    model_config = getattr(model_obj, "model_config", None)
+    if getattr(model_config, "uses_mrope", False):
+        return positions[:, None]
+    return positions[None, ...]
+
+
+def _set_transformers_eagle3_capture_layers(self, layer_ids=None):
+    pp_group = getattr(self, "pp_group", None)
+    if pp_group is not None and not getattr(pp_group, "is_last_rank", True):
+        return
+
+    text_config = getattr(self, "text_config", getattr(self, "config", None))
+    num_layers = int(getattr(text_config, "num_hidden_layers", 0) or 0)
+    self.capture_aux_hidden_states = True
+    self._verl_eagle3_capture_layer_ids = _normalize_eagle3_capture_layers(layer_ids, num_layers)
+
+
+def _run_transformers_hf_backbone_with_aux_hidden_states(
+    model_obj,
+    input_ids,
+    input_embeds,
+    positions,
+    forward_batch=None,
+    extra_kwargs: dict | None = None,
+):
+    hf_input_ids = None if input_ids is None else input_ids[None, ...]
+    hf_input_embeds = None
+    if input_embeds is not None:
+        hf_input_embeds = input_embeds[None, ...]
+        hf_input_ids = None
+
+    embed_scale = getattr(model_obj, "embed_scale", None)
+    if embed_scale is not None and hf_input_ids is not None and hf_input_embeds is None:
+        hf_input_embeds = model_obj.model.get_input_embeddings()(hf_input_ids) * embed_scale
+        hf_input_ids = None
+
+    model_kwargs = {
+        "input_ids": hf_input_ids,
+        "inputs_embeds": hf_input_embeds,
+        "use_cache": False,
+        "position_ids": _format_transformers_position_ids(model_obj, positions),
+        "return_dict": False,
+        "output_hidden_states": True,
+    }
+    if forward_batch is not None:
+        model_kwargs["forward_batch"] = forward_batch
+    if hasattr(model_obj, "attention_instances"):
+        model_kwargs["attention_instances"] = model_obj.attention_instances
+    if extra_kwargs:
+        model_kwargs.update(extra_kwargs)
+
+    outputs = _call_module_with_supported_kwargs(model_obj.model, **model_kwargs)
+    hidden_states = outputs[0][0, ...]
+
+    all_hidden_states = _extract_hf_hidden_states(outputs)
+    aux_hidden_states = []
+    if all_hidden_states is not None:
+        for layer_id in getattr(model_obj, "_verl_eagle3_capture_layer_ids", []):
+            if layer_id >= len(all_hidden_states):
+                continue
+            aux_hidden = all_hidden_states[layer_id]
+            if torch.is_tensor(aux_hidden):
+                aux_hidden_states.append(aux_hidden[0, ...] if aux_hidden.dim() >= 3 else aux_hidden)
+
+    model_obj._verl_last_aux_hidden_states = aux_hidden_states or None
+    return hidden_states
+
+
+def _call_sglang_logits_processor(logits_processor, input_ids, hidden_states, lm_head, forward_batch, aux_hidden_states):
+    try:
+        signature = inspect.signature(logits_processor.forward)
+    except (AttributeError, TypeError, ValueError):
+        try:
+            signature = inspect.signature(logits_processor)
+        except (TypeError, ValueError):
+            signature = None
+
+    accepts_aux_hidden_states = False
+    if signature is not None:
+        parameters = signature.parameters
+        accepts_aux_hidden_states = (
+            "aux_hidden_states" in parameters
+            or any(param.kind == inspect.Parameter.VAR_POSITIONAL for param in parameters.values())
+            or sum(
+                param.kind
+                in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+                for param in parameters.values()
+            )
+            >= 5
+        )
+
+    if accepts_aux_hidden_states:
+        return logits_processor(input_ids, hidden_states, lm_head, forward_batch, aux_hidden_states)
+    return logits_processor(input_ids, hidden_states, lm_head, forward_batch)
+
+
+def _patch_sglang_transformers_base(transformers_base) -> bool:
+    original_run_hf_backbone = getattr(transformers_base, "_run_hf_backbone", None)
+    original_forward = getattr(transformers_base, "forward", None)
+    if original_run_hf_backbone is None or original_forward is None:
+        return False
+
+    if getattr(original_forward, "_verl_patched_transformers_eagle3_capture", False):
+        return True
+
+    if not hasattr(transformers_base, "set_eagle3_layers_to_capture"):
+        transformers_base.set_eagle3_layers_to_capture = _set_transformers_eagle3_capture_layers
+
+    def patched_run_hf_backbone(self, input_ids, input_embeds, positions, forward_batch, **kwargs):
+        if getattr(self, "capture_aux_hidden_states", False):
+            return _run_transformers_hf_backbone_with_aux_hidden_states(
+                self,
+                input_ids=input_ids,
+                input_embeds=input_embeds,
+                positions=positions,
+                forward_batch=forward_batch,
+                extra_kwargs=kwargs,
+            )
+
+        self._verl_last_aux_hidden_states = None
+        return original_run_hf_backbone(self, input_ids, input_embeds, positions, forward_batch, **kwargs)
+
+    @torch.no_grad()
+    def patched_forward(
+        self,
+        input_ids,
+        positions,
+        forward_batch,
+        pp_proxy_tensors=None,
+        input_embeds=None,
+        get_embedding=False,
+        **kwargs,
+    ):
+        if not getattr(self, "capture_aux_hidden_states", False):
+            return _call_sglang_forward_with_supported_kwargs(
+                original_forward,
+                self,
+                input_ids,
+                positions,
+                forward_batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+                input_embeds=input_embeds,
+                get_embedding=get_embedding,
+                **kwargs,
+            )
+
+        runtime_input_ids = input_ids
+        runtime_input_embeds = input_embeds
+        pp_group = getattr(self, "pp_group", None)
+        is_first_rank = getattr(pp_group, "is_first_rank", True)
+        is_last_rank = getattr(pp_group, "is_last_rank", True)
+        if not is_first_rank:
+            assert pp_proxy_tensors is not None
+            runtime_input_ids = None
+            runtime_input_embeds = pp_proxy_tensors["hidden_states"]
+
+        hidden_states = self._forward_hidden_states(
+            input_ids=runtime_input_ids,
+            positions=positions,
+            forward_batch=forward_batch,
+            input_embeds=runtime_input_embeds,
+        )
+
+        if not is_last_rank:
+            from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+
+            return PPProxyTensors({"hidden_states": hidden_states, "residual": hidden_states})
+
+        if get_embedding:
+            assert self.pooler is not None, "pooling is not enabled for this model class"
+            return self.pooler(hidden_states, forward_batch)
+
+        assert self.logits_processor is not None and self.lm_head is not None
+        return _call_sglang_logits_processor(
+            self.logits_processor,
+            input_ids,
+            hidden_states,
+            self.lm_head,
+            forward_batch,
+            getattr(self, "_verl_last_aux_hidden_states", None),
+        )
+
+    patched_run_hf_backbone._verl_patched_transformers_eagle3_capture = True
+    patched_forward._verl_patched_transformers_eagle3_capture = True
+    transformers_base._run_hf_backbone = patched_run_hf_backbone
+    transformers_base.forward = patched_forward
+    return True
+
+
+def _patch_transformers_module(module_name: str) -> list[str]:
+    try:
+        transformers_module = importlib.import_module(module_name)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Skip SGLang Transformers EAGLE3 capture patch for %s: %s", module_name, exc)
+        return []
+
+    patched_classes = []
+    transformers_base = getattr(transformers_module, "TransformersBase", None)
+    for class_name, cls in vars(transformers_module).items():
+        if not isinstance(cls, type) or not class_name.startswith("Transformers"):
+            continue
+        if transformers_base is not None and not issubclass(cls, transformers_base):
+            continue
+
+        if _patch_sglang_transformers_base(cls):
+            patched_classes.append(f"{module_name}.{class_name}")
+            continue
+
+        if not hasattr(cls, "set_eagle3_layers_to_capture"):
+            cls.set_eagle3_layers_to_capture = _set_transformers_eagle3_capture_layers
+            patched_classes.append(f"{module_name}.{class_name}")
+
+    return patched_classes
+
+
+def patch_sglang_transformers_eagle3_capture() -> None:
+    """Add EAGLE3 aux hidden-state capture to SGLang's Transformers fallback backend."""
+    global _SGLANG_TRANSFORMERS_EAGLE3_CAPTURE_PATCHED
+    if _SGLANG_TRANSFORMERS_EAGLE3_CAPTURE_PATCHED:
+        return
+
+    patched_classes = _patch_transformers_module("sglang.srt.models.transformers")
+    if patched_classes:
+        _SGLANG_TRANSFORMERS_EAGLE3_CAPTURE_PATCHED = True
+        logger.info("Patched Transformers EAGLE3 capture for %s", ", ".join(patched_classes))
+
+
 def _run_scheduler_process_with_verl_patches(*args, **kwargs):
+    patch_sglang_transformers_eagle3_capture()
     patch_sglang_eagle_update_weights_from_tensor()
     return _ORIGINAL_SGLANG_RUN_SCHEDULER_PROCESS(*args, **kwargs)
 
@@ -204,6 +491,7 @@ def install_sglang_verl_patches(
     draft_weight_loader: str | None = None,
 ) -> None:
     configure_sglang_eagle_weight_update_patch(target_weight_loader, draft_weight_loader)
+    patch_sglang_transformers_eagle3_capture()
     patch_sglang_eagle_update_weights_from_tensor()
 
     if set_envs_and_config is not None:
