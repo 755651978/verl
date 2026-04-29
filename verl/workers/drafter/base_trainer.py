@@ -539,9 +539,10 @@ class DrafterBaseTrainer:
         hidden_states_concat = torch.cat(preprocessed_lists['h_states'], dim=0).unsqueeze(0)  # (1, total_seq_len, hidden_dim)
 
         if self.backend.model_type == "eagle3":
-            last_hidden_states_concat = torch.cat(preprocessed_lists['last_h_states'], dim=0).unsqueeze(0)
             if use_logits:
                 target_logprobs_concat = torch.cat(preprocessed_lists["target_logprobs"], dim=0).unsqueeze(0)
+            else:
+                last_hidden_states_concat = torch.cat(preprocessed_lists['last_h_states'], dim=0).unsqueeze(0)
 
         total_seq_len = input_ids_concat.size(1)
         if total_seq_len < 2:
@@ -572,7 +573,6 @@ class DrafterBaseTrainer:
                 position_ids = position_ids[:, :train_seq_len].contiguous()
                 loss_mask = loss_mask[:, :train_seq_len].contiguous()
                 target_logprobs = target_logprobs_concat[:, :train_seq_len].contiguous()
-                last_hidden_states = last_hidden_states_concat[:, 1 : 1 + train_seq_len].contiguous()
             else:
                 last_hidden_states = last_hidden_states_concat[:, 1:].contiguous()
         elif self.backend.model_type == "eagle":
@@ -592,7 +592,6 @@ class DrafterBaseTrainer:
                 base_h = torch.nn.functional.pad(base_h, (0, 0, 0, pad_size), value=0.0)
                 attn_mask = torch.nn.functional.pad(attn_mask, (0, pad_size), value=0)
                 if self.backend.model_type == "eagle3":
-                    last_hidden_states = torch.nn.functional.pad(last_hidden_states, (0, 0, 0, pad_size), value=0.0)
                     if use_logits:
                         pad_shape = list(target_logprobs.shape)
                         pad_shape[1] = pad_size
@@ -604,6 +603,10 @@ class DrafterBaseTrainer:
                         target_logprobs_pad[..., 0] = float("-inf")
                         target_logprobs_pad[..., 1] = -1.0
                         target_logprobs = torch.cat((target_logprobs, target_logprobs_pad), dim=1)
+                    else:
+                        last_hidden_states = torch.nn.functional.pad(
+                            last_hidden_states, (0, 0, 0, pad_size), value=0.0
+                        )
                 elif self.backend.model_type == "eagle":
                     target = torch.nn.functional.pad(target, (0, 0, 0, pad_size), value=0.0)
 
@@ -612,9 +615,10 @@ class DrafterBaseTrainer:
             base_h = slice_input_tensor(base_h, dim=1, padding=False)
             attn_mask = slice_input_tensor(attn_mask, dim=1, padding=False)
             if self.backend.model_type == "eagle3":
-                last_hidden_states = slice_input_tensor(last_hidden_states, dim=1, padding=False)
                 if use_logits:
                     target_logprobs = slice_input_tensor(target_logprobs, dim=1, padding=False)
+                else:
+                    last_hidden_states = slice_input_tensor(last_hidden_states, dim=1, padding=False)
             elif self.backend.model_type == "eagle":
                 target = slice_input_tensor(target, dim=1, padding=False)
 
@@ -632,9 +636,10 @@ class DrafterBaseTrainer:
         }
 
         if self.backend.model_type == "eagle3":
-            batch["last_hidden_states"] = last_hidden_states
             if use_logits:
                 batch["target_logprobs"] = target_logprobs
+            else:
+                batch["last_hidden_states"] = last_hidden_states
         elif self.backend.model_type == "eagle":
             batch["target"] = target
 

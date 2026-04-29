@@ -270,7 +270,8 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
                 )
 
             h_states = full_h[:, : 3 * h_dim]
-            last_h_states = full_h[:, 3 * h_dim : 4 * h_dim]
+            if not use_logits:
+                last_h_states = full_h[:, 3 * h_dim : 4 * h_dim]
 
             # Compute loss_mask if not present (for DataBuffer items)
             full_len = ids.size(0)
@@ -309,7 +310,8 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
 
             res['ids'].append(ids[start:end])
             res['h_states'].append(h_states[start:end])
-            res['last_h_states'].append(last_h_states[start:end])
+            if not use_logits:
+                res['last_h_states'].append(last_h_states[start:end])
             res['masks'].append(item_loss_mask[start:end])
             if item.get("target_logprobs") is not None:
                 res["target_logprobs"].append(item["target_logprobs"].to(device, dtype=torch.float32)[start:end])
