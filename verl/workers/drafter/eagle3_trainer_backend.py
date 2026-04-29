@@ -524,13 +524,11 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
 
     def _compute_target_p(self, target_scores, t2d, loss_mask):
         target_subset_scores = target_scores
-        target_max_token = target_subset_scores.argmax(-1)
-        target_mask = t2d[target_max_token].to(loss_mask.device)
         target_subset_scores = target_subset_scores[..., t2d]
         if target_subset_scores.size(-1) == 0:
             raise ValueError("EAGLE3 target-to-draft vocab mask selects zero tokens")
         finite_target_mask = torch.isfinite(target_subset_scores).any(dim=-1)
-        position_mask = target_mask.float() * finite_target_mask.float() * loss_mask.float()
+        position_mask = finite_target_mask.float() * loss_mask.float()
         target_subset_scores = target_subset_scores.float()
         finite_scores = torch.isfinite(target_subset_scores)
         finite_floor = torch.finfo(target_subset_scores.dtype).min
