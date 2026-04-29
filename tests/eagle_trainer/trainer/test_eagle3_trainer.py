@@ -216,6 +216,26 @@ def test_drafter_training_batch_sanitizer_masks_bad_hidden_rows():
     assert sanitized["loss_mask"].tolist() == [[1.0, 0.0, 0.0, 1.0]]
 
 
+def test_drafter_trainable_state_dict_skips_non_floating_buffers():
+    class TinyDrafter(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(2, 2))
+            self.register_buffer("t2d", torch.ones(4, dtype=torch.bool))
+            self.register_buffer("d2t", torch.arange(4, dtype=torch.long))
+
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.model = TinyDrafter()
+    trainer.training_device_mesh = None
+    trainer.backend = type("Backend", (), {"model_type": "eagle3"})()
+    trainer._frozen_param_names = set()
+
+    trainable_state = trainer._get_trainable_state_dict()
+
+    assert set(trainable_state) == {"weight"}
+    assert trainable_state["weight"].shape == (2, 2)
+
+
 def _mock_rollout_batch(config: LlamaConfig, batch_size: int = 2, seq_len: int = 24, prompt_len: int = 8):
     response_len = seq_len - prompt_len
     input_ids = torch.randint(3, config.vocab_size, (batch_size, seq_len), device="cuda")

@@ -301,7 +301,7 @@ class DrafterBaseTrainer:
 
     
     def _get_trainable_state_dict(self) -> dict[str, torch.Tensor]:
-        """Get state dict excluding weights shared with the target model."""
+        """Get floating state dict entries excluding weights shared with the target model."""
         if isinstance(self.model, FSDP) or (self.training_device_mesh is not None and dist.is_initialized()):
             full_state_dict = get_fsdp_full_state_dict(self.model, offload_to_cpu=True, rank0_only=True)
         else:
@@ -311,6 +311,10 @@ class DrafterBaseTrainer:
         trainable_state_dict = {}
 
         for name, param in full_state_dict.items():
+            # EAGLE3 vocab mapping buffers are static and can break SGLang hot update device assumptions.
+            if isinstance(param, torch.Tensor) and not torch.is_floating_point(param):
+                logger.debug(f"Skipping non-floating drafter state: {name}, dtype={param.dtype}")
+                continue
             # EAGLE shares target lm_head, while EAGLE3 trains and publishes its own lm_head.
             if any(frozen_name in name for frozen_name in self._frozen_param_names) or (
                 "lm_head.weight" in name and getattr(self.backend, "model_type", None) != "eagle3"
