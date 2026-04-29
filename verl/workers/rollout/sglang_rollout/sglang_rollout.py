@@ -193,6 +193,7 @@ async def _sgl_update_weights_with_route(
             MultiprocessingSerializer.serialize(named_tensors) for _ in range(infer_tp_size)
         ],
         load_format=load_format,
+        flush_cache=False,
     )
     if disable_draft_model is not None:
         setattr(update_weights_request, "disable_draft_model", disable_draft_model)
