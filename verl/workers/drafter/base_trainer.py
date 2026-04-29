@@ -53,6 +53,15 @@ class DrafterBaseTrainer:
         self.world_size = world_size
         self.rollout_dp_rank = rollout_dp_rank
         self.backend = backend
+        self.pad_token_id = 0
+        model_cfg = getattr(config, "model", None)
+        if model_cfg is not None:
+            try:
+                configured_pad_id = model_cfg.get("pad_token_id", None)
+            except AttributeError:
+                configured_pad_id = getattr(model_cfg, "pad_token_id", None)
+            if configured_pad_id is not None:
+                self.pad_token_id = int(configured_pad_id)
         self.training_device_mesh = training_device_mesh
         if self.training_device_mesh is not None:
             self.training_process_group = self.training_device_mesh["sp"].get_group()
@@ -259,6 +268,7 @@ class DrafterBaseTrainer:
         self.lr_scheduler = self.backend.setup_scheduler(self.optimizer, drafter_train_config)
         self.drafter_train_config = drafter_train_config
         self.model_config = drafter_model_config
+        self.pad_token_id = int(getattr(drafter_model_config, "pad_token_id", self.pad_token_id) or self.pad_token_id)
         
     def _prepare_training_config(self, rollout_config):
         """
@@ -465,8 +475,9 @@ class DrafterBaseTrainer:
         hidden_start = max(0, hidden_seq_length - feature_seq_length)
         hidden_end = hidden_start + feature_seq_length
         
+        model_config = getattr(self, "model_config", None)
+        pad_id = int(getattr(model_config, "pad_token_id", self.pad_token_id) or self.pad_token_id)
         for i in range(batch_size):
-            pad_id = int(getattr(self.model_config, "pad_token_id", 0) or 0)
             full_loss_mask = torch.zeros(input_seq_length, dtype=torch.float32)
             if cpu_prompts is not None and cpu_responses is not None:
                 prompt_len = min(cpu_prompts[i].numel(), input_seq_length)
