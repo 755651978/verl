@@ -623,9 +623,12 @@ class DrafterBaseTrainer:
         """
         effective_batch_size = min(self.batch_size, 4)
 
+        current_step = int(self.current_rl_step)
+
         # Determine data source: DataBuffer (cross-step) or collected_data (current step only)
         if self.use_data_buffer and len(self.data_buffer) > 0:
             # Use data from last N RL steps via DataBuffer
+            buffer_steps = int(self.config.rollout.drafter.training.get("sample_last_n_steps", buffer_steps))
             available_data = self.data_buffer.get_data_from_last_n_steps(buffer_steps)
             if len(available_data) < effective_batch_size:
                 if 0 < len(available_data) >= min(2, effective_batch_size // 2):
@@ -637,14 +640,18 @@ class DrafterBaseTrainer:
                 rng = random.Random(int(self.current_rl_step))
                 items = rng.sample(available_data, min(len(available_data), effective_batch_size))
         else:
-            # Fall back to current step data only
-            if len(self.collected_data) < effective_batch_size:
-                if 0 < len(self.collected_data) >= min(2, effective_batch_size // 2):
-                    items = list(self.collected_data)
+            # Fall back to current step data only. collected_data can contain
+            # older rollout steps when drafter training is triggered sparsely.
+            current_step_data = [
+                item for item in self.collected_data if int(item.get("step", current_step)) == current_step
+            ]
+            if len(current_step_data) < effective_batch_size:
+                if 0 < len(current_step_data) >= min(2, effective_batch_size // 2):
+                    items = current_step_data
                 else:
                     return None
             else:
-                items = list(self.collected_data)[:effective_batch_size]
+                items = current_step_data[:effective_batch_size]
         
         # Filter out items without the tensors required by the selected loss path.
         use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))

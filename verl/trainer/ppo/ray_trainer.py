@@ -1499,6 +1499,7 @@ class RayPPOTrainer:
                         gen_batch_output.meta_info.pop("timing", None)
                         if self.use_drafter and self.drafter_wg is not None:
                             with marked_timer("collect_drafter", timing_raw):
+                                self.drafter_wg.set_global_step(self.global_steps)
                                 collected_drafter_samples = self._collect_drafter_rollout_features(gen_batch_output)
                             metrics["drafter/collected_samples"] = collected_drafter_samples
                             metrics["drafter/owner_routed_samples"] = collected_drafter_samples
@@ -1714,7 +1715,6 @@ class RayPPOTrainer:
 
                         if self.use_drafter and self.drafter_wg is not None:
                             with marked_timer("train_drafter", timing_raw, color="red"):
-                                self.drafter_wg.set_global_step(self.global_steps)
                                 drafter_train_refs = self.drafter_wg.train_drafter()
                                 drafter_train_results = ray.get(drafter_train_refs) if drafter_train_refs else []
 

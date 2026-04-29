@@ -2,6 +2,7 @@ import asyncio
 import os
 import shutil
 import tempfile
+from collections import deque
 from pathlib import Path
 
 import pytest
@@ -234,6 +235,64 @@ def test_drafter_trainable_state_dict_skips_non_floating_buffers():
 
     assert set(trainable_state) == {"weight"}
     assert trainable_state["weight"].shape == (2, 2)
+
+
+def test_drafter_prepare_training_batch_uses_current_step_collected_data_only():
+    class TinyDrafter(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1))
+
+    class Backend:
+        model_type = "eagle"
+
+        def preprocess_individual_items(self, items, device, model_config):
+            return {
+                "ids": [item["input_ids"].to(device) for item in items],
+                "h_states": [item["hidden_states"].to(device) for item in items],
+                "masks": [item["loss_mask"].to(device) for item in items],
+                "position_ids": [item["position_ids"].to(device) for item in items],
+                "last_h_states": [],
+                "target_logprobs": [],
+            }
+
+    def make_item(step: int, token_base: int):
+        return {
+            "step": step,
+            "input_ids": torch.tensor([token_base, token_base + 1, token_base + 2], dtype=torch.long),
+            "hidden_states": torch.full((3, 2), float(token_base)),
+            "loss_mask": torch.ones(3),
+            "position_ids": torch.arange(3, dtype=torch.long),
+        }
+
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.rank = 0
+    trainer.current_rl_step = 2
+    trainer.use_data_buffer = False
+    trainer.batch_size = 2
+    trainer.use_ulysses_sp = False
+    trainer.backend = Backend()
+    trainer.model = TinyDrafter()
+    trainer.model_config = type("ModelConfig", (), {"hidden_size": 2})()
+    trainer.config = OmegaConf.create(
+        {
+            "rollout": {
+                "drafter": {
+                    "training": {
+                        "use_logits": False,
+                        "hidden_state_clip_value": None,
+                        "ttt_length": 1,
+                    }
+                }
+            }
+        }
+    )
+    trainer.collected_data = deque([make_item(1, 10), make_item(2, 20)])
+
+    batch = trainer._prepare_training_batch()
+
+    assert batch is not None
+    assert batch["input_ids"].tolist() == [[20, 21]]
 
 
 def _mock_rollout_batch(config: LlamaConfig, batch_size: int = 2, seq_len: int = 24, prompt_len: int = 8):
