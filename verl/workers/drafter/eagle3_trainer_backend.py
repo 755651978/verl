@@ -19,32 +19,44 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 device_name = get_device_name()
 
 
-def _scatter_sparse_logprobs(logprobs: torch.Tensor, indices: torch.Tensor, vocab_size: int) -> torch.Tensor:
-    full_logprob_view = torch.full(
+def _scatter_topk_logprobs_with_tail(logprobs: torch.Tensor, indices: torch.Tensor, vocab_size: int) -> torch.Tensor:
+    dense_logprob_view = torch.full(
         (logprobs.size(0), vocab_size),
         float("-inf"),
         dtype=logprobs.dtype,
         device=logprobs.device,
     )
     if logprobs.numel() == 0:
-        return full_logprob_view
+        return dense_logprob_view
 
     valid = torch.isfinite(logprobs) & (indices >= 0) & (indices < vocab_size)
     if not valid.any():
-        return full_logprob_view
+        return dense_logprob_view
+
+    valid_count = valid.sum(dim=-1)
+    has_valid = valid_count > 0
+    topk_mass = torch.where(valid, logprobs.float().exp(), torch.zeros_like(logprobs, dtype=torch.float32)).sum(dim=-1)
+    remaining_mass = (1.0 - topk_mass).clamp(min=torch.finfo(torch.float32).tiny)
+    remaining_count = (vocab_size - valid_count).clamp(min=1).to(torch.float32)
+    tail_logprob = (remaining_mass.log() - remaining_count.log()).to(logprobs.dtype)
+    dense_logprob_view = torch.where(
+        has_valid.unsqueeze(-1),
+        tail_logprob.unsqueeze(-1).expand(-1, vocab_size),
+        dense_logprob_view,
+    )
 
     row_indices = torch.arange(logprobs.size(0), device=logprobs.device).unsqueeze(1).expand_as(indices)
-    full_logprob_view[row_indices[valid], indices[valid]] = logprobs[valid]
-    return full_logprob_view
+    dense_logprob_view[row_indices[valid], indices[valid]] = logprobs[valid]
+    return dense_logprob_view
 
 
-def reconstruct_sparse_logprob_view(target_topk_logprobs, topk, vocab_size):
+def reconstruct_dense_logprob_view(target_topk_logprobs, topk, vocab_size):
     if topk <= 0:
-        raise ValueError(f"topk must be positive when reconstructing sparse logprob view, got {topk}")
+        raise ValueError(f"topk must be positive when reconstructing dense logprob view, got {topk}")
     if isinstance(target_topk_logprobs, torch.Tensor):
         if target_topk_logprobs.dim() != 3 or target_topk_logprobs.size(-1) < 2:
             raise ValueError(
-                "target_topk_logprobs must have shape [seq, topk, 2+] when reconstructing a sparse logprob view, "
+                "target_topk_logprobs must have shape [seq, topk, 2+] when reconstructing a dense logprob view, "
                 f"but got shape={tuple(target_topk_logprobs.shape)}"
             )
         if target_topk_logprobs.numel() == 0:
@@ -59,7 +71,7 @@ def reconstruct_sparse_logprob_view(target_topk_logprobs, topk, vocab_size):
             )
         logprobs = target_topk_logprobs[..., 0]
         indices = target_topk_logprobs[..., 1].to(torch.long)
-        return _scatter_sparse_logprobs(logprobs, indices, vocab_size)
+        return _scatter_topk_logprobs_with_tail(logprobs, indices, vocab_size)
 
     rows = []
     for step_top_logprobs in target_topk_logprobs:
@@ -95,7 +107,7 @@ def reconstruct_sparse_logprob_view(target_topk_logprobs, topk, vocab_size):
     rows_tensor = torch.tensor(rows, dtype=torch.float32)
     logprobs = rows_tensor[..., 0]
     indices = rows_tensor[..., 1].to(torch.long)
-    return _scatter_sparse_logprobs(logprobs, indices, vocab_size)
+    return _scatter_topk_logprobs_with_tail(logprobs, indices, vocab_size)
 
 
 class Eagle3TrainerBackend(EagleTrainerBackend):
@@ -379,7 +391,7 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
                     unpad_dim=0,
                     padding_size=_current_pad_size,
                 ).unsqueeze(0)
-                target_scores = reconstruct_sparse_logprob_view(
+                target_scores = reconstruct_dense_logprob_view(
                     target_topk_logprobs.squeeze(0),
                     topk=self.config.rollout.drafter.training.logits_topk,
                     vocab_size=self.vocab_size,
@@ -401,7 +413,7 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
             loss_mask = loss_mask
             if use_logits:
                 target_topk_logprobs = batch["target_logprobs"]
-                target_scores = reconstruct_sparse_logprob_view(
+                target_scores = reconstruct_dense_logprob_view(
                     target_topk_logprobs.squeeze(0),
                     topk=self.config.rollout.drafter.training.logits_topk,
                     vocab_size=self.vocab_size,
@@ -436,7 +448,8 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
         # Clean up large tensors to free memory
         del target_scores
 
-        total_local_ploss = 0
+        total_local_ploss = torch.tensor(0.0, device=input_ids.device, dtype=torch.float32)
+        total_local_tokens = torch.tensor(0.0, device=input_ids.device, dtype=torch.float32)
         gamma = 0.8
         
         # 预处理
@@ -456,8 +469,14 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
             log_probs = F.log_softmax(logits.float(), dim=-1)
             per_token_ploss = -(target_p.float() * log_probs).sum(dim=-1)
             valid_position = position_mask > 0
-            if valid_position.any() and not torch.isfinite(per_token_ploss[valid_position]).all():
-                raise ValueError("EAGLE3 ploss contains non-finite values on valid target positions")
+            finite_ploss = torch.isfinite(per_token_ploss)
+            if valid_position.any() and not finite_ploss[valid_position].all():
+                dropped_tokens = (valid_position & ~finite_ploss).sum()
+                logger.debug(
+                    "Dropping %s EAGLE3 target positions with non-finite ploss",
+                    int(dropped_tokens.detach().cpu().item()),
+                )
+            valid_position = valid_position & finite_ploss
             per_token_ploss = torch.where(
                 valid_position,
                 per_token_ploss,
@@ -467,13 +486,14 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
             
             # 应用Eagle3的时间步衰减
             total_local_ploss += (gamma ** idx) * step_loss_sum
+            total_local_tokens += valid_position.float().sum()
 
         return {
             "total_local_vloss": torch.tensor(0.0, device=input_ids.device),
             "total_local_ploss": total_local_ploss,
-            "local_num_tokens": loss_mask.sum(),
+            "local_num_tokens": total_local_tokens,
             "v_weight": 0.0,
-            "p_weight": 1.0 / length
+            "p_weight": 1.0
         }
     
     def _compute_target_p_padded(self, target_scores, t2d, loss_mask, length):

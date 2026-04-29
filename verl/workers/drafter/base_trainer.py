@@ -742,6 +742,12 @@ class DrafterBaseTrainer:
             global_vloss, global_ploss, global_tokens = l_v, l_p, l_n
         
         # 最终 Loss 平滑处理
+        if float(global_tokens.detach().float().item()) <= 0:
+            logger.warning(
+                f"Step {self.training_steps + 1}: no finite drafter target tokens, skipping optimizer step"
+            )
+            return False
+
         denom = global_tokens.clamp(min=1.0)
         vloss = global_vloss / denom
         ploss = global_ploss / denom
