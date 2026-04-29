@@ -450,24 +450,50 @@ class DrafterBaseTrainer:
 
         batch_size = cpu_input_ids.size(0)
 
-        # Keep feature tensors at their full shared length. For token-level teacher
-        # targets such as target_logprobs, we preserve their own length instead of
-        # truncating input_ids/hidden_states down to match them. This lets the
-        # training batch build the standard next-token alignment:
-        #   inputs/hidden states at [0..T-2]
-        #   target logprobs / loss mask at [1..T-1]
-        feature_seq_length = min(cpu_input_ids.size(1), cpu_h_states.size(1))
-        target_seq_length = (
-            min(cpu_target_logprobs.size(1), feature_seq_length) if cpu_target_logprobs is not None else None
-        )
+        input_seq_length = cpu_input_ids.size(1)
+        hidden_seq_length = cpu_h_states.size(1)
+        feature_seq_length = min(input_seq_length, hidden_seq_length)
+        if feature_seq_length <= 0:
+            return
+
+        # SGLang may return hidden states only for the generated suffix instead
+        # of the full prompt+response sequence. Align shorter feature tensors to
+        # the sequence tail; otherwise response tokens can be truncated away and
+        # the derived loss mask becomes all zeros.
+        feature_start = max(0, input_seq_length - feature_seq_length)
+        feature_end = feature_start + feature_seq_length
+        hidden_start = max(0, hidden_seq_length - feature_seq_length)
+        hidden_end = hidden_start + feature_seq_length
         
         for i in range(batch_size):
+            pad_id = int(getattr(self.model_config, "pad_token_id", 0) or 0)
+            full_loss_mask = torch.zeros(input_seq_length, dtype=torch.float32)
+            if cpu_prompts is not None and cpu_responses is not None:
+                prompt_len = min(cpu_prompts[i].numel(), input_seq_length)
+                response_len = min(cpu_responses[i].numel(), max(0, input_seq_length - prompt_len))
+                if response_len > 0:
+                    response_mask = (cpu_responses[i, :response_len] != pad_id).float()
+                    full_loss_mask[prompt_len : prompt_len + response_len] = response_mask
+            elif cpu_responses is not None:
+                response_len = min(cpu_responses[i].numel(), input_seq_length)
+                response_start = input_seq_length - response_len
+                full_loss_mask[response_start:] = (cpu_responses[i, :response_len] != pad_id).float()
+            else:
+                full_loss_mask[:] = 1.0
+
+            target_logprobs_item = None
+            if cpu_target_logprobs is not None:
+                # target_logprobs are next-token targets for original positions
+                # [1..T-1], so original target position p lives at index p - 1.
+                target_start = min(feature_start, cpu_target_logprobs.size(1))
+                target_end = min(max(feature_start, feature_end - 1), cpu_target_logprobs.size(1))
+                target_logprobs_item = cpu_target_logprobs[i, target_start:target_end, ...]
+
             data_item = { 
-                "input_ids": cpu_input_ids[i, :feature_seq_length],
-                "hidden_states": cpu_h_states[i, :feature_seq_length, :],
-                "target_logprobs": (
-                    cpu_target_logprobs[i, :target_seq_length, ...] if cpu_target_logprobs is not None else None
-                ),
+                "input_ids": cpu_input_ids[i, feature_start:feature_end],
+                "hidden_states": cpu_h_states[i, hidden_start:hidden_end, :],
+                "loss_mask": full_loss_mask[feature_start:feature_end],
+                "target_logprobs": target_logprobs_item,
                 "responses": cpu_responses[i] if cpu_responses is not None else None, 
                 "prompts": cpu_prompts[i] if cpu_prompts is not None else None, 
             }
