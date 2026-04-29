@@ -161,10 +161,18 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
         factory_cls = AutoEagle3DraftModel
         
         drafter_module = factory_cls.from_config(drafter_config)
+        checkpoint_has_vocab_mapping = False
 
         # Initialize model
         if spec_model_path and os.path.exists(spec_model_path):
-            drafter_module = factory_cls.from_pretrained(spec_model_path)
+            loaded = factory_cls.from_pretrained(spec_model_path, output_loading_info=True)
+            if isinstance(loaded, tuple):
+                drafter_module, loading_info = loaded
+                missing_keys = set(loading_info.get("missing_keys", []))
+                checkpoint_has_vocab_mapping = not {"t2d", "d2t"}.intersection(missing_keys)
+            else:
+                drafter_module = loaded
+                checkpoint_has_vocab_mapping = self._has_valid_vocab_mapping(drafter_module)
 
         
         # 复用主模型的Embedding和LM_Head
@@ -174,22 +182,15 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
         drafter_module.freeze_embedding()
         
         training_cfg = self.config.rollout.drafter.training
-        mapping_path = training_cfg.get("vocab_mapping_path", None)
-        if mapping_path:
-            if not os.path.exists(mapping_path):
-                raise FileNotFoundError(f"EAGLE3 vocab_mapping_path does not exist: {mapping_path}")
-            drafter_module.load_vocab_mapping(mapping_path)
-            logger.info(f"Loaded EAGLE3 vocab mapping from {mapping_path}")
-        elif drafter_module.draft_vocab_size != drafter_module.vocab_size:
-            raise ValueError(
-                "EAGLE3 draft_vocab_size differs from target vocab_size, but no vocab_mapping_path was provided"
-            )
-        selected_vocab_size = int(drafter_module.t2d.sum().item())
-        if selected_vocab_size != drafter_module.draft_vocab_size:
-            raise ValueError(
-                f"EAGLE3 vocab mapping selects {selected_vocab_size} tokens, "
-                f"but draft_vocab_size is {drafter_module.draft_vocab_size}"
-            )
+        if drafter_module.draft_vocab_size != drafter_module.vocab_size:
+            if checkpoint_has_vocab_mapping and self._has_valid_vocab_mapping(drafter_module):
+                logger.info("Using EAGLE3 vocab mapping loaded from draft checkpoint")
+            else:
+                raise ValueError(
+                    "EAGLE3 draft_vocab_size differs from target vocab_size, but the draft checkpoint "
+                    "does not provide valid t2d/d2t vocab mapping buffers"
+                )
+        self._validate_vocab_mapping(drafter_module)
 
         use_logits = training_cfg.get("use_logits", False)
         if not use_logits:
@@ -200,6 +201,34 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
 
         return drafter_module, drafter_config
 
+    def _has_valid_vocab_mapping(self, drafter_module) -> bool:
+        try:
+            self._validate_vocab_mapping(drafter_module)
+            return True
+        except (AttributeError, ValueError):
+            return False
+
+    def _validate_vocab_mapping(self, drafter_module) -> None:
+        if not hasattr(drafter_module, "t2d") or not hasattr(drafter_module, "d2t"):
+            raise AttributeError("EAGLE3 draft model does not have t2d/d2t vocab mapping buffers")
+
+        if drafter_module.t2d.numel() != drafter_module.vocab_size:
+            raise ValueError(
+                f"EAGLE3 t2d shape mismatch: expected {drafter_module.vocab_size}, "
+                f"got {drafter_module.t2d.numel()}"
+            )
+        if drafter_module.d2t.numel() != drafter_module.draft_vocab_size:
+            raise ValueError(
+                f"EAGLE3 d2t shape mismatch: expected {drafter_module.draft_vocab_size}, "
+                f"got {drafter_module.d2t.numel()}"
+            )
+
+        selected_vocab_size = int(drafter_module.t2d.sum().item())
+        if selected_vocab_size != drafter_module.draft_vocab_size:
+            raise ValueError(
+                f"EAGLE3 vocab mapping selects {selected_vocab_size} tokens, "
+                f"but draft_vocab_size is {drafter_module.draft_vocab_size}"
+            )
 
     def _build_target_model(self, target_model_path: str):
         """

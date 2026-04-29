@@ -66,6 +66,34 @@ def _create_tiny_checkpoints(root: Path) -> tuple[Path, Path]:
     return target_dir, drafter_dir
 
 
+def _create_compressed_vocab_checkpoints(root: Path) -> tuple[Path, Path, torch.Tensor, torch.Tensor]:
+    target_dir = root / "target_compressed_vocab"
+    drafter_dir = root / "drafter_compressed_vocab"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    drafter_dir.mkdir(parents=True, exist_ok=True)
+
+    target_config = _tiny_llama_config()
+    target_model = LlamaForCausalLM(target_config)
+    target_model.save_pretrained(target_dir, safe_serialization=True, max_shard_size="10KB")
+
+    drafter_config = _tiny_llama_config()
+    drafter_config.architectures = ["LlamaForCausalLMEagle3"]
+    drafter_config.draft_vocab_size = 8
+    drafter_config.target_hidden_size = target_config.hidden_size
+    drafter_config.num_hidden_layers = 1
+    drafter_model = LlamaForCausalLMEagle3(drafter_config)
+
+    selected_tokens = torch.tensor([0, 2, 5, 7, 11, 13, 17, 19], dtype=torch.long)
+    t2d = torch.zeros(target_config.vocab_size, dtype=torch.bool)
+    t2d[selected_tokens] = True
+    d2t = selected_tokens - torch.arange(drafter_config.draft_vocab_size, dtype=torch.long)
+    drafter_model.t2d.copy_(t2d)
+    drafter_model.d2t.copy_(d2t)
+    drafter_model.save_pretrained(drafter_dir, safe_serialization=True, max_shard_size="10KB")
+
+    return target_dir, drafter_dir, t2d, d2t
+
+
 def _build_config(target_dir: Path, drafter_dir: Path):
     return OmegaConf.create(
         {
@@ -104,6 +132,24 @@ def _build_config(target_dir: Path, drafter_dir: Path):
             },
         }
     )
+
+
+def test_eagle3_build_model_uses_checkpoint_vocab_mapping_without_mapping_path():
+    root = Path(tempfile.mkdtemp(prefix="verl_eagle3_vocab_mapping_"))
+    try:
+        target_dir, drafter_dir, expected_t2d, expected_d2t = _create_compressed_vocab_checkpoints(root)
+        config = _build_config(target_dir, drafter_dir)
+        config.rollout.drafter.training.use_logits = True
+
+        target_config = AutoConfig.from_pretrained(target_dir)
+        backend = Eagle3TrainerBackend(config=config, target_model_config=target_config)
+        drafter_model, _ = backend.build_model()
+
+        assert drafter_model.draft_vocab_size == int(expected_t2d.sum().item())
+        assert torch.equal(drafter_model.t2d.cpu(), expected_t2d)
+        assert torch.equal(drafter_model.d2t.cpu(), expected_d2t)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def _mock_rollout_batch(config: LlamaConfig, batch_size: int = 2, seq_len: int = 24, prompt_len: int = 8):
