@@ -437,6 +437,11 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
         # length above, while input_ids remains the local SP slice. Use the
         # actual logits length for target/mask alignment.
         seq_length = all_step_logits[0].shape[1]
+        target_device = all_step_logits[0].device
+        if target_scores.device != target_device:
+            target_scores = target_scores.to(target_device)
+        if loss_mask.device != target_device:
+            loss_mask = loss_mask.to(target_device)
 
         target_p_padded, target_position_mask_padded = self._compute_target_p_padded(
             target_scores=target_scores,
@@ -523,6 +528,8 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
 
 
     def _compute_target_p(self, target_scores, t2d, loss_mask):
+        loss_mask = loss_mask.to(device=target_scores.device)
+        t2d = t2d.to(device=target_scores.device, dtype=torch.bool)
         target_subset_scores = target_scores
         target_subset_scores = target_subset_scores[..., t2d]
         if target_subset_scores.size(-1) == 0:
