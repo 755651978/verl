@@ -414,7 +414,18 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
                     target_scores = self.target_model(last_hidden_states)
         
         length = len(all_step_logits)
-        seq_length = input_ids.shape[1]
+        if length == 0:
+            return {
+                "total_local_vloss": torch.tensor(0.0, device=input_ids.device),
+                "total_local_ploss": torch.tensor(0.0, device=input_ids.device),
+                "local_num_tokens": torch.tensor(0.0, device=input_ids.device),
+                "v_weight": 0.0,
+                "p_weight": 0.0,
+            }
+        # With Ulysses SP, logits and masks are gathered back to full sequence
+        # length above, while input_ids remains the local SP slice. Use the
+        # actual logits length for target/mask alignment.
+        seq_length = all_step_logits[0].shape[1]
 
         target_p_padded, target_position_mask_padded = self._compute_target_p_padded(
             target_scores=target_scores,
