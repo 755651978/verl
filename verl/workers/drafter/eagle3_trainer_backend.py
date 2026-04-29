@@ -50,6 +50,27 @@ def _scatter_topk_logprobs_with_tail(logprobs: torch.Tensor, indices: torch.Tens
     return dense_logprob_view
 
 
+def _masked_soft_cross_entropy(
+    logits: torch.Tensor,
+    target_p: torch.Tensor,
+    position_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    logits = logits.float()
+    target_p = target_p.float()
+    finite_logits = torch.isfinite(logits).all(dim=-1)
+    finite_target = torch.isfinite(target_p).all(dim=-1) & (target_p.sum(dim=-1) > 0)
+    valid_position = (position_mask > 0) & finite_logits & finite_target
+
+    safe_logits = torch.where(torch.isfinite(logits), logits, torch.zeros_like(logits))
+    safe_target = torch.where(torch.isfinite(target_p), target_p, torch.zeros_like(target_p))
+    safe_target = torch.where(valid_position.unsqueeze(-1), safe_target, torch.zeros_like(safe_target))
+
+    log_probs = F.log_softmax(safe_logits, dim=-1)
+    per_token_ploss = -(safe_target * log_probs).sum(dim=-1)
+    per_token_ploss = torch.where(valid_position, per_token_ploss, torch.zeros_like(per_token_ploss))
+    return per_token_ploss, valid_position
+
+
 def reconstruct_dense_logprob_view(target_topk_logprobs, topk, vocab_size):
     if topk <= 0:
         raise ValueError(f"topk must be positive when reconstructing dense logprob view, got {topk}")
@@ -471,22 +492,18 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
                 target_position_mask = target_position_mask.squeeze(-1)
             position_mask = step_position_mask * target_position_mask
 
-            log_probs = F.log_softmax(logits.float(), dim=-1)
-            per_token_ploss = -(target_p.float() * log_probs).sum(dim=-1)
-            valid_position = position_mask > 0
-            finite_ploss = torch.isfinite(per_token_ploss)
-            if valid_position.any() and not finite_ploss[valid_position].all():
-                dropped_tokens = (valid_position & ~finite_ploss).sum()
+            base_valid_position = position_mask > 0
+            per_token_ploss, valid_position = _masked_soft_cross_entropy(
+                logits=logits,
+                target_p=target_p,
+                position_mask=position_mask,
+            )
+            if base_valid_position.any() and not valid_position[base_valid_position].all():
+                dropped_tokens = (base_valid_position & ~valid_position).sum()
                 logger.debug(
-                    "Dropping %s EAGLE3 target positions with non-finite ploss",
+                    "Dropping %s EAGLE3 target positions with non-finite logits or targets",
                     int(dropped_tokens.detach().cpu().item()),
                 )
-            valid_position = valid_position & finite_ploss
-            per_token_ploss = torch.where(
-                valid_position,
-                per_token_ploss,
-                torch.zeros_like(per_token_ploss),
-            )
             step_loss_sum = per_token_ploss.sum()
             
             # 应用Eagle3的时间步衰减

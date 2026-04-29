@@ -11,7 +11,7 @@ from omegaconf import OmegaConf
 from transformers import AutoConfig, LlamaConfig, LlamaForCausalLM
 
 from verl.workers.drafter.base_trainer import DrafterBaseTrainer
-from verl.workers.drafter.eagle3_trainer_backend import Eagle3TrainerBackend
+from verl.workers.drafter.eagle3_trainer_backend import Eagle3TrainerBackend, _masked_soft_cross_entropy
 from verl.workers.drafter.model.eagle import LlamaForCausalLMEagle3
 
 
@@ -150,6 +150,35 @@ def test_eagle3_build_model_uses_checkpoint_vocab_mapping_without_mapping_path()
         assert torch.equal(drafter_model.d2t.cpu(), expected_d2t)
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+
+def test_eagle3_masked_ploss_keeps_bad_logits_out_of_backward():
+    logits = torch.randn(1, 3, 5, requires_grad=True)
+    with torch.no_grad():
+        logits[0, 0, 0] = torch.nan
+        logits[0, 2, 1] = torch.inf
+
+    target_p = torch.zeros_like(logits)
+    target_p[0, 0, 2] = 1.0
+    target_p[0, 1, 3] = 1.0
+    target_p[0, 2, 4] = 1.0
+    position_mask = torch.tensor([[0.0, 1.0, 1.0]])
+
+    per_token_ploss, valid_position = _masked_soft_cross_entropy(
+        logits=logits,
+        target_p=target_p,
+        position_mask=position_mask,
+    )
+    loss = per_token_ploss.sum()
+
+    assert torch.isfinite(loss)
+    assert valid_position.tolist() == [[False, True, False]]
+
+    loss.backward()
+    assert logits.grad is not None
+    assert torch.isfinite(logits.grad).all()
+    assert torch.equal(logits.grad[0, 0], torch.zeros_like(logits.grad[0, 0]))
+    assert torch.equal(logits.grad[0, 2], torch.zeros_like(logits.grad[0, 2]))
 
 
 def _mock_rollout_batch(config: LlamaConfig, batch_size: int = 2, seq_len: int = 24, prompt_len: int = 8):
