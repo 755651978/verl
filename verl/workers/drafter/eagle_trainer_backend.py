@@ -20,6 +20,27 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
+def _masked_soft_cross_entropy(
+    logits: torch.Tensor,
+    target_p: torch.Tensor,
+    loss_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    logits = logits.float()
+    target_p = target_p.float()
+    finite_logits = torch.isfinite(logits).all(dim=-1)
+    finite_target = torch.isfinite(target_p).all(dim=-1) & (target_p.sum(dim=-1) > 0)
+    valid_position = (loss_mask > 0) & finite_logits & finite_target
+
+    safe_logits = torch.where(torch.isfinite(logits), logits, torch.zeros_like(logits))
+    safe_target = torch.where(torch.isfinite(target_p), target_p, torch.zeros_like(target_p))
+    safe_target = torch.where(valid_position.unsqueeze(-1), safe_target, torch.zeros_like(safe_target))
+
+    log_probs = F.log_softmax(safe_logits, dim=-1)
+    per_token_ploss = -(safe_target * log_probs).sum(dim=-1)
+    per_token_ploss = torch.where(valid_position, per_token_ploss, torch.zeros_like(per_token_ploss))
+    return per_token_ploss, valid_position
+
+
 class EagleTrainerBackend:
     def __init__(
         self,
@@ -114,7 +135,7 @@ class EagleTrainerBackend:
         """
         针对单条数据：裁剪窗口、生成Mask、确保维度对齐
         """
-        res = {'ids':[], 'h_states':[], 'masks': []}
+        res = {'ids':[], 'h_states':[], 'masks': [], 'position_ids': []}
         max_window = 512
         pad_id = int(getattr(model_config, "pad_token_id", 0) or 0)
 
@@ -148,7 +169,12 @@ class EagleTrainerBackend:
                     # If no response info, assume all tokens are valid
                     item_loss_mask[:] = 1.0
             else:
-                item_loss_mask = item["loss_mask"]
+                item_loss_mask = item["loss_mask"].to(device, dtype=torch.float32, non_blocking=True)
+            item_position_ids = item.get("position_ids")
+            if item_position_ids is None:
+                item_position_ids = torch.arange(full_len, device=device, dtype=torch.long)
+            else:
+                item_position_ids = item_position_ids.to(device, dtype=torch.long, non_blocking=True)
             
             # Select window around response tokens
             nonzero = torch.nonzero(item_loss_mask)
@@ -167,6 +193,7 @@ class EagleTrainerBackend:
             res['ids'].append(ids[start:end])
             res['h_states'].append(h_states[start:end])
             res['masks'].append(item_loss_mask[start:end])
+            res['position_ids'].append(item_position_ids[start:end])
         
         return res
     
@@ -219,20 +246,33 @@ class EagleTrainerBackend:
             loss_mask = batch["loss_mask"]
 
         # V-Loss：隐藏态回归损失
-        vloss_all = self.criterion(hidden_states, target)  # [B,T,H]
+        safe_hidden_states = torch.nan_to_num(hidden_states, nan=0.0, posinf=0.0, neginf=0.0)
+        safe_target = torch.nan_to_num(target, nan=0.0, posinf=0.0, neginf=0.0)
+
+        vloss_all = self.criterion(safe_hidden_states, safe_target)  # [B,T,H]
         vloss_per_token = vloss_all.mean(dim=-1) # [B, T]
+        finite_vloss = torch.isfinite(vloss_per_token)
 
         # P-Loss: 概率分布对齐损失
         with torch.no_grad():
-            target_p = F.softmax(draft_model.lm_head(target), dim=-1)
+            target_p = F.softmax(draft_model.lm_head(safe_target), dim=-1)
 
-        log_prod = F.log_softmax(logits,  dim=-1)
-        ploss_per_token = -(target_p * log_prod).sum(dim=-1) # [B, T]
+        ploss_per_token, valid_ploss = _masked_soft_cross_entropy(logits, target_p, loss_mask)
+        valid_position = valid_ploss & finite_vloss
+        if (loss_mask > 0).any() and not valid_position[loss_mask > 0].all():
+            dropped_tokens = ((loss_mask > 0) & ~valid_position).sum()
+            logger.debug(
+                "Dropping %s EAGLE target positions with non-finite vloss, logits or targets",
+                int(dropped_tokens.detach().cpu().item()),
+            )
+        vloss_per_token = torch.where(valid_position, vloss_per_token, torch.zeros_like(vloss_per_token))
+        ploss_per_token = torch.where(valid_position, ploss_per_token, torch.zeros_like(ploss_per_token))
+        valid_loss_mask = valid_position.float()
 
         # 结合 Mask
-        total_local_vloss = (vloss_per_token * loss_mask).sum()
-        total_local_ploss = (ploss_per_token * loss_mask).sum()
-        local_num_tokens = loss_mask.sum()
+        total_local_vloss = (vloss_per_token * valid_loss_mask).sum()
+        total_local_ploss = (ploss_per_token * valid_loss_mask).sum()
+        local_num_tokens = valid_loss_mask.sum()
 
         # 读取权重并返回 Loss 字典
         train_config = getattr(self, "train_config", self.config.rollout.drafter.training)

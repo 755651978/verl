@@ -504,6 +504,7 @@ class DrafterBaseTrainer:
                 "input_ids": cpu_input_ids[i, feature_start:feature_end],
                 "hidden_states": cpu_h_states[i, hidden_start:hidden_end, :],
                 "loss_mask": full_loss_mask[feature_start:feature_end],
+                "position_ids": torch.arange(feature_seq_length, dtype=torch.long),
                 "target_logprobs": target_logprobs_item,
                 "responses": cpu_responses[i] if cpu_responses is not None else None, 
                 "prompts": cpu_prompts[i] if cpu_prompts is not None else None, 
@@ -514,6 +515,96 @@ class DrafterBaseTrainer:
 
             # 同步 collect_data (当前步训练直接使用)
             self.collected_data.append(data_item)
+
+    def _get_hidden_state_clip_value(self) -> Optional[float]:
+        clip_value = self.config.rollout.drafter.training.get("hidden_state_clip_value", 1.0e4)
+        if clip_value is None:
+            return None
+        clip_value = float(clip_value)
+        return clip_value if clip_value > 0 else None
+
+    def _sanitize_sequence_tensor(
+        self,
+        tensor: torch.Tensor,
+        name: str,
+        clip_value: Optional[float],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if tensor.dim() < 3:
+            raise ValueError(f"{name} must have shape [batch, seq, ...], got {tuple(tensor.shape)}")
+
+        bad_rows = ~torch.isfinite(tensor).flatten(start_dim=2).all(dim=-1)
+        safe_tensor = torch.nan_to_num(tensor, nan=0.0, posinf=0.0, neginf=0.0)
+
+        if clip_value is not None:
+            row_abs_max = safe_tensor.detach().float().abs().flatten(start_dim=2).amax(dim=-1)
+            bad_rows = bad_rows | (row_abs_max > clip_value)
+            safe_tensor = safe_tensor.clamp(min=-clip_value, max=clip_value)
+
+        dropped_rows = int(bad_rows.detach().sum().cpu().item())
+        if dropped_rows > 0:
+            logger.warning(
+                f"[Rank {self.rank}] Sanitized {dropped_rows} drafter {name} rows with non-finite or clipped values"
+            )
+
+        return safe_tensor, bad_rows
+
+    def _mask_loss_for_bad_inputs(
+        self,
+        loss_mask: torch.Tensor,
+        bad_input_rows: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not bad_input_rows.any():
+            return loss_mask, attention_mask
+
+        ttt_length = 1
+        if getattr(self.backend, "model_type", None) == "eagle3":
+            ttt_length = int(self.config.rollout.drafter.training.get("ttt_length", 1))
+        ttt_length = max(1, ttt_length)
+
+        bad_target_rows = torch.zeros_like(bad_input_rows, dtype=torch.bool)
+        seq_len = bad_input_rows.size(1)
+        for offset in range(min(ttt_length, seq_len)):
+            if offset == 0:
+                bad_target_rows |= bad_input_rows
+            else:
+                bad_target_rows[:, offset:] |= bad_input_rows[:, : seq_len - offset]
+
+        masked_tokens = int(((loss_mask > 0) & bad_target_rows).detach().sum().cpu().item())
+        if masked_tokens > 0:
+            logger.warning(f"[Rank {self.rank}] Masked {masked_tokens} drafter targets due to bad input hidden rows")
+
+        loss_mask = loss_mask.masked_fill(bad_target_rows, 0.0)
+        attention_mask = attention_mask.masked_fill(bad_input_rows, 0)
+        return loss_mask, attention_mask
+
+    def _sanitize_training_batch(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        clip_value = self._get_hidden_state_clip_value()
+
+        loss_mask = torch.nan_to_num(batch["loss_mask"].float(), nan=0.0, posinf=0.0, neginf=0.0)
+        batch["loss_mask"] = torch.where(loss_mask > 0, torch.ones_like(loss_mask), torch.zeros_like(loss_mask))
+
+        hidden_states, bad_input_rows = self._sanitize_sequence_tensor(
+            batch["hidden_states"], "hidden_states", clip_value
+        )
+        batch["hidden_states"] = hidden_states
+        batch["loss_mask"], batch["attention_mask"] = self._mask_loss_for_bad_inputs(
+            batch["loss_mask"], bad_input_rows, batch["attention_mask"]
+        )
+
+        for target_key in ("target", "last_hidden_states"):
+            if target_key not in batch:
+                continue
+            target_tensor, bad_target_rows = self._sanitize_sequence_tensor(batch[target_key], target_key, clip_value)
+            batch[target_key] = target_tensor
+            masked_tokens = int(((batch["loss_mask"] > 0) & bad_target_rows).detach().sum().cpu().item())
+            if masked_tokens > 0:
+                logger.warning(
+                    f"[Rank {self.rank}] Masked {masked_tokens} drafter targets due to bad {target_key} rows"
+                )
+            batch["loss_mask"] = batch["loss_mask"].masked_fill(bad_target_rows, 0.0)
+
+        return batch
 
     def _prepare_training_batch(
         self, buffer_steps: int = 2
@@ -570,50 +661,108 @@ class DrafterBaseTrainer:
         
         preprocessed_lists = self.backend.preprocess_individual_items(items, dev, self.model_config)
        
-        # Concatenate all sequences into a single sequence
-        input_ids_concat = torch.cat(preprocessed_lists['ids'], dim=0).unsqueeze(0)  # (1, total_seq_len)
-        loss_mask_concat = torch.cat(preprocessed_lists['masks'], dim=0).unsqueeze(0)  # (1, total_seq_len)
-        hidden_states_concat = torch.cat(preprocessed_lists['h_states'], dim=0).unsqueeze(0)  # (1, total_seq_len, hidden_dim)
+        # Build next-token training chunks inside each sample before packing.
+        # Shifting after concatenation would create cross-sample targets and
+        # misalign target_logprobs whenever SGLang returns suffix-only features.
+        input_id_chunks = []
+        loss_mask_chunks = []
+        hidden_state_chunks = []
+        position_id_chunks = []
+        target_chunks = []
+        last_hidden_state_chunks = []
+        target_logprob_chunks = []
 
-        if self.backend.model_type == "eagle3":
-            if use_logits:
-                target_logprobs_concat = torch.cat(preprocessed_lists["target_logprobs"], dim=0).unsqueeze(0)
+        ids_list = preprocessed_lists["ids"]
+        hidden_list = preprocessed_lists["h_states"]
+        mask_list = preprocessed_lists["masks"]
+        position_list = preprocessed_lists.get("position_ids")
+        if position_list is None:
+            position_list = [torch.arange(ids.size(0), device=ids.device, dtype=torch.long) for ids in ids_list]
+        for item_idx, (ids, h_states, item_loss_mask, item_position_ids) in enumerate(
+            zip(ids_list, hidden_list, mask_list, position_list)
+        ):
+            seq_len = min(ids.size(0), h_states.size(0), item_loss_mask.size(0), item_position_ids.size(0))
+            if seq_len < 2:
+                continue
+
+            if self.backend.model_type == "eagle3" and use_logits:
+                target_logprobs_item = preprocessed_lists["target_logprobs"][item_idx]
+                train_seq_len = min(seq_len - 1, target_logprobs_item.size(0))
+            elif self.backend.model_type == "eagle3":
+                last_h_states = preprocessed_lists["last_h_states"][item_idx]
+                train_seq_len = min(seq_len - 1, last_h_states.size(0) - 1)
+            elif self.backend.model_type == "eagle":
+                train_seq_len = seq_len - 1
             else:
-                last_hidden_states_concat = torch.cat(preprocessed_lists['last_h_states'], dim=0).unsqueeze(0)
+                train_seq_len = seq_len - 1
 
-        total_seq_len = input_ids_concat.size(1)
-        if total_seq_len < 2:
+            if train_seq_len < 1:
+                continue
+
+            input_id_chunks.append(ids[:train_seq_len])
+            hidden_state_chunks.append(h_states[:train_seq_len])
+            position_id_chunks.append(item_position_ids[:train_seq_len])
+            loss_mask_chunks.append(item_loss_mask[1 : 1 + train_seq_len])
+
+            if self.backend.model_type == "eagle3":
+                if use_logits:
+                    target_logprob_chunks.append(target_logprobs_item[:train_seq_len])
+                else:
+                    last_hidden_state_chunks.append(last_h_states[1 : 1 + train_seq_len])
+            elif self.backend.model_type == "eagle":
+                target_chunks.append(h_states[1 : 1 + train_seq_len])
+
+        if not input_id_chunks:
             return None
 
-        loss_mask = loss_mask_concat[:, 1:].contiguous()
-        input_ids = input_ids_concat[:, :-1].contiguous()
+        input_ids = torch.cat(input_id_chunks, dim=0).unsqueeze(0).contiguous()
+        loss_mask = torch.cat(loss_mask_chunks, dim=0).unsqueeze(0).contiguous()
+        base_h = torch.cat(hidden_state_chunks, dim=0).unsqueeze(0).contiguous()
         attn_mask = torch.ones_like(input_ids, dtype=torch.long, device=dev)
-        base_h = hidden_states_concat[:, :-1].contiguous()
-        position_ids = torch.arange(total_seq_len, device=dev).unsqueeze(0)[:, :-1].contiguous()
+        position_ids = torch.cat(position_id_chunks, dim=0).unsqueeze(0).contiguous()
 
         if self.backend.model_type == "eagle3":
             if use_logits:
-                # rollout already returns token-level teacher targets aligned to
-                # positions [1..T-1]. Keep them as-is and match them against the
-                # standard next-token inputs built above from [0..T-2].
-                train_seq_len = min(
-                    input_ids.size(1),
-                    loss_mask.size(1),
-                    base_h.size(1),
-                    target_logprobs_concat.size(1),
-                )
-                if train_seq_len < 1:
+                if not target_logprob_chunks:
                     return None
-                input_ids = input_ids[:, :train_seq_len].contiguous()
-                attn_mask = attn_mask[:, :train_seq_len].contiguous()
-                base_h = base_h[:, :train_seq_len].contiguous()
-                position_ids = position_ids[:, :train_seq_len].contiguous()
-                loss_mask = loss_mask[:, :train_seq_len].contiguous()
-                target_logprobs = target_logprobs_concat[:, :train_seq_len].contiguous()
+                target_logprobs = torch.cat(target_logprob_chunks, dim=0).unsqueeze(0).contiguous()
             else:
-                last_hidden_states = last_hidden_states_concat[:, 1:].contiguous()
+                if not last_hidden_state_chunks:
+                    return None
+                last_hidden_states = torch.cat(last_hidden_state_chunks, dim=0).unsqueeze(0).contiguous()
         elif self.backend.model_type == "eagle":
-            target = hidden_states_concat[:, 1:].contiguous()
+            if not target_chunks:
+                return None
+            target = torch.cat(target_chunks, dim=0).unsqueeze(0).contiguous()
+
+        batch = {
+            "input_ids": input_ids,
+            "attention_mask": attn_mask,
+            "hidden_states": base_h,
+            "loss_mask": loss_mask,
+            "position_ids": position_ids,
+        }
+        if self.backend.model_type == "eagle3":
+            if use_logits:
+                batch["target_logprobs"] = target_logprobs
+            else:
+                batch["last_hidden_states"] = last_hidden_states
+        elif self.backend.model_type == "eagle":
+            batch["target"] = target
+
+        batch = self._sanitize_training_batch(batch)
+        input_ids = batch["input_ids"]
+        attn_mask = batch["attention_mask"]
+        base_h = batch["hidden_states"]
+        loss_mask = batch["loss_mask"]
+        position_ids = batch["position_ids"]
+        if self.backend.model_type == "eagle3":
+            if use_logits:
+                target_logprobs = batch["target_logprobs"]
+            else:
+                last_hidden_states = batch["last_hidden_states"]
+        elif self.backend.model_type == "eagle":
+            target = batch["target"]
 
         # Use Ulysses SP to pad and slice if needed
         if self.use_ulysses_sp:

@@ -102,6 +102,7 @@ class DrafterTrainingConfig(BaseConfig):
     vocab_mapping_path: Optional[str] = None
     current_max_samples: int = 2000
     data_buffer_max_size: int = 10000
+    hidden_state_clip_value: Optional[float] = 1.0e4
 
 
 @dataclass

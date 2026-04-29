@@ -276,7 +276,7 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
         """
         针对单条数据：裁剪窗口、生成Mask、确保维度对齐
         """
-        res = {'ids':[], 'h_states':[], 'masks': [], 'last_h_states': [], 'target_logprobs': []}
+        res = {'ids':[], 'h_states':[], 'masks': [], 'position_ids': [], 'last_h_states': [], 'target_logprobs': []}
         max_window = 512
         pad_id = int(getattr(model_config, "pad_token_id", 0) or 0)
         h_dim = getattr(model_config, "target_hidden_size", model_config.hidden_size)
@@ -324,7 +324,12 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
                     # If no response info, assume all tokens are valid
                     item_loss_mask[:] = 1.0
             else:
-                item_loss_mask = item["loss_mask"]
+                item_loss_mask = item["loss_mask"].to(device, dtype=torch.float32, non_blocking=True)
+            item_position_ids = item.get("position_ids")
+            if item_position_ids is None:
+                item_position_ids = torch.arange(full_len, device=device, dtype=torch.long)
+            else:
+                item_position_ids = item_position_ids.to(device, dtype=torch.long, non_blocking=True)
             
             # Select window around response tokens
             nonzero = torch.nonzero(item_loss_mask)
@@ -342,11 +347,15 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
 
             res['ids'].append(ids[start:end])
             res['h_states'].append(h_states[start:end])
+            res['position_ids'].append(item_position_ids[start:end])
             if not use_logits:
                 res['last_h_states'].append(last_h_states[start:end])
             res['masks'].append(item_loss_mask[start:end])
             if item.get("target_logprobs") is not None:
-                res["target_logprobs"].append(item["target_logprobs"].to(device, dtype=torch.float32)[start:end])
+                target_end = max(start, end - 1)
+                res["target_logprobs"].append(
+                    item["target_logprobs"].to(device, dtype=torch.float32)[start:target_end]
+                )
         
         return res
 

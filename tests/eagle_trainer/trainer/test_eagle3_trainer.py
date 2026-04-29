@@ -181,6 +181,41 @@ def test_eagle3_masked_ploss_keeps_bad_logits_out_of_backward():
     assert torch.equal(logits.grad[0, 2], torch.zeros_like(logits.grad[0, 2]))
 
 
+def test_drafter_training_batch_sanitizer_masks_bad_hidden_rows():
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.rank = 0
+    trainer.backend = type("Backend", (), {"model_type": "eagle3"})()
+    trainer.config = OmegaConf.create(
+        {
+            "rollout": {
+                "drafter": {
+                    "training": {
+                        "hidden_state_clip_value": 10.0,
+                        "ttt_length": 2,
+                    }
+                }
+            }
+        }
+    )
+
+    hidden_states = torch.ones(1, 4, 3)
+    hidden_states[0, 1, 0] = torch.nan
+    batch = {
+        "input_ids": torch.ones(1, 4, dtype=torch.long),
+        "attention_mask": torch.ones(1, 4, dtype=torch.long),
+        "hidden_states": hidden_states,
+        "loss_mask": torch.ones(1, 4),
+        "position_ids": torch.arange(4).unsqueeze(0),
+        "target_logprobs": torch.zeros(1, 4, 2, 2),
+    }
+
+    sanitized = trainer._sanitize_training_batch(batch)
+
+    assert torch.isfinite(sanitized["hidden_states"]).all()
+    assert sanitized["attention_mask"].tolist() == [[1, 0, 1, 1]]
+    assert sanitized["loss_mask"].tolist() == [[1.0, 0.0, 0.0, 1.0]]
+
+
 def _mock_rollout_batch(config: LlamaConfig, batch_size: int = 2, seq_len: int = 24, prompt_len: int = 8):
     response_len = seq_len - prompt_len
     input_ids = torch.randint(3, config.vocab_size, (batch_size, seq_len), device="cuda")

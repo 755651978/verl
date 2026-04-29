@@ -480,5 +480,6 @@ drafter:
     vocab_mapping_path: null
     current_max_samples: 2000
     data_buffer_max_size: 10000
+    hidden_state_clip_value: 1.0e4
 
 
