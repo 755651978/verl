@@ -83,7 +83,7 @@ class DrafterBaseTrainer:
                 dist.get_rank() if dist.is_initialized() else 0
             )
             self.dp_rank = dist.get_rank(data_parallel_process_group) if data_parallel_process_group is not None else 0
-        self.use_data_buffer = config.rollout.drafter.training.get("use_data_buffer", False)
+        self.use_data_buffer = bool(config.rollout.drafter.training.get("use_data_buffer", False))
         self.current_rl_step = 0
         
         self.device_id = get_device_id()
@@ -417,8 +417,8 @@ class DrafterBaseTrainer:
     def collect_online_data(self, batch: dict, hidden_states: torch.Tensor, target_logprobs: List = None) -> None:
         """Collect online data from inference for Eagle training.
 
-        This method collects data both to the local collected_data deque (for immediate use)
-        and to the DataBuffer (for cross-step data accumulation).
+        This method stores hidden states in the cross-step DataBuffer only when
+        use_data_buffer=True. Otherwise it keeps only the current-step samples.
         """
         input_ids = batch.get("input_ids")
         if input_ids is None:
@@ -515,10 +515,13 @@ class DrafterBaseTrainer:
             }
 
             # 同步 DataBuffer
-            self.data_buffer.add_batch(data_item)
+            if self.use_data_buffer:
+                self.data_buffer.add_batch(data_item)
 
             # 同步 collect_data (当前步训练直接使用)
-            self.collected_data.append(data_item)
+            else:
+                data_item["step"] = self.current_rl_step
+                self.collected_data.append(data_item)
 
     def _get_hidden_state_clip_value(self) -> Optional[float]:
         clip_value = self.config.rollout.drafter.training.get("hidden_state_clip_value", 1.0e4)
@@ -1003,10 +1006,13 @@ class DrafterBaseTrainer:
 
         Should be called at the end of each RL training step to mark the boundary.
         """
+        previous_step = self.current_rl_step
         if global_step is None:
             self.current_rl_step += 1
         else:
             self.current_rl_step = int(global_step)
+        if not self.use_data_buffer and self.current_rl_step != previous_step:
+            self.collected_data.clear()
         self.data_buffer.update_rl_step(self.current_rl_step)
         logger.debug(
             f"[Rank {self.rank}] DataBuffer RL step incremented to {self.data_buffer.get_current_step()}, "

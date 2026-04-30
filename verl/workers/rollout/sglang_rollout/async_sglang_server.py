@@ -445,6 +445,8 @@ class SGLangHttpServer:
         video_data: Optional[list[Any]] = None,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
+        skip_drafter_collection = bool(sampling_params.pop("_verl_skip_drafter_collection", False))
+
         # TODO(@wuxibin): switch to `/generate` http endpoint once multi-modal support ready.
         max_possible_tokens = self.config.max_model_len - len(prompt_ids) - 1
 
@@ -497,6 +499,7 @@ class SGLangHttpServer:
             and self.config.drafter.enable_drafter_training
             and self.config.drafter.training.collect_hidden_states_from_sgl
             and collect_this_step
+            and not skip_drafter_collection
         ):
             should_collect = True
             request.update({"return_hidden_states": True})

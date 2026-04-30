@@ -547,6 +547,7 @@ class AgentLoopWorker:
             response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
         """
         config = self.rollout_config
+        is_validate = bool(batch.meta_info.get("validate", False))
         sampling_params = dict(
             temperature=config.temperature,
             top_p=config.top_p,
@@ -554,9 +555,11 @@ class AgentLoopWorker:
             repetition_penalty=1.0,
             logprobs=config.calculate_log_probs,
         )
+        if is_validate and config.name == "sglang":
+            sampling_params["_verl_skip_drafter_collection"] = True
 
         # override sampling params for validation
-        if batch.meta_info.get("validate", False):
+        if is_validate:
             sampling_params["top_p"] = config.val_kwargs.top_p
             sampling_params["top_k"] = config.val_kwargs.top_k
             sampling_params["temperature"] = config.val_kwargs.temperature
@@ -588,7 +591,7 @@ class AgentLoopWorker:
             traced_indices = set(range(len(batch)))
 
         trajectory_info = await get_trajectory_info(
-            batch.meta_info.get("global_steps", -1), index.tolist(), batch.meta_info.get("validate", False)
+            batch.meta_info.get("global_steps", -1), index.tolist(), is_validate
         )
 
         tasks = []
@@ -603,7 +606,7 @@ class AgentLoopWorker:
         outputs = await asyncio.gather(*tasks)
 
         output = self._postprocess(
-            outputs, input_non_tensor_batch=batch.non_tensor_batch, validate=batch.meta_info.get("validate", False)
+            outputs, input_non_tensor_batch=batch.non_tensor_batch, validate=is_validate
         )
         return output
 
@@ -644,6 +647,8 @@ class AgentLoopWorker:
     async def _agent_loop_postprocess(self, output, validate, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
+        if validate:
+            output.extra_fields.pop("drafter_sample", None)
 
         # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
 
