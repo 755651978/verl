@@ -40,6 +40,7 @@ from sglang.srt.managers.io_struct import (
     ResumeMemoryOccupationReqInput,
 )
 from sglang.srt.managers.tokenizer_manager import ServerStatus
+from sglang.srt.utils import MultiprocessingSerializer
 
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_visible_devices_keyword
@@ -96,6 +97,46 @@ def _top_logprobs_to_tensor(top_logprobs: list, topk: int) -> Optional[torch.Ten
     if not rows:
         return None
     return torch.tensor(rows, dtype=torch.float32)
+
+
+def _hidden_state_chunk_to_tensor(hidden_state_chunk: Any) -> Optional[torch.Tensor]:
+    if hidden_state_chunk is None:
+        return None
+
+    if torch.is_tensor(hidden_state_chunk):
+        h_states = hidden_state_chunk.detach().to(device="cpu", dtype=torch.bfloat16)
+    elif isinstance(hidden_state_chunk, (bytes, bytearray, memoryview, str)):
+        serialized_chunk = (
+            hidden_state_chunk.tobytes()
+            if isinstance(hidden_state_chunk, memoryview)
+            else bytes(hidden_state_chunk)
+            if isinstance(hidden_state_chunk, bytearray)
+            else hidden_state_chunk
+        )
+        try:
+            deserialized = MultiprocessingSerializer.deserialize(serialized_chunk)
+        except Exception:  # noqa: BLE001
+            logger.warning("Failed to deserialize hidden-state chunk from bytes; skipping this chunk")
+            return None
+        return _hidden_state_chunk_to_tensor(deserialized)
+    else:
+        h_states = torch.tensor(hidden_state_chunk, dtype=torch.bfloat16)
+
+    if h_states.numel() == 0:
+        return None
+    if h_states.dim() == 1:
+        h_states = h_states.unsqueeze(0)
+    elif h_states.dim() == 3:
+        h_states = h_states.squeeze(0)
+    return h_states.contiguous()
+
+
+def _iter_hidden_state_chunks(hidden_states_data: Any):
+    if hidden_states_data is None:
+        return []
+    if torch.is_tensor(hidden_states_data) or isinstance(hidden_states_data, (bytes, bytearray, memoryview, str)):
+        return [hidden_states_data]
+    return hidden_states_data
 
 
 class SGLangHttpServer:
@@ -574,15 +615,10 @@ class SGLangHttpServer:
 
             hidden_states_data = output.get("meta_info", {}).get("hidden_states", [])
             hidden_states_list = []
-            for hs in hidden_states_data:
-                h_states = torch.tensor(hs, dtype=torch.bfloat16)
-                if h_states.numel() == 0:
-                    continue
-                if h_states.dim() == 1:
-                    h_states = h_states.unsqueeze(0)
-                elif h_states.dim() == 3:
-                    h_states = h_states.squeeze(0)
-                hidden_states_list.append(h_states)
+            for hs in _iter_hidden_state_chunks(hidden_states_data):
+                h_states = _hidden_state_chunk_to_tensor(hs)
+                if h_states is not None:
+                    hidden_states_list.append(h_states)
 
             if hidden_states_list:
                 prompt_tensor = torch.as_tensor(prompt_ids, dtype=torch.long).detach().cpu()

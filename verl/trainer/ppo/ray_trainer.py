@@ -75,6 +75,17 @@ from verl.workers.engine.fsdp.utils import build_rollout_parallel_layout
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
 
+_POLICY_MODEL_NON_TENSOR_KEYS = {"multi_modal_inputs", "pad_token_id"}
+
+
+def _select_policy_model_batch(batch: DataProto) -> DataProto:
+    """Keep rollout/drafter side-channel data out of policy-model forward paths."""
+    non_tensor_batch_keys = [
+        key for key in _POLICY_MODEL_NON_TENSOR_KEYS if key in batch.non_tensor_batch
+    ]
+    return batch.select(non_tensor_batch_keys=non_tensor_batch_keys)
+
+
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
     """Apply KL penalty to the token-level rewards.
 
@@ -1279,6 +1290,7 @@ class RayPPOTrainer:
         return values
 
     def _compute_ref_log_prob(self, batch: DataProto) -> DataProto:
+        batch = _select_policy_model_batch(batch)
         # step 1: convert dataproto to tensordict.
         batch_td = batch.to_tensordict()
         # step 2: convert from padding to nopadding
@@ -1303,6 +1315,7 @@ class RayPPOTrainer:
         return ref_log_prob
 
     def _compute_old_log_prob(self, batch: DataProto):
+        batch = _select_policy_model_batch(batch)
         # TODO: remove step 1, 2, 4 after we make the whole training tensordict and padding free
         # step 1: convert dataproto to tensordict.
         batch_td = batch.to_tensordict()
@@ -1335,6 +1348,7 @@ class RayPPOTrainer:
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
         # TODO: Make "temperature" single source of truth from generation.
         batch.meta_info["temperature"] = rollout_config.temperature
+        batch = _select_policy_model_batch(batch)
         # update actor
         batch_td = batch.to_tensordict()
         # step 2: convert from padding to no-padding
@@ -1487,51 +1501,54 @@ class RayPPOTrainer:
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
                     # generate a batch
+                    if curr_step_profile:
+                        self.async_rollout_manager.start_profile()
                     with marked_timer("gen", timing_raw, color="red"):
-                        if curr_step_profile:
-                            self.async_rollout_manager.start_profile()
                         gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
-                        self.checkpoint_manager.sleep_replicas()
-                        if curr_step_profile:
-                            self.async_rollout_manager.stop_profile()
 
-                        timing_raw.update(gen_batch_output.meta_info["timing"])
-                        gen_batch_output.meta_info.pop("timing", None)
-                        if self.use_drafter and self.drafter_wg is not None:
-                            with marked_timer("collect_drafter", timing_raw):
-                                self.drafter_wg.set_global_step(self.global_steps)
-                                collected_drafter_samples = self._collect_drafter_rollout_features(gen_batch_output)
-                            metrics["drafter/collected_samples"] = collected_drafter_samples
-                            metrics["drafter/owner_routed_samples"] = collected_drafter_samples
+                    with marked_timer("sleep_replicas", timing_raw):
+                        self.checkpoint_manager.sleep_replicas()
+                    if curr_step_profile:
+                        self.async_rollout_manager.stop_profile()
+
+                    timing_raw.update(gen_batch_output.meta_info["timing"])
+                    gen_batch_output.meta_info.pop("timing", None)
+                    if self.use_drafter and self.drafter_wg is not None:
+                        with marked_timer("collect_drafter", timing_raw):
+                            self.drafter_wg.set_global_step(self.global_steps)
+                            collected_drafter_samples = self._collect_drafter_rollout_features(gen_batch_output)
+                        metrics["drafter/collected_samples"] = collected_drafter_samples
+                        metrics["drafter/owner_routed_samples"] = collected_drafter_samples
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                        gen_baseline_batch = deepcopy(gen_batch)
+                        gen_baseline_batch.meta_info["do_sample"] = False
+                        if curr_step_profile:
+                            self.async_rollout_manager.start_profile()
                         with marked_timer("gen_max", timing_raw, color="purple"):
-                            gen_baseline_batch = deepcopy(gen_batch)
-                            gen_baseline_batch.meta_info["do_sample"] = False
-                            if curr_step_profile:
-                                self.async_rollout_manager.start_profile()
                             gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
+                        with marked_timer("sleep_replicas", timing_raw):
                             self.checkpoint_manager.sleep_replicas()
-                            if curr_step_profile:
-                                self.async_rollout_manager.stop_profile()
-                            batch = batch.union(gen_baseline_output)
-                            # compute reward model score on batch
-                            rm_scores = None
-                            if self.use_rm and "rm_scores" not in batch.batch.keys():
-                                batch_reward = self._compute_reward_colocate(batch)
-                                batch = batch.union(batch_reward)
+                        if curr_step_profile:
+                            self.async_rollout_manager.stop_profile()
+                        batch = batch.union(gen_baseline_output)
+                        # compute reward model score on batch
+                        rm_scores = None
+                        if self.use_rm and "rm_scores" not in batch.batch.keys():
+                            batch_reward = self._compute_reward_colocate(batch)
+                            batch = batch.union(batch_reward)
 
-                            # Compute or extract reward for REMAX baseline
-                            reward_baseline_tensor = batch.batch["rm_scores"].sum(dim=-1)
+                        # Compute or extract reward for REMAX baseline
+                        reward_baseline_tensor = batch.batch["rm_scores"].sum(dim=-1)
 
-                            keys_to_pop = set(gen_baseline_output.batch.keys())
-                            if rm_scores is not None:
-                                keys_to_pop.update(rm_scores.batch.keys())
-                            batch.pop(batch_keys=list(keys_to_pop))
+                        keys_to_pop = set(gen_baseline_output.batch.keys())
+                        if rm_scores is not None:
+                            keys_to_pop.update(rm_scores.batch.keys())
+                        batch.pop(batch_keys=list(keys_to_pop))
 
-                            batch.batch["reward_baselines"] = reward_baseline_tensor
+                        batch.batch["reward_baselines"] = reward_baseline_tensor
 
-                            del rm_scores, gen_baseline_batch, gen_baseline_output
+                        del rm_scores, gen_baseline_batch, gen_baseline_output
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
@@ -1686,6 +1703,8 @@ class RayPPOTrainer:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self._update_actor(batch)
+                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                        metrics.update(actor_output_metrics)
 
                         # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                         esi_close_to_expiration = should_save_ckpt_esi(
@@ -1736,9 +1755,6 @@ class RayPPOTrainer:
                             else:
                                 metrics["drafter/publish_attempted"] = 0
                                 metrics["drafter/published"] = 0
-
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                        metrics.update(actor_output_metrics)
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)

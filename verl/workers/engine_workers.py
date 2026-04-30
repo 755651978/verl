@@ -14,13 +14,15 @@
 import functools
 import logging
 import os
+import random
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from functools import partial
 from itertools import chain
 from typing import Optional
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from codetiming import Timer
@@ -39,7 +41,7 @@ from verl.single_controller.base.decorator import (
 from verl.trainer.distillation import distillation_ppo_loss, is_distillation_enabled
 from verl.utils import tensordict_utils as tu
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.device import get_device_name, is_npu_available, set_expandable_segments
+from verl.utils.device import get_device_name, get_torch_device, is_npu_available, set_expandable_segments
 from verl.utils.distributed import initialize_global_process_group_ray, set_numa_affinity
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.import_utils import import_external_libs
@@ -79,6 +81,34 @@ def _resolve_drafter_init_backend(device_name: str) -> str:
     if device_name == "cpu":
         return "cpu:gloo"
     raise ValueError(f"Unsupported drafter device_name={device_name!r}")
+
+
+@contextmanager
+def _preserve_process_rng_state(device_name: str):
+    python_rng_state = random.getstate()
+    numpy_rng_state = np.random.get_state()
+    torch_cpu_rng_state = torch.get_rng_state()
+    torch_device_rng_state = None
+    torch_device = None
+
+    if str(device_name).lower() != "cpu":
+        torch_device = get_torch_device()
+        try:
+            torch_device_rng_state = torch_device.get_rng_state()
+        except (AttributeError, RuntimeError):
+            torch_device_rng_state = None
+
+    try:
+        yield
+    finally:
+        random.setstate(python_rng_state)
+        np.random.set_state(numpy_rng_state)
+        torch.set_rng_state(torch_cpu_rng_state)
+        if torch_device is not None and torch_device_rng_state is not None:
+            try:
+                torch_device.set_rng_state(torch_device_rng_state)
+            except (AttributeError, RuntimeError):
+                logger.warning("Failed to restore %s RNG state after drafter training.", device_name)
 
 
 def _with_routing_replay_flag(enabled: bool):
@@ -984,33 +1014,34 @@ class DrafterWorker(Worker):
             result["reason"] = "interval_not_reached"
             return result
 
-        result["triggered"] = True
-        start_ts = time.time()
-        success = await self.trainer.activate_training_model()
-        if not success:
-            logger.error(
-                f"[DrafterWorker replica={self.replica_rank}] failed to activate trainer at step {self.last_global_step}"
-            )
-            await self.trainer.cleanup_training(clear_data=False)
-            result["reason"] = "activation_failed"
+        with _preserve_process_rng_state(self.device_name):
+            result["triggered"] = True
+            start_ts = time.time()
+            success = await self.trainer.activate_training_model()
+            if not success:
+                logger.error(
+                    f"[DrafterWorker replica={self.replica_rank}] failed to activate trainer at step {self.last_global_step}"
+                )
+                await self.trainer.cleanup_training(clear_data=False)
+                result["reason"] = "activation_failed"
+                result["elapsed_sec"] = time.time() - start_ts
+                return result
+
+            try:
+                for _ in range(self.train_steps_per_trigger):
+                    result["attempted_steps"] += 1
+                    step_ok = await self.trainer.training_step(self.last_global_step)
+                    if step_ok:
+                        result["successful_steps"] += 1
+            finally:
+                await self.trainer.cleanup_training(clear_data=result["successful_steps"] > 0)
+
+            result["trained"] = result["successful_steps"] > 0
+            result["reason"] = "trained" if result["trained"] else "no_trainable_batch"
+            if result["trained"]:
+                self.last_trained_step = self.last_global_step
             result["elapsed_sec"] = time.time() - start_ts
             return result
-
-        try:
-            for _ in range(self.train_steps_per_trigger):
-                result["attempted_steps"] += 1
-                step_ok = await self.trainer.training_step(self.last_global_step)
-                if step_ok:
-                    result["successful_steps"] += 1
-        finally:
-            await self.trainer.cleanup_training(clear_data=result["successful_steps"] > 0)
-
-        result["trained"] = result["successful_steps"] > 0
-        result["reason"] = "trained" if result["trained"] else "no_trainable_batch"
-        if result["trained"]:
-            self.last_trained_step = self.last_global_step
-        result["elapsed_sec"] = time.time() - start_ts
-        return result
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def maybe_publish(self):

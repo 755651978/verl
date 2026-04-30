@@ -17,6 +17,8 @@ import importlib
 import inspect
 import logging
 import os
+import re
+import textwrap
 from functools import wraps
 from typing import Callable
 
@@ -33,8 +35,12 @@ _DRAFT_WEIGHT_LOADER_ENV = "VERL_SGLANG_DRAFT_WEIGHT_LOADER"
 _target_weight_loader: str | None = os.environ.get(_TARGET_WEIGHT_LOADER_ENV)
 _draft_weight_loader: str | None = os.environ.get(_DRAFT_WEIGHT_LOADER_ENV)
 _ORIGINAL_SGLANG_RUN_SCHEDULER_PROCESS = sglang.srt.entrypoints.engine.run_scheduler_process
+_ORIGINAL_SGLANG_DIRECT_RUN_SCHEDULER_PROCESS = None
 _SGLANG_EAGLE_UPDATE_PATCHED = False
 _SGLANG_TRANSFORMERS_EAGLE3_CAPTURE_PATCHED = False
+_SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED = False
+_SGLANG_SCHEDULER_PROCESS_PATCHED = False
+_SCHEDULER_PROCESS_PATCH_ATTR = "_verl_patched_scheduler_process"
 
 
 def configure_sglang_eagle_weight_update_patch(
@@ -476,14 +482,138 @@ def patch_sglang_transformers_eagle3_capture() -> None:
         logger.info("Patched Transformers EAGLE3 capture for %s", ", ".join(patched_classes))
 
 
-def _run_scheduler_process_with_verl_patches(*args, **kwargs):
+def _make_sglang_hidden_states_tensor_output_patch(original_method):
+    """Patch SGLang output processors to keep hidden-state chunks as CPU tensors.
+
+    SGLang 0.5.9 and 0.5.10 both append hidden states with
+    `.cpu().clone().tolist()`. The `.tolist()` conversion serializes every
+    hidden value through Python objects and dominates rollout latency when
+    drafter collection is enabled. Keeping CPU tensors preserves the existing
+    ownership/lifetime behavior while avoiding Python list materialization.
+    """
+    try:
+        source = inspect.getsource(original_method)
+    except (OSError, TypeError):
+        return None
+
+    source = textwrap.dedent(source)
+    patched_source = re.sub(
+        r"\.cpu\(\)\s*\.clone\(\)\s*\.tolist\(\)",
+        '.detach().to("cpu", copy=True)',
+        source,
+    )
+    if patched_source == source:
+        return None
+
+    namespace = {}
+    exec(  # noqa: S102
+        "from __future__ import annotations\n" + patched_source,
+        original_method.__globals__,
+        namespace,
+    )
+    patched_method = namespace[original_method.__name__]
+    patched_method = wraps(original_method)(patched_method)
+    patched_method._verl_patched_hidden_states_tensor_output = True
+    return patched_method
+
+
+def patch_sglang_hidden_states_tensor_output() -> None:
+    """Return SGLang hidden-state chunks as CPU tensors instead of Python lists."""
+    global _SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED
+    if _SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED:
+        return
+
+    try:
+        module = importlib.import_module("sglang.srt.managers.scheduler_output_processor_mixin")
+        processor_cls = getattr(module, "SchedulerOutputProcessorMixin")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Skip SGLang hidden-state tensor output patch: %s", exc)
+        return
+
+    patched_methods = []
+    for method_name in ("process_batch_result_prefill", "process_batch_result_decode"):
+        original_method = getattr(processor_cls, method_name, None)
+        if original_method is None or getattr(
+            original_method,
+            "_verl_patched_hidden_states_tensor_output",
+            False,
+        ):
+            continue
+
+        patched_method = _make_sglang_hidden_states_tensor_output_patch(original_method)
+        if patched_method is None:
+            logger.debug("Skip SGLang hidden-state tensor output patch for %s", method_name)
+            continue
+
+        setattr(processor_cls, method_name, patched_method)
+        patched_methods.append(method_name)
+
+    if patched_methods:
+        _SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED = True
+        logger.info("Patched SGLang hidden-state tensor output for %s", ", ".join(patched_methods))
+
+
+def _apply_sglang_child_process_patches() -> None:
     patch_sglang_transformers_eagle3_capture()
     patch_sglang_eagle_update_weights_from_tensor()
+    patch_sglang_hidden_states_tensor_output()
+
+
+def _run_scheduler_process_with_verl_patches(*args, **kwargs):
+    _apply_sglang_child_process_patches()
     return _ORIGINAL_SGLANG_RUN_SCHEDULER_PROCESS(*args, **kwargs)
 
 
 _run_scheduler_process_with_verl_patches._verl_patched_eagle_update_weights = True
+setattr(_run_scheduler_process_with_verl_patches, _SCHEDULER_PROCESS_PATCH_ATTR, True)
 
+
+def _run_direct_scheduler_process_with_verl_patches(*args, **kwargs):
+    global _ORIGINAL_SGLANG_DIRECT_RUN_SCHEDULER_PROCESS
+
+    _apply_sglang_child_process_patches()
+    if _ORIGINAL_SGLANG_DIRECT_RUN_SCHEDULER_PROCESS is None:
+        scheduler_module = importlib.import_module("sglang.srt.managers.scheduler")
+        _ORIGINAL_SGLANG_DIRECT_RUN_SCHEDULER_PROCESS = scheduler_module.run_scheduler_process
+    return _ORIGINAL_SGLANG_DIRECT_RUN_SCHEDULER_PROCESS(*args, **kwargs)
+
+
+_run_direct_scheduler_process_with_verl_patches._verl_patched_eagle_update_weights = True
+setattr(_run_direct_scheduler_process_with_verl_patches, _SCHEDULER_PROCESS_PATCH_ATTR, True)
+
+
+def patch_sglang_scheduler_process_entrypoints() -> None:
+    """Install child-process patches for both SGLang 0.5.9 and 0.5.10 launch paths."""
+    global _SGLANG_SCHEDULER_PROCESS_PATCHED
+    if _SGLANG_SCHEDULER_PROCESS_PATCHED:
+        return
+
+    patched_entrypoints = []
+    modules = [sglang.srt.entrypoints.engine]
+    try:
+        modules.append(importlib.import_module("sglang.srt.managers.scheduler"))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Skip direct scheduler entrypoint patch: %s", exc)
+
+    for module in modules:
+        original_run_scheduler_process = getattr(module, "run_scheduler_process", None)
+        if original_run_scheduler_process is None or getattr(
+            original_run_scheduler_process,
+            _SCHEDULER_PROCESS_PATCH_ATTR,
+            False,
+        ):
+            continue
+        if module is sglang.srt.entrypoints.engine:
+            module.run_scheduler_process = _run_scheduler_process_with_verl_patches
+        else:
+            global _ORIGINAL_SGLANG_DIRECT_RUN_SCHEDULER_PROCESS
+            _ORIGINAL_SGLANG_DIRECT_RUN_SCHEDULER_PROCESS = original_run_scheduler_process
+            module.run_scheduler_process = _run_direct_scheduler_process_with_verl_patches
+        patched_entrypoints.append(module.__name__)
+
+    if patched_entrypoints:
+        _SGLANG_SCHEDULER_PROCESS_PATCHED = True
+        logger.info("Patched SGLang scheduler entrypoints for %s", ", ".join(patched_entrypoints))
 
 def install_sglang_verl_patches(
     set_envs_and_config: Callable | None = None,
@@ -493,13 +623,8 @@ def install_sglang_verl_patches(
     configure_sglang_eagle_weight_update_patch(target_weight_loader, draft_weight_loader)
     patch_sglang_transformers_eagle3_capture()
     patch_sglang_eagle_update_weights_from_tensor()
+    patch_sglang_hidden_states_tensor_output()
+    patch_sglang_scheduler_process_entrypoints()
 
     if set_envs_and_config is not None:
         sglang.srt.entrypoints.engine._set_envs_and_config = set_envs_and_config
-
-    if not getattr(
-        sglang.srt.entrypoints.engine.run_scheduler_process,
-        "_verl_patched_eagle_update_weights",
-        False,
-    ):
-        sglang.srt.entrypoints.engine.run_scheduler_process = _run_scheduler_process_with_verl_patches

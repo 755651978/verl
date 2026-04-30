@@ -89,6 +89,20 @@ def verl_sglang_draft_weight_loader(model, named_tensors):
     return model.load_weights(named_tensors)
 
 
+def _check_sglang_update_weights_result(result, route: str) -> None:
+    if result is None:
+        return
+    if not isinstance(result, dict):
+        return
+
+    success = result.get("success")
+    status = str(result.get("status", "")).lower()
+    failed = success is False or status in {"error", "failed", "failure"} or bool(result.get("error"))
+    if failed:
+        message = result.get("message") or result.get("error") or result
+        raise RuntimeError(f"SGLang {route} weight update failed: {message}")
+
+
 # patch to avoid issue https://github.com/sgl-project/sglang/issues/6723
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
@@ -199,7 +213,10 @@ async def _sgl_update_weights_with_route(
         setattr(update_weights_request, "disable_draft_model", disable_draft_model)
     if disable_target_model is not None:
         setattr(update_weights_request, "disable_target_model", disable_target_model)
-    return await engine.update_weights_from_tensor(update_weights_request)
+    result = await engine.update_weights_from_tensor(update_weights_request)
+    route = "target" if disable_draft_model else "draft" if disable_target_model else "target/draft"
+    _check_sglang_update_weights_result(result, route)
+    return result
 
 
 # because chatCompletion is an async method, it makes the whole ray actor be an async actor
