@@ -985,20 +985,6 @@ class DrafterBaseTrainer:
             logger.info(
                 f"Step {self.training_steps}: loss={float(loss.item()):.4f}, vloss={float(vloss.item()):.4f}, ploss={float(ploss.item()):.4f}"
             )
-        # 异步进行checkpoint保存
-        if self.checkpoint_dir and (self.training_steps // self.step) > self._last_ckpt_step:
-            # Wait for previous checkpoint to complete before starting a new one
-            # This avoids queuing multiple checkpoints and excessive memory usage
-            if self._pending_checkpoint_future is not None:
-                try:
-                    self._pending_checkpoint_future.result()
-                except Exception as e:  # noqa: BLE001
-                    logger.warning(f"Previous checkpoint save failed: {e}")
-
-            # Launch async checkpoint save without blocking training
-            self._pending_checkpoint_future = self._save_checkpoint_async(step, is_final=False)
-            self._last_ckpt_step = self.training_steps // self.step
-
         return True
     
     def increment_rl_step(self, global_step: Optional[int] = None):
@@ -1055,7 +1041,7 @@ class DrafterBaseTrainer:
                 logger.warning(f"Pending checkpoint save failed: {e}")
             self._pending_checkpoint_future = None
 
-         # Save final checkpoint and wait for it to complete
+        # Save final checkpoint and wait for it to complete
         if self.checkpoint_dir and self.model is not None and self.training_steps > 0:
             final_ckpt_step = self.current_rl_step if self.current_rl_step > 0 else self.training_steps
             final_future = self._save_checkpoint_async(final_ckpt_step, is_final=True)
