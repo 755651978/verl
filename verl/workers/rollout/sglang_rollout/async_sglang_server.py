@@ -446,6 +446,9 @@ class SGLangHttpServer:
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
         skip_drafter_collection = bool(sampling_params.pop("_verl_skip_drafter_collection", False))
+        request_global_steps = sampling_params.pop("_verl_global_steps", None)
+        if request_global_steps is not None:
+            request_global_steps = int(request_global_steps)
 
         # TODO(@wuxibin): switch to `/generate` http endpoint once multi-modal support ready.
         max_possible_tokens = self.config.max_model_len - len(prompt_ids) - 1
@@ -492,8 +495,9 @@ class SGLangHttpServer:
 
         # return hidden states
         should_collect = False
+        collection_global_steps = request_global_steps if request_global_steps is not None else self.global_steps
         collect_interval = max(1, int(self.config.drafter.training.collect_interval_steps))
-        collect_this_step = self.global_steps is None or (self.global_steps % collect_interval == 0)
+        collect_this_step = collection_global_steps is None or (collection_global_steps % collect_interval == 0)
         if (
             self.config.drafter.enable
             and self.config.drafter.enable_drafter_training
@@ -589,13 +593,13 @@ class SGLangHttpServer:
                     "responses": response_tensor.unsqueeze(0),
                     "hidden_states": torch.cat(hidden_states_list, dim=0).unsqueeze(0).cpu(),
                     "target_logprobs": target_logprobs.unsqueeze(0).cpu() if target_logprobs is not None else None,
-                    "global_step": self.global_steps,
+                    "global_step": collection_global_steps,
                     "replica_rank": self.replica_rank,
                 }
             else:
                 logger.warning("[SGLangHttpServer] No valid hidden states returned for drafter sample collection")
 
-        extra_fields = {"global_steps": self.global_steps}
+        extra_fields = {"global_steps": collection_global_steps}
         if drafter_sample is not None:
             extra_fields["drafter_sample"] = drafter_sample
 

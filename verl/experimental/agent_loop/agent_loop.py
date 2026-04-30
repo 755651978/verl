@@ -555,8 +555,10 @@ class AgentLoopWorker:
             repetition_penalty=1.0,
             logprobs=config.calculate_log_probs,
         )
-        if is_validate and config.name == "sglang":
-            sampling_params["_verl_skip_drafter_collection"] = True
+        if config.name == "sglang":
+            sampling_params["_verl_global_steps"] = batch.meta_info.get("global_steps", None)
+            if is_validate:
+                sampling_params["_verl_skip_drafter_collection"] = True
 
         # override sampling params for validation
         if is_validate:
