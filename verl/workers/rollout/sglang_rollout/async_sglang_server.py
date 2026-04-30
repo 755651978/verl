@@ -14,6 +14,7 @@
 # limitations under the License.
 import asyncio
 import dataclasses
+import hashlib
 import json
 import logging
 import os
@@ -189,6 +190,9 @@ class SGLangHttpServer:
         self.base_gpu_id = base_gpu_id
         # model weights version, set by ServerAdapter when update weights.
         self.global_steps = None
+        self._drafter_collection_step = None
+        self._drafter_collection_samples = 0
+        self._drafter_collection_tokens = 0
 
         if self.rollout_mode != RolloutMode.HYBRID and self.config.load_format == "dummy":
             logger.warning(f"rollout mode is {self.rollout_mode}, load_format is dummy, set to auto")
@@ -477,6 +481,48 @@ class SGLangHttpServer:
         if self.node_rank == 0:
             await self.tokenizer_manager.flush_cache()
 
+    def _reset_drafter_collection_budget_if_needed(self, collection_global_steps: Optional[int]):
+        if self._drafter_collection_step == collection_global_steps:
+            return
+        self._drafter_collection_step = collection_global_steps
+        self._drafter_collection_samples = 0
+        self._drafter_collection_tokens = 0
+
+    def _passes_drafter_collection_sampling(self, request_id: str, collection_global_steps: Optional[int]) -> bool:
+        sample_rate = float(self.config.drafter.training.collection_sample_rate)
+        if sample_rate <= 0:
+            return False
+        if sample_rate >= 1:
+            return True
+
+        sampling_key = f"{collection_global_steps}:{self.replica_rank}:{request_id}".encode()
+        digest = hashlib.blake2b(sampling_key, digest_size=8).digest()
+        sample_value = int.from_bytes(digest, byteorder="big", signed=False) / float(1 << 64)
+        return sample_value < sample_rate
+
+    def _reserve_drafter_collection_budget(
+        self,
+        request_id: str,
+        collection_global_steps: Optional[int],
+        max_new_tokens: int,
+    ) -> bool:
+        self._reset_drafter_collection_budget_if_needed(collection_global_steps)
+        if not self._passes_drafter_collection_sampling(request_id, collection_global_steps):
+            return False
+
+        training_cfg = self.config.drafter.training
+        max_samples = training_cfg.max_collect_samples_per_step_per_replica
+        if max_samples is not None and self._drafter_collection_samples >= int(max_samples):
+            return False
+
+        max_tokens = training_cfg.max_collect_tokens_per_step_per_replica
+        if max_tokens is not None and self._drafter_collection_tokens + max_new_tokens > int(max_tokens):
+            return False
+
+        self._drafter_collection_samples += 1
+        self._drafter_collection_tokens += max_new_tokens
+        return True
+
     async def generate(
         self,
         prompt_ids: torch.Tensor,
@@ -545,12 +591,12 @@ class SGLangHttpServer:
             and self.config.drafter.training.collect_hidden_states_from_sgl
             and collect_this_step
             and not skip_drafter_collection
+            and self._reserve_drafter_collection_budget(request_id, collection_global_steps, max_new_tokens)
         ):
             should_collect = True
             request.update({"return_hidden_states": True})
             if self.config.drafter.training.use_logits:
                 request.update({"return_logprob": True})
-                request.update({"logprob_start_len": 0})
                 request.update({"top_logprobs_num": self.config.drafter.training.logits_topk})
 
         generate_request = GenerateReqInput(**request)
@@ -612,6 +658,18 @@ class SGLangHttpServer:
                     )
                     if target_logprobs is None:
                         logger.warning("Failed to convert top_logprobs to tensor; skip target_logprobs collection")
+                elif output_top:
+                    # Keep prompt-prefix logprob collection off by default so
+                    # drafter targets do not force SGLang onto a different
+                    # prefix-cache/logprob path. Prompt rows are masked out
+                    # during drafter training, so invalid placeholders are OK.
+                    prompt_target_padding = [[] for _ in range(max(len(prompt_ids) - 1, 0))]
+                    target_logprobs = _top_logprobs_to_tensor(
+                        prompt_target_padding + output_top,
+                        int(self.config.drafter.training.logits_topk),
+                    )
+                    if target_logprobs is None:
+                        logger.warning("Failed to convert output top_logprobs to tensor; skip target_logprobs collection")
 
             hidden_states_data = output.get("meta_info", {}).get("hidden_states", [])
             hidden_states_list = []
@@ -623,11 +681,15 @@ class SGLangHttpServer:
             if hidden_states_list:
                 prompt_tensor = torch.as_tensor(prompt_ids, dtype=torch.long).detach().cpu()
                 response_tensor = torch.tensor(token_ids, dtype=torch.long)
+                hidden_states = torch.cat(hidden_states_list, dim=0)
+                max_hidden_tokens = self.config.drafter.training.hidden_state_max_tokens_per_sample
+                if max_hidden_tokens is not None and int(max_hidden_tokens) > 0:
+                    hidden_states = hidden_states[-int(max_hidden_tokens):]
                 drafter_sample = {
                     "input_ids": torch.cat([prompt_tensor, response_tensor], dim=0).unsqueeze(0),
                     "prompts": prompt_tensor.unsqueeze(0),
                     "responses": response_tensor.unsqueeze(0),
-                    "hidden_states": torch.cat(hidden_states_list, dim=0).unsqueeze(0).cpu(),
+                    "hidden_states": hidden_states.unsqueeze(0).cpu(),
                     "target_logprobs": target_logprobs.unsqueeze(0).cpu() if target_logprobs is not None else None,
                     "global_step": collection_global_steps,
                     "replica_rank": self.replica_rank,

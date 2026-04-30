@@ -463,6 +463,10 @@ drafter:
     collect_hidden_states_from_sgl: false
     use_data_buffer: false
     collect_interval_steps: 1
+    collection_sample_rate: 1.0
+    max_collect_samples_per_step_per_replica: null
+    max_collect_tokens_per_step_per_replica: null
+    hidden_state_max_tokens_per_sample: null
     max_seq_len: 8192
     max_epoch: 10
     step: 100

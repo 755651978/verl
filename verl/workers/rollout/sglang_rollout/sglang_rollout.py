@@ -432,7 +432,8 @@ class ServerAdapter(BaseRollout):
             )
 
         if self.device_mesh["infer_tp"].get_local_rank() == 0:
-            await self._engine.flush_cache()
+            # Draft-only updates do not invalidate target-model KV/prefix cache.
+            # Each bucket already sets flush_cache=False on update_weights_from_tensor.
             if global_steps is not None:
                 await self.server_actor.set_global_steps.remote(global_steps)
 

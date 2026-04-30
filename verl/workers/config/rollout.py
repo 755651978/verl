@@ -85,6 +85,10 @@ class DrafterTrainingConfig(BaseConfig):
     collect_hidden_states_from_sgl: bool = False
     use_data_buffer: bool = False
     collect_interval_steps: int = 1
+    collection_sample_rate: float = 1.0
+    max_collect_samples_per_step_per_replica: Optional[int] = None
+    max_collect_tokens_per_step_per_replica: Optional[int] = None
+    hidden_state_max_tokens_per_sample: Optional[int] = None
     max_seq_len: int = 8192
     max_epoch: int = 10
     step: int = 100
@@ -103,6 +107,22 @@ class DrafterTrainingConfig(BaseConfig):
     current_max_samples: int = 2000
     data_buffer_max_size: int = 10000
     hidden_state_clip_value: Optional[float] = 1.0e4
+
+    def __post_init__(self):
+        if self.collection_sample_rate < 0 or self.collection_sample_rate > 1:
+            raise ValueError("`collection_sample_rate` must be in [0, 1].")
+        if (
+            self.max_collect_samples_per_step_per_replica is not None
+            and self.max_collect_samples_per_step_per_replica < 0
+        ):
+            raise ValueError("`max_collect_samples_per_step_per_replica` must be non-negative or null.")
+        if (
+            self.max_collect_tokens_per_step_per_replica is not None
+            and self.max_collect_tokens_per_step_per_replica < 0
+        ):
+            raise ValueError("`max_collect_tokens_per_step_per_replica` must be non-negative or null.")
+        if self.hidden_state_max_tokens_per_sample is not None and self.hidden_state_max_tokens_per_sample < 0:
+            raise ValueError("`hidden_state_max_tokens_per_sample` must be non-negative or null.")
 
 
 @dataclass
