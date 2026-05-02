@@ -38,6 +38,7 @@ _EAGLE_V1_VERIFY_MODE_ENV = "VERL_SGLANG_NPU_EAGLE_V1_VERIFY_MODE"
 _EAGLE_V2_VERIFY_MODE_ENV = "VERL_SGLANG_NPU_EAGLE_V2_VERIFY_MODE"
 _EAGLE_V1_TORCH_GREEDY_ENV = "VERL_SGLANG_NPU_EAGLE_V1_TORCH_GREEDY"
 _EAGLE_V1_TORCH_TOPK1_TREE_ENV = "VERL_SGLANG_NPU_EAGLE_V1_TORCH_TOPK1_TREE"
+_EAGLE_V1_FORCE_TARGET_TOKEN_ENV = "VERL_SGLANG_NPU_EAGLE_V1_FORCE_TARGET_TOKEN"
 
 _target_weight_loader: str | None = os.environ.get(_TARGET_WEIGHT_LOADER_ENV)
 _draft_weight_loader: str | None = os.environ.get(_DRAFT_WEIGHT_LOADER_ENV)
@@ -599,6 +600,38 @@ def _verify_tree_greedy_topk1_torch(
     return predicts, accept_index, accept_token_num
 
 
+def _verify_tree_greedy_force_target_token_torch(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    target_predict: torch.Tensor,
+    topk: int = -1,
+):
+    """Accept only the target prediction at the root node for isolation runs."""
+    del retrive_next_token, retrive_next_sibling, topk
+
+    batch_size, num_draft_tokens = candidates.shape
+    if num_draft_tokens == 0:
+        return predicts, accept_index, accept_token_num
+
+    target_predict = target_predict.reshape(batch_size, num_draft_tokens)
+    root_indices = retrive_index[:, 0].to(device=candidates.device, dtype=torch.long)
+
+    accept_index.fill_(-1)
+    accept_index[:, 0].copy_(root_indices.to(dtype=accept_index.dtype))
+    accept_token_num.zero_()
+    predicts.scatter_(
+        dim=0,
+        index=root_indices,
+        src=target_predict[:, 0].to(dtype=predicts.dtype),
+    )
+    return predicts, accept_index, accept_token_num
+
+
 def _make_verify_tree_greedy_func_patch(original_verify_tree_greedy_func):
     @wraps(original_verify_tree_greedy_func)
     def patched_verify_tree_greedy_func(
@@ -612,6 +645,22 @@ def _make_verify_tree_greedy_func_patch(original_verify_tree_greedy_func):
         target_predict: torch.Tensor,
         topk: int = -1,
     ):
+        if (
+            _env_flag_enabled(_EAGLE_V1_FORCE_TARGET_TOKEN_ENV, False)
+            and candidates.dim() == 2
+            and target_predict.numel() == candidates.numel()
+        ):
+            return _verify_tree_greedy_force_target_token_torch(
+                predicts=predicts,
+                accept_index=accept_index,
+                accept_token_num=accept_token_num,
+                candidates=candidates,
+                retrive_index=retrive_index,
+                retrive_next_token=retrive_next_token,
+                retrive_next_sibling=retrive_next_sibling,
+                target_predict=target_predict,
+                topk=topk,
+            )
         if (
             _env_flag_enabled(_EAGLE_V1_TORCH_GREEDY_ENV, True)
             and int(topk) == 1
