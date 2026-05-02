@@ -32,7 +32,10 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 _TARGET_WEIGHT_LOADER_ENV = "VERL_SGLANG_TARGET_WEIGHT_LOADER"
 _DRAFT_WEIGHT_LOADER_ENV = "VERL_SGLANG_DRAFT_WEIGHT_LOADER"
+_EAGLE_VERIFY_MODE_ENV = "VERL_SGLANG_NPU_EAGLE_VERIFY_MODE"
 _EAGLE_V1_TARGET_SAMPLING_ENV = "VERL_SGLANG_NPU_EAGLE_V1_TARGET_SAMPLING"
+_EAGLE_V1_VERIFY_MODE_ENV = "VERL_SGLANG_NPU_EAGLE_V1_VERIFY_MODE"
+_EAGLE_V2_VERIFY_MODE_ENV = "VERL_SGLANG_NPU_EAGLE_V2_VERIFY_MODE"
 
 _target_weight_loader: str | None = os.environ.get(_TARGET_WEIGHT_LOADER_ENV)
 _draft_weight_loader: str | None = os.environ.get(_DRAFT_WEIGHT_LOADER_ENV)
@@ -218,8 +221,47 @@ def _is_sglang_npu_backend() -> bool:
     return hasattr(torch, "npu") and torch.npu.is_available()
 
 
-def _enable_sglang_npu_eagle_v1_target_sampling() -> bool:
-    return os.getenv(_EAGLE_V1_TARGET_SAMPLING_ENV, "1") != "0"
+def _normalize_sglang_npu_eagle_verify_mode(mode: str | None) -> str | None:
+    if mode is None:
+        return None
+    normalized_mode = mode.strip().lower().replace("-", "_")
+    if normalized_mode in {"0", "false", "off", "greedy"}:
+        return "greedy"
+    if normalized_mode in {"pq", "p/q", "full", "full_pq"}:
+        return "pq"
+    if normalized_mode in {"1", "true", "on", "target", "target_only", "vllm", "vllm_like"}:
+        return "target_only"
+    return None
+
+
+def _sglang_npu_eagle_verify_mode(version_env: str | None = None) -> str:
+    mode = _normalize_sglang_npu_eagle_verify_mode(os.getenv(version_env)) if version_env else None
+    if mode is not None:
+        return mode
+    mode = _normalize_sglang_npu_eagle_verify_mode(os.getenv(_EAGLE_VERIFY_MODE_ENV))
+    if mode is not None:
+        return mode
+    if version_env == _EAGLE_V1_VERIFY_MODE_ENV:
+        legacy_mode = _normalize_sglang_npu_eagle_verify_mode(os.getenv(_EAGLE_V1_TARGET_SAMPLING_ENV))
+        if legacy_mode is not None:
+            return legacy_mode
+    return "target_only"
+
+
+def _sglang_npu_eagle_v1_verify_mode() -> str:
+    return _sglang_npu_eagle_verify_mode(_EAGLE_V1_VERIFY_MODE_ENV)
+
+
+def _sglang_npu_eagle_v2_verify_mode() -> str:
+    return _sglang_npu_eagle_verify_mode(_EAGLE_V2_VERIFY_MODE_ENV)
+
+
+def _enable_sglang_npu_eagle_v1_pq_sampling() -> bool:
+    return _sglang_npu_eagle_v1_verify_mode() == "pq"
+
+
+def _enable_sglang_npu_eagle_v2_pq_sampling() -> bool:
+    return _sglang_npu_eagle_v2_verify_mode() == "pq"
 
 
 def _renorm_probs_by_top_k_top_p(
@@ -875,7 +917,8 @@ def _make_sglang_eagle_v2_sample_patch(original_sample, eagle_info_v2_module):
         expected_draft_probs_shape = (bs, self.draft_token_num, next_token_logits.shape[-1])
 
         if (
-            int(getattr(self, "topk", 0) or 0) != 1
+            not _enable_sglang_npu_eagle_v2_pq_sampling()
+            or int(getattr(self, "topk", 0) or 0) != 1
             or not torch.is_tensor(draft_probs)
             or draft_probs.shape != expected_draft_probs_shape
         ):
@@ -1054,6 +1097,10 @@ def _patch_sglang_eagle_draft_probs() -> list[str]:
         cls = getattr(module, class_name, None)
         if cls is None:
             continue
+        if class_name == "EagleWorker" and not _enable_sglang_npu_eagle_v1_pq_sampling():
+            continue
+        if class_name == "EAGLEWorkerV2" and not _enable_sglang_npu_eagle_v2_pq_sampling():
+            continue
 
         patched_bits = []
         original_fast_topk = getattr(module, "fast_topk", None)
@@ -1115,39 +1162,52 @@ def patch_sglang_npu_eagle_target_sampling() -> None:
 
     patched_targets = []
 
-    if _enable_sglang_npu_eagle_v1_target_sampling():
+    v1_verify_mode = _sglang_npu_eagle_v1_verify_mode()
+    if v1_verify_mode != "greedy":
         try:
             eagle_info = importlib.import_module("sglang.srt.speculative.eagle_info")
             eagle_info.top_k_renorm_prob = _top_k_renorm_prob_torch
             eagle_info.top_p_renorm_prob = _top_p_renorm_prob_torch
             tree_sampler = getattr(eagle_info, "tree_speculative_sampling_target_only", None)
-            if not getattr(tree_sampler, "_verl_patched_eagle_v1_sampling", False):
+            if v1_verify_mode == "pq" and not getattr(tree_sampler, "_verl_patched_eagle_v1_sampling", False):
                 eagle_info.tree_speculative_sampling_target_only = _make_sglang_eagle_v1_tree_sampling_patch()
+            elif v1_verify_mode == "target_only":
+                eagle_info.tree_speculative_sampling_target_only = _tree_speculative_sampling_target_only_torch
             eagle_info.TREE_SPEC_KERNEL_AVAILABLE = True
-            verify_cls = getattr(eagle_info, "EagleVerifyInput", None)
-            original_verify = getattr(verify_cls, "verify", None)
-            if original_verify is not None and not getattr(original_verify, "_verl_patched_eagle_v1_sampling", False):
-                verify_cls.verify = _make_sglang_eagle_v1_verify_patch(original_verify)
-            patched_targets.append("sglang.srt.speculative.eagle_info")
+            if v1_verify_mode == "pq":
+                verify_cls = getattr(eagle_info, "EagleVerifyInput", None)
+                original_verify = getattr(verify_cls, "verify", None)
+                if original_verify is not None and not getattr(
+                    original_verify, "_verl_patched_eagle_v1_sampling", False
+                ):
+                    verify_cls.verify = _make_sglang_eagle_v1_verify_patch(original_verify)
+            patched_targets.append(f"sglang.srt.speculative.eagle_info({v1_verify_mode})")
         except Exception as exc:  # noqa: BLE001
             logger.debug("Skip SGLang EAGLE v1 target sampling patch: %s", exc)
     else:
         logger.info(
-            "Skip SGLang EAGLE v1 target sampling patch. Set %s=1 to enable target-distribution-preserving verify.",
-            _EAGLE_V1_TARGET_SAMPLING_ENV,
+            "Skip SGLang EAGLE v1 target sampling patch. Set %s=target_only or pq to enable it.",
+            _EAGLE_V1_VERIFY_MODE_ENV,
         )
 
     patched_targets.extend(_patch_sglang_eagle_draft_probs())
 
-    try:
-        eagle_info_v2 = importlib.import_module("sglang.srt.speculative.eagle_info_v2")
-        mixin = getattr(eagle_info_v2, "EagleVerifyInputV2Mixin", None)
-        original_sample = getattr(mixin, "sample", None)
-        if original_sample is not None and not getattr(original_sample, "_verl_patched_npu_eagle_sampling", False):
-            mixin.sample = _make_sglang_eagle_v2_sample_patch(original_sample, eagle_info_v2)
-            patched_targets.append("sglang.srt.speculative.eagle_info_v2")
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Skip SGLang EAGLE v2 target sampling patch: %s", exc)
+    v2_verify_mode = _sglang_npu_eagle_v2_verify_mode()
+    if v2_verify_mode != "greedy":
+        try:
+            eagle_info_v2 = importlib.import_module("sglang.srt.speculative.eagle_info_v2")
+            mixin = getattr(eagle_info_v2, "EagleVerifyInputV2Mixin", None)
+            original_sample = getattr(mixin, "sample", None)
+            if original_sample is not None and not getattr(original_sample, "_verl_patched_npu_eagle_sampling", False):
+                mixin.sample = _make_sglang_eagle_v2_sample_patch(original_sample, eagle_info_v2)
+                patched_targets.append(f"sglang.srt.speculative.eagle_info_v2({v2_verify_mode})")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Skip SGLang EAGLE v2 target sampling patch: %s", exc)
+    else:
+        logger.info(
+            "Skip SGLang EAGLE v2 target sampling patch. Set %s=target_only or pq to enable it.",
+            _EAGLE_V2_VERIFY_MODE_ENV,
+        )
 
     if patched_targets:
         _SGLANG_NPU_EAGLE_SAMPLING_PATCHED = True
