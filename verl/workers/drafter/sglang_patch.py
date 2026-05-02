@@ -277,6 +277,42 @@ def _target_probs_from_logits(
     return target_probs.reshape(-1, draft_token_num, target_probs.shape[-1])
 
 
+def _expand_sampling_info_rows(value: torch.Tensor, rows: int) -> torch.Tensor | None:
+    if value.shape[0] == rows:
+        return value
+    if value.shape[0] == 0 or rows % value.shape[0] != 0:
+        return None
+    return torch.repeat_interleave(value, rows // value.shape[0], dim=0)
+
+
+def _draft_probs_from_probs(probs: torch.Tensor, sampling_info) -> torch.Tensor | None:
+    draft_probs = probs.float()
+    rows = draft_probs.shape[0]
+    tiny = torch.finfo(draft_probs.dtype).tiny
+
+    temperatures = _expand_sampling_info_rows(sampling_info.temperatures, rows)
+    if temperatures is None:
+        return None
+    temperatures = temperatures.to(device=draft_probs.device, dtype=draft_probs.dtype)
+    if temperatures.dim() == 1:
+        temperatures = temperatures.view(-1, 1)
+    draft_probs = draft_probs.pow(1.0 / temperatures.clamp_min(1e-5))
+    draft_probs = draft_probs / draft_probs.sum(dim=-1, keepdim=True).clamp_min(tiny)
+
+    if getattr(sampling_info, "need_top_k_sampling", True):
+        top_ks = _expand_sampling_info_rows(sampling_info.top_ks, rows)
+        if top_ks is None:
+            return None
+        draft_probs = _top_k_renorm_prob_torch(draft_probs, top_ks)
+    if getattr(sampling_info, "need_top_p_sampling", True):
+        top_ps = _expand_sampling_info_rows(sampling_info.top_ps, rows)
+        if top_ps is None:
+            return None
+        draft_probs = _top_p_renorm_prob_torch(draft_probs, top_ps)
+
+    return draft_probs
+
+
 def _sample_from_probs_with_coin(probs: torch.Tensor, coin: torch.Tensor) -> torch.Tensor:
     squeeze_output = probs.dim() == 1
     if squeeze_output:
@@ -325,8 +361,12 @@ def _make_sglang_eagle_fast_topk_patch(original_fast_topk):
         ):
             return original_fast_topk(probs, topk, dim=dim)
 
-        context["draft_probs"].append(probs.float().unsqueeze(1).contiguous())
-        return _sample_eagle_top1_from_probs(probs, dim=dim)
+        draft_probs = _draft_probs_from_probs(probs, context["sampling_info"])
+        if draft_probs is None:
+            return original_fast_topk(probs, topk, dim=dim)
+
+        context["draft_probs"].append(draft_probs.unsqueeze(1).contiguous())
+        return _sample_eagle_top1_from_probs(draft_probs.to(dtype=probs.dtype), dim=dim)
 
     patched_fast_topk._verl_patched_eagle_draft_probs = True
     return patched_fast_topk
