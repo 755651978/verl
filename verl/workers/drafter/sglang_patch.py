@@ -37,10 +37,12 @@ _draft_weight_loader: str | None = os.environ.get(_DRAFT_WEIGHT_LOADER_ENV)
 _ORIGINAL_SGLANG_RUN_SCHEDULER_PROCESS = sglang.srt.entrypoints.engine.run_scheduler_process
 _ORIGINAL_SGLANG_DIRECT_RUN_SCHEDULER_PROCESS = None
 _SGLANG_EAGLE_UPDATE_PATCHED = False
+_SGLANG_NPU_EAGLE_SAMPLING_PATCHED = False
 _SGLANG_TRANSFORMERS_EAGLE3_CAPTURE_PATCHED = False
 _SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED = False
 _SGLANG_SCHEDULER_PROCESS_PATCHED = False
 _SCHEDULER_PROCESS_PATCH_ATTR = "_verl_patched_scheduler_process"
+_SGLANG_TOP_K_ALL = 1 << 30
 
 
 def configure_sglang_eagle_weight_update_patch(
@@ -197,6 +199,393 @@ def patch_sglang_eagle_update_weights_from_tensor() -> None:
     if patched_classes:
         _SGLANG_EAGLE_UPDATE_PATCHED = True
         logger.info("Patched SGLang EAGLE routed weight update for %s", ", ".join(patched_classes))
+
+
+def _is_sglang_npu_backend() -> bool:
+    for module_name in ("sglang.srt.utils.common", "sglang.srt.utils"):
+        try:
+            is_npu = getattr(importlib.import_module(module_name), "is_npu", None)
+        except Exception:  # noqa: BLE001
+            continue
+        if callable(is_npu) and is_npu():
+            return True
+
+    return hasattr(torch, "npu") and torch.npu.is_available()
+
+
+def _renorm_probs_by_top_k_top_p(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+) -> torch.Tensor:
+    vocab_size = probs.shape[-1]
+    top_ks = top_ks.to(device=probs.device, dtype=torch.long).view(-1)
+    top_ps = top_ps.to(device=probs.device, dtype=probs.dtype).view(-1)
+
+    vocab_size_tensor = torch.full_like(top_ks, vocab_size)
+    top_ks = torch.where((top_ks <= 0) | (top_ks >= _SGLANG_TOP_K_ALL), vocab_size_tensor, top_ks)
+    top_ks = torch.minimum(top_ks, vocab_size_tensor)
+
+    if bool(torch.all(top_ks >= vocab_size).item()) and bool(torch.all(top_ps >= 1.0).item()):
+        return probs
+
+    sorted_probs, sorted_indices = torch.sort(probs, dim=-1, descending=True)
+    ranks = torch.arange(vocab_size, device=probs.device).view(1, -1)
+    sorted_probs = sorted_probs.masked_fill(ranks >= top_ks.view(-1, 1), 0.0)
+
+    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+    sorted_probs = sorted_probs.masked_fill((cumulative_probs - sorted_probs) > top_ps.view(-1, 1), 0.0)
+
+    normalizer = sorted_probs.sum(dim=-1, keepdim=True)
+    sorted_probs = torch.where(normalizer > 0, sorted_probs / normalizer.clamp_min(torch.finfo(probs.dtype).tiny), 0.0)
+
+    renormed_probs = torch.zeros_like(probs)
+    renormed_probs.scatter_(dim=1, index=sorted_indices, src=sorted_probs)
+    return renormed_probs
+
+
+def _top_k_renorm_prob_torch(probs: torch.Tensor, top_ks: torch.Tensor) -> torch.Tensor:
+    top_ps = torch.ones((probs.shape[0],), dtype=probs.dtype, device=probs.device)
+    return _renorm_probs_by_top_k_top_p(probs, top_ks, top_ps)
+
+
+def _top_p_renorm_prob_torch(probs: torch.Tensor, top_ps: torch.Tensor) -> torch.Tensor:
+    top_ks = torch.full((probs.shape[0],), probs.shape[-1], dtype=torch.long, device=probs.device)
+    return _renorm_probs_by_top_k_top_p(probs, top_ks, top_ps)
+
+
+def _target_probs_from_logits(
+    next_token_logits: torch.Tensor,
+    sampling_info,
+    draft_token_num: int,
+) -> torch.Tensor:
+    expanded_temperature = torch.repeat_interleave(sampling_info.temperatures, draft_token_num, dim=0)
+    target_probs = torch.softmax(next_token_logits.float() / expanded_temperature, dim=-1)
+    if getattr(sampling_info, "need_top_k_sampling", True):
+        target_probs = _top_k_renorm_prob_torch(
+            target_probs,
+            torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
+        )
+    if getattr(sampling_info, "need_top_p_sampling", True):
+        target_probs = _top_p_renorm_prob_torch(
+            target_probs,
+            torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
+        )
+    return target_probs.reshape(-1, draft_token_num, target_probs.shape[-1])
+
+
+def _sample_from_probs_with_coin(probs: torch.Tensor, coin: torch.Tensor) -> torch.Tensor:
+    squeeze_output = probs.dim() == 1
+    if squeeze_output:
+        probs = probs.unsqueeze(0)
+
+    totals = probs.sum(dim=-1, keepdim=True)
+    probs = torch.where(totals > 0, probs, torch.ones_like(probs))
+    totals = probs.sum(dim=-1, keepdim=True)
+    threshold = coin.to(dtype=probs.dtype, device=probs.device).view(-1, 1) * totals
+    cumulative = torch.cumsum(probs, dim=-1)
+    samples = torch.argmax((cumulative > threshold).to(torch.int32), dim=-1).to(torch.int32)
+    return samples[0] if squeeze_output else samples
+
+
+def _try_sglang_tree_speculative_sampling_kernel(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    uniform_samples: torch.Tensor,
+    uniform_samples_for_final_sampling: torch.Tensor,
+    target_probs: torch.Tensor,
+    draft_probs: torch.Tensor,
+    threshold_single: float,
+    threshold_acc: float,
+    deterministic: bool,
+) -> bool:
+    if target_probs.device.type != "cuda" or draft_probs.shape != target_probs.shape:
+        return False
+
+    try:
+        from sgl_kernel import tree_speculative_sampling_target_only
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("SGLang tree speculative CUDA kernel is unavailable: %s", exc)
+        return False
+
+    try:
+        tree_speculative_sampling_target_only(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates,
+            retrive_index=retrive_index,
+            retrive_next_token=retrive_next_token,
+            retrive_next_sibling=retrive_next_sibling,
+            uniform_samples=uniform_samples,
+            uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
+            target_probs=target_probs,
+            draft_probs=draft_probs,
+            threshold_single=threshold_single,
+            threshold_acc=threshold_acc,
+            deterministic=deterministic,
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("SGLang tree speculative CUDA kernel failed; falling back to torch path: %s", exc)
+        return False
+
+
+def _tree_speculative_sampling_target_only_vectorized_torch(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    uniform_samples: torch.Tensor,
+    uniform_samples_for_final_sampling: torch.Tensor,
+    target_probs: torch.Tensor,
+    draft_probs: torch.Tensor,
+    threshold_single: float,
+    threshold_acc: float,
+) -> None:
+    batch_size, num_draft_tokens = candidates.shape
+    num_speculative_tokens = accept_index.shape[1]
+    device = target_probs.device
+    vocab_size = target_probs.shape[-1]
+
+    threshold_acc = max(float(threshold_acc), 1e-9)
+    threshold_single = float(threshold_single)
+
+    accept_index.fill_(-1)
+    accept_token_num.zero_()
+
+    batch_indices = torch.arange(batch_size, dtype=torch.long, device=device)
+    cur_prob_idx = torch.zeros((batch_size,), dtype=torch.long, device=device)
+    accepted_count = torch.zeros((batch_size,), dtype=torch.long, device=device)
+    active = torch.ones((batch_size,), dtype=torch.bool, device=device)
+
+    last_accepted_retrive_idx = retrive_index[:, 0].to(torch.long)
+    accept_index[:, 0].copy_(last_accepted_retrive_idx.to(dtype=accept_index.dtype))
+    coin = uniform_samples[:, 0]
+    residual_draft_probs = draft_probs[:, 0, :]
+    residual_draft_probs.zero_()
+
+    for _ in range(1, num_speculative_tokens):
+        sibling_idx = torch.where(
+            active,
+            retrive_next_token[batch_indices, cur_prob_idx],
+            torch.full_like(cur_prob_idx, -1),
+        )
+        found_idx = torch.full_like(cur_prob_idx, -1)
+        prob_acc = torch.zeros((batch_size,), dtype=target_probs.dtype, device=device)
+
+        for _ in range(num_draft_tokens):
+            valid = active & (found_idx < 0) & (sibling_idx >= 0)
+            safe_sibling_idx = sibling_idx.clamp_min(0)
+            draft_token_id = candidates[batch_indices, safe_sibling_idx].to(torch.long)
+            target_prob_single = target_probs[batch_indices, cur_prob_idx, draft_token_id]
+            target_prob_single = torch.where(valid, target_prob_single, torch.zeros_like(target_prob_single))
+            next_prob_acc = prob_acc + target_prob_single
+
+            old_residual = residual_draft_probs.gather(dim=1, index=draft_token_id.view(-1, 1)).squeeze(1)
+            residual_update = torch.where(valid, target_prob_single, old_residual)
+            residual_draft_probs.scatter_(dim=1, index=draft_token_id.view(-1, 1), src=residual_update.view(-1, 1))
+
+            accepted = valid & (
+                (coin <= (next_prob_acc / threshold_acc)) | (target_prob_single >= threshold_single)
+            )
+            found_idx = torch.where(accepted, sibling_idx, found_idx)
+            prob_acc = torch.where(valid, next_prob_acc, prob_acc)
+            sibling_idx = torch.where(
+                valid & ~accepted,
+                retrive_next_sibling[batch_indices, safe_sibling_idx],
+                sibling_idx,
+            )
+
+        accepted = active & (found_idx >= 0)
+        safe_found_idx = found_idx.clamp_min(0)
+        accepted_token_id = candidates[batch_indices, safe_found_idx].to(dtype=predicts.dtype)
+        accepted_retrive_idx = retrive_index[batch_indices, safe_found_idx].to(torch.long)
+
+        old_predicts = predicts.gather(dim=0, index=last_accepted_retrive_idx)
+        predict_updates = torch.where(accepted, accepted_token_id, old_predicts)
+        predicts.scatter_(dim=0, index=last_accepted_retrive_idx, src=predict_updates)
+
+        next_accepted_count = accepted_count + accepted.to(dtype=torch.long)
+        accept_index_position = next_accepted_count.clamp_max(num_speculative_tokens - 1).view(-1, 1)
+        old_accept_index = accept_index.gather(dim=1, index=accept_index_position).squeeze(1)
+        accept_index_updates = torch.where(
+            accepted,
+            accepted_retrive_idx.to(dtype=accept_index.dtype),
+            old_accept_index,
+        )
+        accept_index.scatter_(dim=1, index=accept_index_position, src=accept_index_updates.view(-1, 1))
+
+        cur_prob_idx = torch.where(accepted, safe_found_idx, cur_prob_idx)
+        last_accepted_retrive_idx = torch.where(accepted, accepted_retrive_idx, last_accepted_retrive_idx)
+        accepted_count = next_accepted_count
+        coin = uniform_samples[batch_indices, cur_prob_idx]
+        active = accepted
+        residual_draft_probs.mul_((~accepted).to(dtype=residual_draft_probs.dtype).view(-1, 1))
+
+    accept_token_num.copy_(accepted_count.to(dtype=accept_token_num.dtype))
+
+    final_target_probs = target_probs[batch_indices, cur_prob_idx]
+    residual_probs = torch.clamp(final_target_probs - residual_draft_probs, min=0.0)
+    need_residual = accepted_count != (num_speculative_tokens - 1)
+    final_probs = torch.where(need_residual.view(-1, 1), residual_probs, final_target_probs)
+    final_probs = torch.where(final_probs.sum(dim=-1, keepdim=True) > 0, final_probs, final_target_probs)
+    final_token_ids = _sample_from_probs_with_coin(final_probs, uniform_samples_for_final_sampling)
+    predicts.scatter_(dim=0, index=last_accepted_retrive_idx, src=final_token_ids.to(dtype=predicts.dtype))
+
+
+def _tree_speculative_sampling_target_only_torch(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    uniform_samples: torch.Tensor,
+    uniform_samples_for_final_sampling: torch.Tensor,
+    target_probs: torch.Tensor,
+    draft_probs: torch.Tensor,
+    threshold_single: float = 1.0,
+    threshold_acc: float = 1.0,
+    deterministic: bool = True,
+) -> None:
+    if _try_sglang_tree_speculative_sampling_kernel(
+        predicts=predicts,
+        accept_index=accept_index,
+        accept_token_num=accept_token_num,
+        candidates=candidates,
+        retrive_index=retrive_index,
+        retrive_next_token=retrive_next_token,
+        retrive_next_sibling=retrive_next_sibling,
+        uniform_samples=uniform_samples,
+        uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
+        target_probs=target_probs,
+        draft_probs=draft_probs,
+        threshold_single=threshold_single,
+        threshold_acc=threshold_acc,
+        deterministic=deterministic,
+    ):
+        return
+
+    _tree_speculative_sampling_target_only_vectorized_torch(
+        predicts=predicts,
+        accept_index=accept_index,
+        accept_token_num=accept_token_num,
+        candidates=candidates,
+        retrive_index=retrive_index,
+        retrive_next_token=retrive_next_token,
+        retrive_next_sibling=retrive_next_sibling,
+        uniform_samples=uniform_samples,
+        uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
+        target_probs=target_probs,
+        draft_probs=draft_probs,
+        threshold_single=threshold_single,
+        threshold_acc=threshold_acc,
+    )
+
+
+def _make_sglang_eagle_v2_sample_patch(original_sample, eagle_info_v2_module):
+    @wraps(original_sample)
+    def patched_sample(self, batch, logits_output, vocab_mask=None):
+        if batch.forward_mode.is_idle() or batch.sampling_info.is_all_greedy:
+            return original_sample(self, batch, logits_output, vocab_mask)
+
+        bs = len(batch.seq_lens)
+        sampling_info = batch.sampling_info
+        next_token_logits = logits_output.next_token_logits
+        device = batch.input_ids.device
+
+        if vocab_mask is not None:
+            assert self.grammar is not None
+            self.grammar.apply_vocab_mask(logits=next_token_logits, vocab_mask=vocab_mask)
+
+        candidates = self.draft_token.reshape(bs, self.draft_token_num)
+        predict_shape = list(next_token_logits.shape)[:-1]
+        predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
+        accept_index = torch.full((bs, self.spec_steps + 1), -1, dtype=torch.int32, device=device)
+        accept_length = torch.empty((bs,), dtype=torch.int32, device=device)
+
+        target_probs = _target_probs_from_logits(next_token_logits, sampling_info, self.draft_token_num)
+        draft_probs = torch.empty((bs, 1, target_probs.shape[-1]), dtype=target_probs.dtype, device=device)
+        coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
+        coins_for_final_sampling = torch.rand((bs,), dtype=torch.float32, device=device)
+        server_args = eagle_info_v2_module.get_global_server_args()
+
+        _tree_speculative_sampling_target_only_torch(
+            predicts=predict,
+            accept_index=accept_index,
+            accept_token_num=accept_length,
+            candidates=candidates.to(torch.int64),
+            retrive_index=self.retrive_index.to(torch.int64),
+            retrive_next_token=self.retrive_next_token.to(torch.int64),
+            retrive_next_sibling=self.retrive_next_sibling.to(torch.int64),
+            uniform_samples=coins,
+            uniform_samples_for_final_sampling=coins_for_final_sampling,
+            target_probs=target_probs,
+            draft_probs=draft_probs,
+            threshold_single=server_args.speculative_accept_threshold_single,
+            threshold_acc=server_args.speculative_accept_threshold_acc,
+            deterministic=True,
+        )
+
+        simulate_acc_len = getattr(eagle_info_v2_module, "SIMULATE_ACC_LEN", -1)
+        if simulate_acc_len > 0:
+            accept_index = eagle_info_v2_module.generate_simulated_accept_index(
+                accept_index=accept_index,
+                predict=predict,
+                accept_length=accept_length,
+                simulate_acc_len=simulate_acc_len,
+                bs=bs,
+                spec_steps=self.spec_steps,
+            )
+
+        accept_length.add_(1)
+        return predict, accept_length, accept_index
+
+    patched_sample._verl_patched_npu_eagle_sampling = True
+    return patched_sample
+
+
+def patch_sglang_npu_eagle_target_sampling() -> None:
+    """Patch SGLang NPU EAGLE verification to use target-distribution-preserving sampling."""
+    global _SGLANG_NPU_EAGLE_SAMPLING_PATCHED
+    if _SGLANG_NPU_EAGLE_SAMPLING_PATCHED or not _is_sglang_npu_backend():
+        return
+
+    patched_targets = []
+
+    try:
+        eagle_info = importlib.import_module("sglang.srt.speculative.eagle_info")
+        eagle_info.top_k_renorm_prob = _top_k_renorm_prob_torch
+        eagle_info.top_p_renorm_prob = _top_p_renorm_prob_torch
+        eagle_info.tree_speculative_sampling_target_only = _tree_speculative_sampling_target_only_torch
+        eagle_info.TREE_SPEC_KERNEL_AVAILABLE = True
+        patched_targets.append("sglang.srt.speculative.eagle_info")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Skip SGLang EAGLE v1 target sampling patch: %s", exc)
+
+    try:
+        eagle_info_v2 = importlib.import_module("sglang.srt.speculative.eagle_info_v2")
+        mixin = getattr(eagle_info_v2, "EagleVerifyInputV2Mixin", None)
+        original_sample = getattr(mixin, "sample", None)
+        if original_sample is not None and not getattr(original_sample, "_verl_patched_npu_eagle_sampling", False):
+            mixin.sample = _make_sglang_eagle_v2_sample_patch(original_sample, eagle_info_v2)
+            patched_targets.append("sglang.srt.speculative.eagle_info_v2")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Skip SGLang EAGLE v2 target sampling patch: %s", exc)
+
+    if patched_targets:
+        _SGLANG_NPU_EAGLE_SAMPLING_PATCHED = True
+        logger.info("Patched SGLang NPU EAGLE target sampling for %s", ", ".join(patched_targets))
 
 
 def _extract_hf_hidden_states(outputs):
@@ -556,6 +945,7 @@ def patch_sglang_hidden_states_tensor_output() -> None:
 def _apply_sglang_child_process_patches() -> None:
     patch_sglang_transformers_eagle3_capture()
     patch_sglang_eagle_update_weights_from_tensor()
+    patch_sglang_npu_eagle_target_sampling()
     patch_sglang_hidden_states_tensor_output()
 
 
@@ -623,6 +1013,7 @@ def install_sglang_verl_patches(
     configure_sglang_eagle_weight_update_patch(target_weight_loader, draft_weight_loader)
     patch_sglang_transformers_eagle3_capture()
     patch_sglang_eagle_update_weights_from_tensor()
+    patch_sglang_npu_eagle_target_sampling()
     patch_sglang_hidden_states_tensor_output()
     patch_sglang_scheduler_process_entrypoints()
 
