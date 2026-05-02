@@ -63,6 +63,50 @@ logger.setLevel(logging.INFO)
 visible_devices_keyword = get_visible_devices_keyword()
 _DEBUG_OUTPUT_TOKENS_ENV = "VERL_SGLANG_DEBUG_OUTPUT_TOKENS"
 _DEBUG_OUTPUT_TOKENS_LIMIT_ENV = "VERL_SGLANG_DEBUG_OUTPUT_TOKENS_LIMIT"
+_EAGLE_STATE_DEBUG_ENV = "VERL_SGLANG_EAGLE_STATE_DEBUG"
+
+
+def _env_flag_enabled(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"", "0", "false", "off", "no"}
+
+
+def _log_sglang_eagle_server_state(args: dict, server_args: ServerArgs, config: RolloutConfig) -> None:
+    if not _env_flag_enabled(_EAGLE_STATE_DEBUG_ENV):
+        return
+
+    keys = (
+        "model_path",
+        "load_format",
+        "custom_weight_loader",
+        "speculative_algorithm",
+        "speculative_draft_model_path",
+        "speculative_num_steps",
+        "speculative_eagle_topk",
+        "speculative_num_draft_tokens",
+        "enable_return_hidden_states",
+        "enable_weights_cpu_backup",
+        "enable_draft_weights_cpu_backup",
+        "disable_cuda_graph",
+        "cuda_graph_max_bs",
+        "skip_server_warmup",
+        "attention_backend",
+        "disable_overlap_schedule",
+    )
+    selected = {key: getattr(server_args, key, args.get(key, None)) for key in keys}
+    logger.warning(
+        "[SGLangEagleStateDebug] server sglang_version=%s drafter_enable=%s "
+        "drafter_training=%s collect_hidden=%s target_loader=%s draft_loader=%s args=%s",
+        sglang.__version__,
+        bool(config.drafter.enable),
+        bool(config.drafter.enable_drafter_training),
+        bool(config.drafter.training.collect_hidden_states_from_sgl),
+        VERL_SGLANG_TARGET_WEIGHT_LOADER,
+        VERL_SGLANG_DRAFT_WEIGHT_LOADER,
+        selected,
+    )
 
 
 def _top_logprobs_to_tensor(top_logprobs: list, topk: int) -> Optional[torch.Tensor]:
@@ -377,6 +421,7 @@ class SGLangHttpServer:
         sglang.srt.entrypoints.engine._set_envs_and_config = _set_envs_and_config
         os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
         server_args = ServerArgs(**args)
+        _log_sglang_eagle_server_state(args, server_args, self.config)
         # For SGLang main branch or version >= 0.5.10
         # The latest main branch of SGLang has wrapped the _launch_subprocesses function inside the Engine class
         if version.parse(sglang.__version__) >= version.parse("0.5.10"):

@@ -41,6 +41,10 @@ _EAGLE_FORCE_TARGET_TOKEN_ENV = "VERL_SGLANG_NPU_EAGLE_FORCE_TARGET_TOKEN"
 _EAGLE_V1_BYPASS_DECODE_ENV = "VERL_SGLANG_NPU_EAGLE_V1_BYPASS_DECODE"
 _EAGLE_ROOT_DEBUG_ENV = "VERL_SGLANG_NPU_EAGLE_DEBUG_ROOT"
 _EAGLE_ROOT_DEBUG_LIMIT_ENV = "VERL_SGLANG_NPU_EAGLE_DEBUG_ROOT_LIMIT"
+_EAGLE_STATE_DEBUG_ENV = "VERL_SGLANG_EAGLE_STATE_DEBUG"
+_EAGLE_STATE_DEBUG_UPDATE_LIMIT_ENV = "VERL_SGLANG_EAGLE_STATE_DEBUG_UPDATE_LIMIT"
+_EAGLE_V1_DECODE_DEBUG_ENV = "VERL_SGLANG_EAGLE_V1_DECODE_DEBUG"
+_EAGLE_V1_DECODE_DEBUG_LIMIT_ENV = "VERL_SGLANG_EAGLE_V1_DECODE_DEBUG_LIMIT"
 
 _target_weight_loader: str | None = os.environ.get(_TARGET_WEIGHT_LOADER_ENV)
 _draft_weight_loader: str | None = os.environ.get(_DRAFT_WEIGHT_LOADER_ENV)
@@ -55,6 +59,8 @@ _SGLANG_SCHEDULER_PROCESS_PATCHED = False
 _SCHEDULER_PROCESS_PATCH_ATTR = "_verl_patched_scheduler_process"
 _SGLANG_TOP_K_ALL = 1 << 30
 _EAGLE_ROOT_DEBUG_COUNTER = 0
+_EAGLE_STATE_DEBUG_UPDATE_COUNTER = 0
+_EAGLE_V1_DECODE_DEBUG_COUNTER = 0
 
 
 def configure_sglang_eagle_weight_update_patch(
@@ -114,6 +120,101 @@ def _get_sglang_target_runner(worker):
     return None
 
 
+def _state_debug_enabled() -> bool:
+    return _env_flag_enabled(_EAGLE_STATE_DEBUG_ENV, False)
+
+
+def _runner_debug_summary(runner) -> str:
+    if runner is None:
+        return "missing"
+
+    model = getattr(runner, "model", None)
+    model_config = getattr(runner, "model_config", None)
+    hf_config = getattr(model_config, "hf_config", None)
+    if hf_config is None:
+        hf_config = getattr(model, "config", None)
+
+    fields = [
+        f"runner={type(runner).__name__}",
+        f"model={type(model).__name__ if model is not None else 'missing'}",
+    ]
+    for name in ("tp_rank", "rank"):
+        value = getattr(runner, name, None)
+        if value is not None:
+            fields.append(f"{name}={value}")
+            break
+    for name in ("model_path", "path"):
+        value = getattr(model_config, name, None)
+        if value is not None:
+            fields.append(f"{name}={value}")
+            break
+    if hf_config is not None:
+        architectures = getattr(hf_config, "architectures", None)
+        if architectures:
+            fields.append(f"architectures={architectures}")
+        for name in ("vocab_size", "draft_vocab_size", "hidden_size"):
+            value = getattr(hf_config, name, None)
+            if value is not None:
+                fields.append(f"{name}={value}")
+    return " ".join(fields)
+
+
+def _maybe_log_eagle_weight_update_state(
+    worker,
+    recv_req,
+    *,
+    target_weight_loader: str | None,
+    draft_weight_loader: str | None,
+    target_only: bool,
+    draft_only: bool,
+    disable_draft_model: bool,
+    disable_target_model: bool,
+    tp_rank: int | None = None,
+    named_tensors=None,
+) -> None:
+    global _EAGLE_STATE_DEBUG_UPDATE_COUNTER
+
+    if not _state_debug_enabled():
+        return
+
+    try:
+        call_limit = int(os.getenv(_EAGLE_STATE_DEBUG_UPDATE_LIMIT_ENV, "16"))
+    except ValueError:
+        call_limit = 16
+    if _EAGLE_STATE_DEBUG_UPDATE_COUNTER >= call_limit:
+        return
+
+    _EAGLE_STATE_DEBUG_UPDATE_COUNTER += 1
+    load_format = getattr(recv_req, "load_format", None)
+    serialized_named_tensors = getattr(recv_req, "serialized_named_tensors", None)
+    first_names = []
+    if named_tensors is not None:
+        try:
+            first_names = [name for name, _ in list(named_tensors)[:3]]
+        except Exception:  # noqa: BLE001
+            first_names = []
+
+    logger.warning(
+        "[SGLangEagleStateDebug] update call=%s worker=%s tp_rank=%s load_format=%s "
+        "target_loader_match=%s draft_loader_match=%s disable_draft=%s disable_target=%s "
+        "num_serialized_shards=%s num_tensors=%s first_names=%s "
+        "target_runner={%s} draft_runner={%s}",
+        _EAGLE_STATE_DEBUG_UPDATE_COUNTER,
+        type(worker).__name__,
+        tp_rank,
+        load_format,
+        target_only,
+        draft_only,
+        disable_draft_model,
+        disable_target_model,
+        len(serialized_named_tensors) if serialized_named_tensors is not None else None,
+        len(named_tensors) if named_tensors is not None else None,
+        first_names,
+        _runner_debug_summary(_get_sglang_target_runner(worker)),
+        _runner_debug_summary(_get_sglang_draft_runner(worker)),
+    )
+
+
 def _make_verl_eagle_update_weights_patch(original_update_weights):
     @wraps(original_update_weights)
     def patched_update_weights_from_tensor(self, recv_req):
@@ -123,6 +224,19 @@ def _make_verl_eagle_update_weights_patch(original_update_weights):
         draft_only = draft_weight_loader is not None and load_format == draft_weight_loader
         disable_draft_model = bool(getattr(recv_req, "disable_draft_model", False)) or target_only
         disable_target_model = bool(getattr(recv_req, "disable_target_model", False)) or draft_only
+        should_log_state = _state_debug_enabled()
+
+        if should_log_state:
+            _maybe_log_eagle_weight_update_state(
+                self,
+                recv_req,
+                target_weight_loader=target_weight_loader,
+                draft_weight_loader=draft_weight_loader,
+                target_only=target_only,
+                draft_only=draft_only,
+                disable_draft_model=disable_draft_model,
+                disable_target_model=disable_target_model,
+            )
 
         if not (disable_draft_model or disable_target_model):
             return original_update_weights(self, recv_req)
@@ -146,6 +260,19 @@ def _make_verl_eagle_update_weights_patch(original_update_weights):
 
         monkey_patch_torch_reductions()
         named_tensors = MultiprocessingSerializer.deserialize(serialized_named_tensors[tp_rank])
+        if should_log_state:
+            _maybe_log_eagle_weight_update_state(
+                self,
+                recv_req,
+                target_weight_loader=target_weight_loader,
+                draft_weight_loader=draft_weight_loader,
+                target_only=target_only,
+                draft_only=draft_only,
+                disable_draft_model=disable_draft_model,
+                disable_target_model=disable_target_model,
+                tp_rank=tp_rank,
+                named_tensors=named_tensors,
+            )
 
         # The verl-only custom loaders are route markers. After EAGLEWorker
         # selects the correct side, let that model runner use its normal loader.
@@ -312,6 +439,134 @@ def _maybe_log_eagle_root_debug(kind: str, token_ids: torch.Tensor, **tensors: t
         _EAGLE_ROOT_DEBUG_COUNTER,
         " ".join(parts),
     )
+
+
+def _eagle_v1_decode_debug_enabled() -> bool:
+    return _env_flag_enabled(_EAGLE_V1_DECODE_DEBUG_ENV, False)
+
+
+def _take_eagle_v1_decode_debug_slot() -> int | None:
+    global _EAGLE_V1_DECODE_DEBUG_COUNTER
+
+    if not _eagle_v1_decode_debug_enabled():
+        return None
+    try:
+        call_limit = int(os.getenv(_EAGLE_V1_DECODE_DEBUG_LIMIT_ENV, "16"))
+    except ValueError:
+        call_limit = 16
+    if _EAGLE_V1_DECODE_DEBUG_COUNTER >= call_limit:
+        return None
+
+    _EAGLE_V1_DECODE_DEBUG_COUNTER += 1
+    return _EAGLE_V1_DECODE_DEBUG_COUNTER
+
+
+def _debug_shape(value) -> tuple | None:
+    return tuple(value.shape) if torch.is_tensor(value) else None
+
+
+def _debug_req_output_tails(batch, limit: int = 8, max_reqs: int = 2) -> list[list[int]]:
+    tails = []
+    for req in getattr(batch, "reqs", [])[:max_reqs]:
+        output_ids = getattr(req, "output_ids", []) or []
+        tails.append([int(token_id) for token_id in output_ids[-limit:]])
+    return tails
+
+
+def _log_eagle_v1_worker_debug(stage: str, batch, result=None) -> None:
+    call = _take_eagle_v1_decode_debug_slot()
+    if call is None:
+        return
+
+    spec_info = getattr(batch, "spec_info", None)
+    logger.warning(
+        "[SGLangEagleV1DecodeDebug] stage=%s call=%s forward_mode=%s batch_size=%s "
+        "input_ids_shape=%s output_ids_shape=%s out_cache_loc_shape=%s seq_lens=%s "
+        "spec=%s verified_shape=%s accept_cpu=%s req_tails=%s result_next=%s result_accept=%s",
+        stage,
+        call,
+        getattr(batch, "forward_mode", None),
+        batch.batch_size() if hasattr(batch, "batch_size") else None,
+        _debug_shape(getattr(batch, "input_ids", None)),
+        _debug_shape(getattr(batch, "output_ids", None)),
+        _debug_shape(getattr(batch, "out_cache_loc", None)),
+        _debug_tensor_head(getattr(batch, "seq_lens", torch.empty(0)), 8)
+        if torch.is_tensor(getattr(batch, "seq_lens", None))
+        else None,
+        type(spec_info).__name__ if spec_info is not None else None,
+        _debug_shape(getattr(spec_info, "verified_id", None)),
+        getattr(spec_info, "accept_length_cpu", None),
+        _debug_req_output_tails(batch),
+        _debug_tensor_head(getattr(result, "next_token_ids", torch.empty(0)), 8)
+        if result is not None and torch.is_tensor(getattr(result, "next_token_ids", None))
+        else None,
+        getattr(result, "accept_length_per_req_cpu", None) if result is not None else None,
+    )
+
+
+def _make_eagle_verify_input_debug_patch(original_verify):
+    @wraps(original_verify)
+    def patched_verify(self, batch, logits_output, *args, **kwargs):
+        if not _eagle_v1_decode_debug_enabled():
+            return original_verify(self, batch, logits_output, *args, **kwargs)
+
+        before_call = _take_eagle_v1_decode_debug_slot()
+        next_token_logits = getattr(logits_output, "next_token_logits", None)
+        root_top_ids = root_top_vals = root_finite = None
+        if before_call is not None and torch.is_tensor(next_token_logits):
+            try:
+                bs = int(self.retrive_index.shape[0])
+                draft_token_num = int(self.draft_token_num)
+                root_logits = next_token_logits.reshape(bs, draft_token_num, -1)[:, 0, :]
+                root_top_vals, root_top_ids = torch.max(root_logits, dim=-1)
+                root_finite = torch.isfinite(root_logits).all(dim=-1)
+            except Exception:  # noqa: BLE001
+                root_top_ids = root_top_vals = root_finite = None
+
+        if before_call is not None:
+            logger.warning(
+                "[SGLangEagleV1DecodeDebug] stage=verify_before call=%s bs=%s "
+                "draft_token_num=%s topk=%s spec_steps=%s logits_shape=%s "
+                "draft_head=%s retrive0=%s root_top=%s root_top_val=%s root_finite=%s "
+                "req_tails=%s",
+                before_call,
+                getattr(self.retrive_index, "shape", [None])[0],
+                getattr(self, "draft_token_num", None),
+                getattr(self, "topk", None),
+                getattr(self, "spec_steps", None),
+                _debug_shape(next_token_logits),
+                _debug_tensor_head(getattr(self, "draft_token", torch.empty(0)), 12),
+                _debug_tensor_head(getattr(self, "retrive_index", torch.empty(0))[0], 12)
+                if torch.is_tensor(getattr(self, "retrive_index", None))
+                and self.retrive_index.numel() > 0
+                else None,
+                _debug_tensor_head(root_top_ids, 8) if torch.is_tensor(root_top_ids) else None,
+                _debug_tensor_head(root_top_vals, 8) if torch.is_tensor(root_top_vals) else None,
+                _debug_tensor_head(root_finite, 8) if torch.is_tensor(root_finite) else None,
+                _debug_req_output_tails(batch),
+            )
+
+        result = original_verify(self, batch, logits_output, *args, **kwargs)
+        after_call = _take_eagle_v1_decode_debug_slot()
+        if after_call is not None:
+            logger.warning(
+                "[SGLangEagleV1DecodeDebug] stage=verify_after call=%s verified=%s "
+                "accept_cpu=%s accepted_indices=%s req_tails=%s hidden_shape=%s",
+                after_call,
+                _debug_tensor_head(getattr(result, "verified_id", torch.empty(0)), 12)
+                if result is not None and torch.is_tensor(getattr(result, "verified_id", None))
+                else None,
+                getattr(result, "accept_length_per_req_cpu", None) if result is not None else None,
+                _debug_tensor_head(getattr(result, "accepted_indices", torch.empty(0)), 16)
+                if result is not None and torch.is_tensor(getattr(result, "accepted_indices", None))
+                else None,
+                _debug_req_output_tails(batch),
+                _debug_shape(getattr(getattr(result, "draft_input", None), "hidden_states", None)),
+            )
+        return result
+
+    patched_verify._verl_patched_npu_eagle_v1_decode_debug = True
+    return patched_verify
 
 
 def _renorm_probs_by_top_k_top_p(
@@ -709,6 +964,7 @@ def _make_verify_tree_greedy_func_patch(original_verify_tree_greedy_func):
 def _make_eagle_v1_bypass_decode_patch(original_forward_batch_generation):
     @wraps(original_forward_batch_generation)
     def patched_forward_batch_generation(self, batch):
+        _log_eagle_v1_worker_debug("worker_before", batch)
         if (
             _env_flag_enabled(_EAGLE_V1_BYPASS_DECODE_ENV, False)
             and not batch.forward_mode.is_extend()
@@ -732,13 +988,16 @@ def _make_eagle_v1_bypass_decode_patch(original_forward_batch_generation):
                 result = self.target_worker.forward_batch_generation(model_worker_batch)
                 result.num_accepted_tokens = 0
                 result.accept_length_per_req_cpu = [0] * batch.batch_size()
+                _log_eagle_v1_worker_debug("worker_bypass_after", batch, result)
                 return result
             finally:
                 batch.spec_info = spec_info_backup
                 batch.spec_algorithm = spec_algorithm_backup
                 batch.return_hidden_states = return_hidden_states_backup
 
-        return original_forward_batch_generation(self, batch)
+        result = original_forward_batch_generation(self, batch)
+        _log_eagle_v1_worker_debug("worker_after", batch, result)
+        return result
 
     patched_forward_batch_generation._verl_patched_npu_eagle_v1_bypass_decode = True
     return patched_forward_batch_generation
@@ -846,6 +1105,24 @@ def patch_sglang_npu_eagle_v1_greedy_path() -> None:
 
     try:
         eagle_info = importlib.import_module("sglang.srt.speculative.eagle_info")
+        eagle_verify_input_cls = getattr(eagle_info, "EagleVerifyInput", None)
+        original_input_verify = (
+            getattr(eagle_verify_input_cls, "verify", None)
+            if eagle_verify_input_cls is not None
+            else None
+        )
+        if original_input_verify is not None and not getattr(
+            original_input_verify,
+            "_verl_patched_npu_eagle_v1_decode_debug",
+            False,
+        ):
+            eagle_verify_input_cls.verify = _make_eagle_verify_input_debug_patch(
+                original_input_verify
+            )
+            patched_targets.append(
+                "sglang.srt.speculative.eagle_info.EagleVerifyInput.verify"
+            )
+
         patched_verify = getattr(
             importlib.import_module("sglang.srt.speculative.eagle_utils"),
             "verify_tree_greedy_func",
