@@ -445,7 +445,7 @@ def _eagle_v1_decode_debug_enabled() -> bool:
     return _env_flag_enabled(_EAGLE_V1_DECODE_DEBUG_ENV, False)
 
 
-def _take_eagle_v1_decode_debug_slot() -> int | None:
+def _take_eagle_v1_decode_debug_slot(force: bool = False) -> int | None:
     global _EAGLE_V1_DECODE_DEBUG_COUNTER
 
     if not _eagle_v1_decode_debug_enabled():
@@ -454,7 +454,7 @@ def _take_eagle_v1_decode_debug_slot() -> int | None:
         call_limit = int(os.getenv(_EAGLE_V1_DECODE_DEBUG_LIMIT_ENV, "16"))
     except ValueError:
         call_limit = 16
-    if _EAGLE_V1_DECODE_DEBUG_COUNTER >= call_limit:
+    if not force and _EAGLE_V1_DECODE_DEBUG_COUNTER >= call_limit:
         return None
 
     _EAGLE_V1_DECODE_DEBUG_COUNTER += 1
@@ -465,16 +465,43 @@ def _debug_shape(value) -> tuple | None:
     return tuple(value.shape) if torch.is_tensor(value) else None
 
 
-def _debug_req_output_tails(batch, limit: int = 8, max_reqs: int = 2) -> list[list[int]]:
-    tails = []
-    for req in getattr(batch, "reqs", [])[:max_reqs]:
+def _tensor_has_zero(value) -> bool:
+    return torch.is_tensor(value) and value.numel() > 0 and bool(torch.any(value == 0).item())
+
+
+def _debug_req_output_entries(batch, limit: int = 8, max_reqs: int = 2) -> list[dict]:
+    entries = []
+    seen_indices = set()
+    reqs = list(getattr(batch, "reqs", []) or [])
+    for i, req in enumerate(reqs):
         output_ids = getattr(req, "output_ids", []) or []
-        tails.append([int(token_id) for token_id in output_ids[-limit:]])
-    return tails
+        has_zero = any(int(token_id) == 0 for token_id in output_ids[-limit:])
+        if i >= max_reqs and not has_zero:
+            continue
+        seen_indices.add(i)
+        entries.append(
+            {
+                "i": i,
+                "rid": getattr(req, "rid", None),
+                "len": len(output_ids),
+                "tail": [int(token_id) for token_id in output_ids[-limit:]],
+                "tail_has_zero": has_zero,
+            }
+        )
+    return entries
+
+
+def _batch_tail_has_zero(batch, limit: int = 8) -> bool:
+    for req in getattr(batch, "reqs", []) or []:
+        output_ids = getattr(req, "output_ids", []) or []
+        if any(int(token_id) == 0 for token_id in output_ids[-limit:]):
+            return True
+    return False
 
 
 def _log_eagle_v1_worker_debug(stage: str, batch, result=None) -> None:
-    call = _take_eagle_v1_decode_debug_slot()
+    force = _batch_tail_has_zero(batch) or _tensor_has_zero(getattr(result, "next_token_ids", None))
+    call = _take_eagle_v1_decode_debug_slot(force=force)
     if call is None:
         return
 
@@ -482,7 +509,7 @@ def _log_eagle_v1_worker_debug(stage: str, batch, result=None) -> None:
     logger.warning(
         "[SGLangEagleV1DecodeDebug] stage=%s call=%s forward_mode=%s batch_size=%s "
         "input_ids_shape=%s output_ids_shape=%s out_cache_loc_shape=%s seq_lens=%s "
-        "spec=%s verified_shape=%s accept_cpu=%s req_tails=%s result_next=%s result_accept=%s",
+        "spec=%s verified_shape=%s accept_cpu=%s req_entries=%s result_next=%s result_accept=%s force=%s",
         stage,
         call,
         getattr(batch, "forward_mode", None),
@@ -496,11 +523,12 @@ def _log_eagle_v1_worker_debug(stage: str, batch, result=None) -> None:
         type(spec_info).__name__ if spec_info is not None else None,
         _debug_shape(getattr(spec_info, "verified_id", None)),
         getattr(spec_info, "accept_length_cpu", None),
-        _debug_req_output_tails(batch),
+        _debug_req_output_entries(batch),
         _debug_tensor_head(getattr(result, "next_token_ids", torch.empty(0)), 8)
         if result is not None and torch.is_tensor(getattr(result, "next_token_ids", None))
         else None,
         getattr(result, "accept_length_per_req_cpu", None) if result is not None else None,
+        force,
     )
 
 
@@ -510,10 +538,9 @@ def _make_eagle_verify_input_debug_patch(original_verify):
         if not _eagle_v1_decode_debug_enabled():
             return original_verify(self, batch, logits_output, *args, **kwargs)
 
-        before_call = _take_eagle_v1_decode_debug_slot()
         next_token_logits = getattr(logits_output, "next_token_logits", None)
         root_top_ids = root_top_vals = root_finite = None
-        if before_call is not None and torch.is_tensor(next_token_logits):
+        if torch.is_tensor(next_token_logits):
             try:
                 bs = int(self.retrive_index.shape[0])
                 draft_token_num = int(self.draft_token_num)
@@ -523,12 +550,14 @@ def _make_eagle_verify_input_debug_patch(original_verify):
             except Exception:  # noqa: BLE001
                 root_top_ids = root_top_vals = root_finite = None
 
+        before_force = _tensor_has_zero(root_top_ids) or _batch_tail_has_zero(batch)
+        before_call = _take_eagle_v1_decode_debug_slot(force=before_force)
         if before_call is not None:
             logger.warning(
                 "[SGLangEagleV1DecodeDebug] stage=verify_before call=%s bs=%s "
                 "draft_token_num=%s topk=%s spec_steps=%s logits_shape=%s "
                 "draft_head=%s retrive0=%s root_top=%s root_top_val=%s root_finite=%s "
-                "req_tails=%s",
+                "req_entries=%s force=%s",
                 before_call,
                 getattr(self.retrive_index, "shape", [None])[0],
                 getattr(self, "draft_token_num", None),
@@ -543,15 +572,21 @@ def _make_eagle_verify_input_debug_patch(original_verify):
                 _debug_tensor_head(root_top_ids, 8) if torch.is_tensor(root_top_ids) else None,
                 _debug_tensor_head(root_top_vals, 8) if torch.is_tensor(root_top_vals) else None,
                 _debug_tensor_head(root_finite, 8) if torch.is_tensor(root_finite) else None,
-                _debug_req_output_tails(batch),
+                _debug_req_output_entries(batch),
+                before_force,
             )
 
         result = original_verify(self, batch, logits_output, *args, **kwargs)
-        after_call = _take_eagle_v1_decode_debug_slot()
+        after_force = (
+            _tensor_has_zero(getattr(result, "verified_id", None))
+            or _tensor_has_zero(getattr(result, "accepted_indices", None))
+            or _batch_tail_has_zero(batch)
+        )
+        after_call = _take_eagle_v1_decode_debug_slot(force=after_force)
         if after_call is not None:
             logger.warning(
                 "[SGLangEagleV1DecodeDebug] stage=verify_after call=%s verified=%s "
-                "accept_cpu=%s accepted_indices=%s req_tails=%s hidden_shape=%s",
+                "accept_cpu=%s accepted_indices=%s req_entries=%s hidden_shape=%s force=%s",
                 after_call,
                 _debug_tensor_head(getattr(result, "verified_id", torch.empty(0)), 12)
                 if result is not None and torch.is_tensor(getattr(result, "verified_id", None))
@@ -560,8 +595,9 @@ def _make_eagle_verify_input_debug_patch(original_verify):
                 _debug_tensor_head(getattr(result, "accepted_indices", torch.empty(0)), 16)
                 if result is not None and torch.is_tensor(getattr(result, "accepted_indices", None))
                 else None,
-                _debug_req_output_tails(batch),
+                _debug_req_output_entries(batch),
                 _debug_shape(getattr(getattr(result, "draft_input", None), "hidden_states", None)),
+                after_force,
             )
         return result
 
