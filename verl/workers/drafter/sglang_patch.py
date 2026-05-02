@@ -36,6 +36,8 @@ _EAGLE_VERIFY_MODE_ENV = "VERL_SGLANG_NPU_EAGLE_VERIFY_MODE"
 _EAGLE_V1_TARGET_SAMPLING_ENV = "VERL_SGLANG_NPU_EAGLE_V1_TARGET_SAMPLING"
 _EAGLE_V1_VERIFY_MODE_ENV = "VERL_SGLANG_NPU_EAGLE_V1_VERIFY_MODE"
 _EAGLE_V2_VERIFY_MODE_ENV = "VERL_SGLANG_NPU_EAGLE_V2_VERIFY_MODE"
+_EAGLE_V1_TORCH_GREEDY_ENV = "VERL_SGLANG_NPU_EAGLE_V1_TORCH_GREEDY"
+_EAGLE_V1_TORCH_TOPK1_TREE_ENV = "VERL_SGLANG_NPU_EAGLE_V1_TORCH_TOPK1_TREE"
 
 _target_weight_loader: str | None = os.environ.get(_TARGET_WEIGHT_LOADER_ENV)
 _draft_weight_loader: str | None = os.environ.get(_DRAFT_WEIGHT_LOADER_ENV)
@@ -43,6 +45,7 @@ _ORIGINAL_SGLANG_RUN_SCHEDULER_PROCESS = sglang.srt.entrypoints.engine.run_sched
 _ORIGINAL_SGLANG_DIRECT_RUN_SCHEDULER_PROCESS = None
 _SGLANG_EAGLE_UPDATE_PATCHED = False
 _SGLANG_NPU_EAGLE_SAMPLING_PATCHED = False
+_SGLANG_NPU_EAGLE_GREEDY_PATCHED = False
 _SGLANG_TRANSFORMERS_EAGLE3_CAPTURE_PATCHED = False
 _SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED = False
 _SGLANG_SCHEDULER_PROCESS_PATCHED = False
@@ -261,6 +264,13 @@ def _sglang_npu_eagle_v1_verify_mode() -> str:
 
 def _sglang_npu_eagle_v2_verify_mode() -> str:
     return _sglang_npu_eagle_verify_mode(_EAGLE_V2_VERIFY_MODE_ENV)
+
+
+def _env_flag_enabled(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "off", "no"}
 
 
 def _renorm_probs_by_top_k_top_p(
@@ -523,6 +533,283 @@ def _tree_speculative_sampling_target_only_torch(
     )
 
 
+def _verify_tree_greedy_topk1_torch(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    target_predict: torch.Tensor,
+    topk: int = -1,
+):
+    """Torch implementation of SGLang greedy tree verify for the topk=1 chain."""
+    del retrive_next_token, retrive_next_sibling, topk
+
+    batch_size, num_draft_tokens = candidates.shape
+    if num_draft_tokens == 0:
+        return predicts, accept_index, accept_token_num
+
+    target_predict = target_predict.reshape(batch_size, num_draft_tokens)
+    base_indices = retrive_index[:, 0].to(device=candidates.device, dtype=torch.long)
+    chain_offsets = torch.arange(
+        num_draft_tokens,
+        device=candidates.device,
+        dtype=torch.long,
+    ).view(1, -1)
+    chain_indices = base_indices.view(-1, 1) + chain_offsets
+
+    accept_index.fill_(-1)
+    accept_index[:, 0].copy_(base_indices.to(dtype=accept_index.dtype))
+
+    if num_draft_tokens == 1:
+        accept_token_num.zero_()
+        predicts.scatter_(
+            dim=0,
+            index=base_indices,
+            src=target_predict[:, 0].to(dtype=predicts.dtype),
+        )
+        return predicts, accept_index, accept_token_num
+
+    draft_matches = (
+        candidates[:, 1:].to(dtype=target_predict.dtype) == target_predict[:, :-1]
+    )
+    accepted_prefix = torch.cumprod(
+        draft_matches.to(dtype=torch.int64),
+        dim=1,
+    ).to(dtype=torch.bool)
+    accepted_draft_tokens = accepted_prefix.sum(dim=1).to(dtype=torch.long)
+
+    valid_accept = chain_offsets <= accepted_draft_tokens.view(-1, 1)
+    accept_updates = torch.where(
+        valid_accept,
+        chain_indices,
+        torch.full_like(chain_indices, -1),
+    )
+    accept_index.copy_(accept_updates.to(dtype=accept_index.dtype))
+    accept_token_num.copy_(accepted_draft_tokens.to(dtype=accept_token_num.dtype))
+
+    valid_predict = chain_offsets <= accepted_draft_tokens.view(-1, 1)
+    predicts.scatter_(
+        dim=0,
+        index=chain_indices[valid_predict],
+        src=target_predict[valid_predict].to(dtype=predicts.dtype),
+    )
+    return predicts, accept_index, accept_token_num
+
+
+def _make_verify_tree_greedy_func_patch(original_verify_tree_greedy_func):
+    @wraps(original_verify_tree_greedy_func)
+    def patched_verify_tree_greedy_func(
+        predicts: torch.Tensor,
+        accept_index: torch.Tensor,
+        accept_token_num: torch.Tensor,
+        candidates: torch.Tensor,
+        retrive_index: torch.Tensor,
+        retrive_next_token: torch.Tensor,
+        retrive_next_sibling: torch.Tensor,
+        target_predict: torch.Tensor,
+        topk: int = -1,
+    ):
+        if (
+            _env_flag_enabled(_EAGLE_V1_TORCH_GREEDY_ENV, True)
+            and int(topk) == 1
+            and candidates.dim() == 2
+            and target_predict.numel() == candidates.numel()
+        ):
+            return _verify_tree_greedy_topk1_torch(
+                predicts=predicts,
+                accept_index=accept_index,
+                accept_token_num=accept_token_num,
+                candidates=candidates,
+                retrive_index=retrive_index,
+                retrive_next_token=retrive_next_token,
+                retrive_next_sibling=retrive_next_sibling,
+                target_predict=target_predict,
+                topk=topk,
+            )
+        return original_verify_tree_greedy_func(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates,
+            retrive_index=retrive_index,
+            retrive_next_token=retrive_next_token,
+            retrive_next_sibling=retrive_next_sibling,
+            target_predict=target_predict,
+            topk=topk,
+        )
+
+    patched_verify_tree_greedy_func._verl_patched_npu_eagle_greedy = True
+    return patched_verify_tree_greedy_func
+
+
+def _build_tree_kernel_efficient_topk1_torch(
+    verified_id: torch.Tensor,
+    parent_list: torch.Tensor,
+    top_scores_index: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    seq_lens_sum: int,
+    topk: int,
+    spec_steps: int,
+    num_verify_tokens: int,
+    tree_mask_mode=0,
+    tree_mask_buf: torch.Tensor | None = None,
+    position_buf: torch.Tensor | None = None,
+):
+    del parent_list, top_scores_index, topk, spec_steps
+
+    batch_size = int(seq_lens.numel())
+    num_verify_tokens = int(num_verify_tokens)
+    device = seq_lens.device
+    mode = int(tree_mask_mode)
+
+    draft_tokens = torch.cat((verified_id.unsqueeze(1), draft_tokens), dim=1).flatten()
+
+    if position_buf is None:
+        positions = torch.empty(
+            (batch_size * num_verify_tokens,),
+            device=device,
+            dtype=torch.long,
+        )
+    else:
+        positions = position_buf
+
+    offsets = torch.arange(num_verify_tokens, device=device, dtype=torch.long)
+    positions.copy_(
+        (seq_lens.to(dtype=torch.long).view(-1, 1) + offsets.view(1, -1)).flatten()
+    )
+
+    retrive_buf = torch.full(
+        (3, batch_size, num_verify_tokens),
+        -1,
+        device=device,
+        dtype=torch.long,
+    )
+    retrive_index, retrive_next_token, retrive_next_sibling = retrive_buf
+    base_indices = torch.arange(
+        batch_size * num_verify_tokens,
+        device=device,
+        dtype=torch.long,
+    ).view(batch_size, num_verify_tokens)
+    retrive_index.copy_(base_indices)
+    if num_verify_tokens > 1:
+        retrive_next_token[:, :-1] = torch.arange(
+            1,
+            num_verify_tokens,
+            device=device,
+            dtype=torch.long,
+        )
+
+    if mode == 0:
+        mask_numel = (
+            int(seq_lens_sum) * num_verify_tokens
+            + batch_size * num_verify_tokens * num_verify_tokens
+        )
+    elif mode == 1:
+        mask_numel = batch_size * num_verify_tokens * num_verify_tokens
+    else:
+        raise NotImplementedError(
+            "Torch topk=1 EAGLE tree builder only supports FULL_MASK and QLEN_ONLY"
+        )
+
+    if tree_mask_buf is None:
+        tree_mask = torch.zeros((mask_numel,), dtype=torch.bool, device=device)
+    else:
+        tree_mask = tree_mask_buf
+        tree_mask.fill_(False)
+
+    lower_tri = torch.tril(
+        torch.ones(
+            (num_verify_tokens, num_verify_tokens),
+            dtype=torch.bool,
+            device=device,
+        )
+    )
+    if mode == 0:
+        cursor = 0
+        seq_lens_cpu = seq_lens.detach().cpu().tolist()
+        for seq_len in seq_lens_cpu:
+            seq_len = int(seq_len)
+            req_block = tree_mask[
+                cursor : cursor + num_verify_tokens * (seq_len + num_verify_tokens)
+            ]
+            req_block = req_block.view(num_verify_tokens, seq_len + num_verify_tokens)
+            if seq_len > 0:
+                req_block[:, :seq_len] = True
+            req_block[:, seq_len : seq_len + num_verify_tokens] = lower_tri
+            cursor += num_verify_tokens * (seq_len + num_verify_tokens)
+    else:
+        tree_mask.view(batch_size, num_verify_tokens, num_verify_tokens).copy_(
+            lower_tri.expand(batch_size, -1, -1)
+        )
+
+    return (
+        tree_mask,
+        positions,
+        retrive_index,
+        retrive_next_token,
+        retrive_next_sibling,
+        draft_tokens,
+    )
+
+
+def _make_build_tree_kernel_efficient_topk1_patch(original_build_tree_kernel_efficient):
+    @wraps(original_build_tree_kernel_efficient)
+    def patched_build_tree_kernel_efficient(
+        verified_id: torch.Tensor,
+        parent_list: torch.Tensor,
+        top_scores_index: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        topk: int,
+        spec_steps: int,
+        num_verify_tokens: int,
+        tree_mask_mode=0,
+        tree_mask_buf: torch.Tensor | None = None,
+        position_buf: torch.Tensor | None = None,
+    ):
+        if (
+            _env_flag_enabled(_EAGLE_V1_TORCH_TOPK1_TREE_ENV, False)
+            and int(topk) == 1
+            and int(tree_mask_mode) in {0, 1}
+        ):
+            return _build_tree_kernel_efficient_topk1_torch(
+                verified_id=verified_id,
+                parent_list=parent_list,
+                top_scores_index=top_scores_index,
+                draft_tokens=draft_tokens,
+                seq_lens=seq_lens,
+                seq_lens_sum=seq_lens_sum,
+                topk=topk,
+                spec_steps=spec_steps,
+                num_verify_tokens=num_verify_tokens,
+                tree_mask_mode=tree_mask_mode,
+                tree_mask_buf=tree_mask_buf,
+                position_buf=position_buf,
+            )
+        return original_build_tree_kernel_efficient(
+            verified_id=verified_id,
+            parent_list=parent_list,
+            top_scores_index=top_scores_index,
+            draft_tokens=draft_tokens,
+            seq_lens=seq_lens,
+            seq_lens_sum=seq_lens_sum,
+            topk=topk,
+            spec_steps=spec_steps,
+            num_verify_tokens=num_verify_tokens,
+            tree_mask_mode=tree_mask_mode,
+            tree_mask_buf=tree_mask_buf,
+            position_buf=position_buf,
+        )
+
+    patched_build_tree_kernel_efficient._verl_patched_npu_eagle_topk1_tree = True
+    return patched_build_tree_kernel_efficient
+
+
 def _make_sglang_eagle_v2_sample_patch(original_sample):
     sample_globals = dict(original_sample.__globals__)
     sample_globals["_is_npu"] = False
@@ -587,6 +874,82 @@ def patch_sglang_npu_eagle_target_sampling() -> None:
     if patched_targets:
         _SGLANG_NPU_EAGLE_SAMPLING_PATCHED = True
         logger.info("Patched SGLang NPU EAGLE target sampling for %s", ", ".join(patched_targets))
+
+
+def patch_sglang_npu_eagle_v1_greedy_path() -> None:
+    """Patch SGLang NPU EAGLE v1 topk=1 greedy helpers for transparency diagnostics."""
+    global _SGLANG_NPU_EAGLE_GREEDY_PATCHED
+    if _SGLANG_NPU_EAGLE_GREEDY_PATCHED or not _is_sglang_npu_backend():
+        return
+
+    patched_targets = []
+    try:
+        eagle_utils = importlib.import_module("sglang.srt.speculative.eagle_utils")
+        original_verify = getattr(eagle_utils, "verify_tree_greedy_func", None)
+        if original_verify is not None and not getattr(
+            original_verify,
+            "_verl_patched_npu_eagle_greedy",
+            False,
+        ):
+            patched_verify = _make_verify_tree_greedy_func_patch(original_verify)
+            eagle_utils.verify_tree_greedy_func = patched_verify
+            patched_targets.append(
+                "sglang.srt.speculative.eagle_utils.verify_tree_greedy_func"
+            )
+
+        original_build_tree = getattr(eagle_utils, "build_tree_kernel_efficient", None)
+        if original_build_tree is not None and not getattr(
+            original_build_tree,
+            "_verl_patched_npu_eagle_topk1_tree",
+            False,
+        ):
+            patched_build_tree = _make_build_tree_kernel_efficient_topk1_patch(
+                original_build_tree
+            )
+            eagle_utils.build_tree_kernel_efficient = patched_build_tree
+            patched_targets.append(
+                "sglang.srt.speculative.eagle_utils.build_tree_kernel_efficient"
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Skip SGLang EAGLE v1 greedy utility patch: %s", exc)
+        return
+
+    try:
+        eagle_info = importlib.import_module("sglang.srt.speculative.eagle_info")
+        patched_verify = getattr(
+            importlib.import_module("sglang.srt.speculative.eagle_utils"),
+            "verify_tree_greedy_func",
+            None,
+        )
+        if patched_verify is not None:
+            eagle_info.verify_tree_greedy_func = patched_verify
+            patched_targets.append(
+                "sglang.srt.speculative.eagle_info.verify_tree_greedy_func"
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Skip SGLang EAGLE v1 greedy verify binding patch: %s", exc)
+
+    try:
+        eagle_worker = importlib.import_module("sglang.srt.speculative.eagle_worker")
+        patched_build_tree = getattr(
+            importlib.import_module("sglang.srt.speculative.eagle_utils"),
+            "build_tree_kernel_efficient",
+            None,
+        )
+        if patched_build_tree is not None:
+            eagle_worker.build_tree_kernel_efficient = patched_build_tree
+            patched_targets.append(
+                "sglang.srt.speculative.eagle_worker.build_tree_kernel_efficient"
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Skip SGLang EAGLE v1 tree builder binding patch: %s", exc)
+
+    if patched_targets:
+        _SGLANG_NPU_EAGLE_GREEDY_PATCHED = True
+        logger.info(
+            "Patched SGLang NPU EAGLE v1 greedy path for %s",
+            ", ".join(patched_targets),
+        )
 
 
 def _extract_hf_hidden_states(outputs):
@@ -946,6 +1309,7 @@ def patch_sglang_hidden_states_tensor_output() -> None:
 def _apply_sglang_child_process_patches() -> None:
     patch_sglang_transformers_eagle3_capture()
     patch_sglang_eagle_update_weights_from_tensor()
+    patch_sglang_npu_eagle_v1_greedy_path()
     patch_sglang_npu_eagle_target_sampling()
     patch_sglang_hidden_states_tensor_output()
 
@@ -1014,6 +1378,7 @@ def install_sglang_verl_patches(
     configure_sglang_eagle_weight_update_patch(target_weight_loader, draft_weight_loader)
     patch_sglang_transformers_eagle3_capture()
     patch_sglang_eagle_update_weights_from_tensor()
+    patch_sglang_npu_eagle_v1_greedy_path()
     patch_sglang_npu_eagle_target_sampling()
     patch_sglang_hidden_states_tensor_output()
     patch_sglang_scheduler_process_entrypoints()
