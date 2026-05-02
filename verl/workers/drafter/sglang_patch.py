@@ -20,6 +20,7 @@ import os
 import re
 import textwrap
 from functools import wraps
+from types import FunctionType
 from typing import Callable
 
 import torch
@@ -43,6 +44,8 @@ _SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED = False
 _SGLANG_SCHEDULER_PROCESS_PATCHED = False
 _SCHEDULER_PROCESS_PATCH_ATTR = "_verl_patched_scheduler_process"
 _SGLANG_TOP_K_ALL = 1 << 30
+_VERL_EAGLE_DRAFT_PROBS_ATTR = "_verl_eagle_draft_probs"
+_SGLANG_EAGLE_DRAFT_CONTEXT = None
 
 
 def configure_sglang_eagle_weight_update_patch(
@@ -288,6 +291,74 @@ def _sample_from_probs_with_coin(probs: torch.Tensor, coin: torch.Tensor) -> tor
     return samples[0] if squeeze_output else samples
 
 
+def _should_sample_eagle_draft_tokens(sampling_info, topk: int | None) -> bool:
+    """Use sampled EAGLE proposals only for the linear top-1 non-greedy case."""
+    if os.getenv("VERL_SGLANG_NPU_EAGLE_SAMPLE_DRAFT", "1") == "0":
+        return False
+    if int(topk or 0) != 1:
+        return False
+    return sampling_info is not None and not getattr(sampling_info, "is_all_greedy", False)
+
+
+def _sample_eagle_top1_from_probs(probs: torch.Tensor, dim: int = -1) -> tuple[torch.Tensor, torch.Tensor]:
+    noise = torch.empty_like(probs, dtype=torch.float32)
+    noise.exponential_()
+    scores = probs.float() / noise.clamp_min(torch.finfo(torch.float32).tiny)
+    topk_index = torch.argmax(scores, dim=dim, keepdim=True)
+    topk_p = torch.gather(probs, dim=dim, index=topk_index)
+    return topk_p, topk_index
+
+
+def _clear_eagle_draft_probs(spec_info) -> None:
+    if hasattr(spec_info, _VERL_EAGLE_DRAFT_PROBS_ATTR):
+        delattr(spec_info, _VERL_EAGLE_DRAFT_PROBS_ATTR)
+
+
+def _make_sglang_eagle_fast_topk_patch(original_fast_topk):
+    @wraps(original_fast_topk)
+    def patched_fast_topk(probs, topk, dim=-1):
+        context = _SGLANG_EAGLE_DRAFT_CONTEXT
+        if (
+            context is None
+            or dim != -1
+            or not _should_sample_eagle_draft_tokens(context["sampling_info"], topk)
+        ):
+            return original_fast_topk(probs, topk, dim=dim)
+
+        context["draft_probs"].append(probs.float().unsqueeze(1).contiguous())
+        return _sample_eagle_top1_from_probs(probs, dim=dim)
+
+    patched_fast_topk._verl_patched_eagle_draft_probs = True
+    return patched_fast_topk
+
+
+def _eagle_draft_probs_from_context(
+    context: dict,
+    draft_token_num: int,
+) -> torch.Tensor | None:
+    draft_probs_list = context["draft_probs"]
+    if not draft_probs_list:
+        return None
+
+    draft_probs = torch.cat(draft_probs_list, dim=1)
+    if draft_probs.shape[1] < max(draft_token_num - 1, 1):
+        return None
+    if draft_probs.shape[1] < draft_token_num:
+        pad = torch.zeros(
+            (
+                draft_probs.shape[0],
+                draft_token_num - draft_probs.shape[1],
+                draft_probs.shape[2],
+            ),
+            dtype=draft_probs.dtype,
+            device=draft_probs.device,
+        )
+        draft_probs = torch.cat((draft_probs, pad), dim=1)
+    elif draft_probs.shape[1] > draft_token_num:
+        draft_probs = draft_probs[:, :draft_token_num, :]
+    return draft_probs.contiguous()
+
+
 def _try_sglang_tree_speculative_sampling_kernel(
     predicts: torch.Tensor,
     accept_index: torch.Tensor,
@@ -442,6 +513,96 @@ def _tree_speculative_sampling_target_only_vectorized_torch(
     predicts.scatter_(dim=0, index=last_accepted_retrive_idx, src=final_token_ids.to(dtype=predicts.dtype))
 
 
+def _tree_speculative_sampling_with_draft_probs_torch(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    uniform_samples: torch.Tensor,
+    uniform_samples_for_final_sampling: torch.Tensor,
+    target_probs: torch.Tensor,
+    draft_probs: torch.Tensor,
+    threshold_single: float = 1.0,
+    threshold_acc: float = 1.0,
+) -> None:
+    batch_size, _ = candidates.shape
+    num_speculative_tokens = accept_index.shape[1]
+    device = target_probs.device
+    dtype = target_probs.dtype
+
+    threshold_acc = max(float(threshold_acc), 1e-9)
+    threshold_single = float(threshold_single)
+
+    accept_index.fill_(-1)
+    accept_token_num.zero_()
+
+    batch_indices = torch.arange(batch_size, dtype=torch.long, device=device)
+    cur_prob_idx = torch.zeros((batch_size,), dtype=torch.long, device=device)
+    accepted_count = torch.zeros((batch_size,), dtype=torch.long, device=device)
+    active = torch.ones((batch_size,), dtype=torch.bool, device=device)
+
+    last_accepted_retrive_idx = retrive_index[:, 0].to(torch.long)
+    accept_index[:, 0].copy_(last_accepted_retrive_idx.to(dtype=accept_index.dtype))
+    coin = uniform_samples[:, 0]
+    tiny = torch.finfo(dtype).tiny
+
+    for _ in range(1, num_speculative_tokens):
+        next_idx = torch.where(
+            active,
+            retrive_next_token[batch_indices, cur_prob_idx],
+            torch.full_like(cur_prob_idx, -1),
+        )
+        valid = active & (next_idx >= 0)
+        safe_next_idx = next_idx.clamp_min(0)
+        draft_token_id = candidates[batch_indices, safe_next_idx].to(torch.long)
+        target_prob_single = target_probs[batch_indices, cur_prob_idx, draft_token_id]
+        draft_prob_single = draft_probs[batch_indices, cur_prob_idx, draft_token_id].to(dtype=dtype)
+
+        accept_prob = torch.where(
+            draft_prob_single > tiny,
+            torch.minimum(target_prob_single / draft_prob_single.clamp_min(tiny), torch.ones_like(target_prob_single)),
+            torch.zeros_like(target_prob_single),
+        )
+        accept_prob = torch.minimum(accept_prob / threshold_acc, torch.ones_like(accept_prob))
+        accepted = valid & ((coin <= accept_prob) | (target_prob_single >= threshold_single))
+
+        accepted_token_id = candidates[batch_indices, safe_next_idx].to(dtype=predicts.dtype)
+        accepted_retrive_idx = retrive_index[batch_indices, safe_next_idx].to(torch.long)
+
+        old_predicts = predicts.gather(dim=0, index=last_accepted_retrive_idx)
+        predict_updates = torch.where(accepted, accepted_token_id, old_predicts)
+        predicts.scatter_(dim=0, index=last_accepted_retrive_idx, src=predict_updates)
+
+        next_accepted_count = accepted_count + accepted.to(dtype=torch.long)
+        accept_index_position = next_accepted_count.clamp_max(num_speculative_tokens - 1).view(-1, 1)
+        old_accept_index = accept_index.gather(dim=1, index=accept_index_position).squeeze(1)
+        accept_index_updates = torch.where(
+            accepted,
+            accepted_retrive_idx.to(dtype=accept_index.dtype),
+            old_accept_index,
+        )
+        accept_index.scatter_(dim=1, index=accept_index_position, src=accept_index_updates.view(-1, 1))
+
+        cur_prob_idx = torch.where(accepted, safe_next_idx, cur_prob_idx)
+        last_accepted_retrive_idx = torch.where(accepted, accepted_retrive_idx, last_accepted_retrive_idx)
+        accepted_count = next_accepted_count
+        coin = uniform_samples[batch_indices, cur_prob_idx]
+        active = accepted
+
+    accept_token_num.copy_(accepted_count.to(dtype=accept_token_num.dtype))
+
+    final_target_probs = target_probs[batch_indices, cur_prob_idx]
+    final_draft_probs = draft_probs[batch_indices, cur_prob_idx].to(dtype=dtype)
+    residual_probs = torch.clamp(final_target_probs - final_draft_probs, min=0.0)
+    need_residual = accepted_count != (num_speculative_tokens - 1)
+    final_probs = torch.where(need_residual.view(-1, 1), residual_probs, final_target_probs)
+    final_probs = torch.where(final_probs.sum(dim=-1, keepdim=True) > 0, final_probs, final_target_probs)
+    final_token_ids = _sample_from_probs_with_coin(final_probs, uniform_samples_for_final_sampling)
+    predicts.scatter_(dim=0, index=last_accepted_retrive_idx, src=final_token_ids.to(dtype=predicts.dtype))
+
+
 def _tree_speculative_sampling_target_only_torch(
     predicts: torch.Tensor,
     accept_index: torch.Tensor,
@@ -493,7 +654,27 @@ def _tree_speculative_sampling_target_only_torch(
     )
 
 
+def _make_sglang_eagle_v2_original_sample_with_target_sampling(original_sample):
+    sample_globals = dict(original_sample.__globals__)
+    sample_globals["_is_npu"] = False
+    sample_globals["top_k_renorm_prob"] = _top_k_renorm_prob_torch
+    sample_globals["top_p_renorm_prob"] = _top_p_renorm_prob_torch
+    sample_globals["tree_speculative_sampling_target_only"] = _tree_speculative_sampling_target_only_torch
+    sample = FunctionType(
+        original_sample.__code__,
+        sample_globals,
+        original_sample.__name__,
+        original_sample.__defaults__,
+        original_sample.__closure__,
+    )
+    sample.__kwdefaults__ = getattr(original_sample, "__kwdefaults__", None)
+    sample.__annotations__ = getattr(original_sample, "__annotations__", {}).copy()
+    return sample
+
+
 def _make_sglang_eagle_v2_sample_patch(original_sample, eagle_info_v2_module):
+    original_sample_with_target_sampling = _make_sglang_eagle_v2_original_sample_with_target_sampling(original_sample)
+
     @wraps(original_sample)
     def patched_sample(self, batch, logits_output, vocab_mask=None):
         if batch.forward_mode.is_idle() or batch.sampling_info.is_all_greedy:
@@ -503,6 +684,15 @@ def _make_sglang_eagle_v2_sample_patch(original_sample, eagle_info_v2_module):
         sampling_info = batch.sampling_info
         next_token_logits = logits_output.next_token_logits
         device = batch.input_ids.device
+        draft_probs = getattr(self, _VERL_EAGLE_DRAFT_PROBS_ATTR, None)
+        expected_draft_probs_shape = (bs, self.draft_token_num, next_token_logits.shape[-1])
+
+        if (
+            int(getattr(self, "topk", 0) or 0) != 1
+            or not torch.is_tensor(draft_probs)
+            or draft_probs.shape != expected_draft_probs_shape
+        ):
+            return original_sample_with_target_sampling(self, batch, logits_output, vocab_mask)
 
         if vocab_mask is not None:
             assert self.grammar is not None
@@ -515,26 +705,23 @@ def _make_sglang_eagle_v2_sample_patch(original_sample, eagle_info_v2_module):
         accept_length = torch.empty((bs,), dtype=torch.int32, device=device)
 
         target_probs = _target_probs_from_logits(next_token_logits, sampling_info, self.draft_token_num)
-        draft_probs = torch.empty((bs, 1, target_probs.shape[-1]), dtype=target_probs.dtype, device=device)
         coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
         coins_for_final_sampling = torch.rand((bs,), dtype=torch.float32, device=device)
         server_args = eagle_info_v2_module.get_global_server_args()
 
-        _tree_speculative_sampling_target_only_torch(
+        _tree_speculative_sampling_with_draft_probs_torch(
             predicts=predict,
             accept_index=accept_index,
             accept_token_num=accept_length,
             candidates=candidates.to(torch.int64),
             retrive_index=self.retrive_index.to(torch.int64),
             retrive_next_token=self.retrive_next_token.to(torch.int64),
-            retrive_next_sibling=self.retrive_next_sibling.to(torch.int64),
             uniform_samples=coins,
             uniform_samples_for_final_sampling=coins_for_final_sampling,
             target_probs=target_probs,
-            draft_probs=draft_probs,
+            draft_probs=draft_probs.to(device=device, dtype=target_probs.dtype),
             threshold_single=server_args.speculative_accept_threshold_single,
             threshold_acc=server_args.speculative_accept_threshold_acc,
-            deterministic=True,
         )
 
         simulate_acc_len = getattr(eagle_info_v2_module, "SIMULATE_ACC_LEN", -1)
@@ -555,6 +742,147 @@ def _make_sglang_eagle_v2_sample_patch(original_sample, eagle_info_v2_module):
     return patched_sample
 
 
+def _make_sglang_eagle_draft_patch(original_draft):
+    @wraps(original_draft)
+    def patched_draft(self, batch):
+        global _SGLANG_EAGLE_DRAFT_CONTEXT
+        draft_input = getattr(batch, "spec_info", None)
+        sampling_info = getattr(batch, "sampling_info", None)
+        previous_context = _SGLANG_EAGLE_DRAFT_CONTEXT
+        initial_draft_probs = getattr(draft_input, _VERL_EAGLE_DRAFT_PROBS_ATTR, None)
+        enabled = _should_sample_eagle_draft_tokens(sampling_info, getattr(self, "topk", None)) and torch.is_tensor(
+            initial_draft_probs
+        )
+        saved_cuda_graph_runner = getattr(self, "cuda_graph_runner", None) if enabled else None
+        draft_probs_list = [initial_draft_probs] if torch.is_tensor(initial_draft_probs) else []
+        if enabled:
+            _SGLANG_EAGLE_DRAFT_CONTEXT = {
+                "sampling_info": sampling_info,
+                "draft_probs": draft_probs_list,
+            }
+        if enabled and hasattr(self, "cuda_graph_runner"):
+            self.cuda_graph_runner = None
+        try:
+            verify_input = original_draft(self, batch)
+        finally:
+            if enabled and hasattr(self, "cuda_graph_runner"):
+                self.cuda_graph_runner = saved_cuda_graph_runner
+            _SGLANG_EAGLE_DRAFT_CONTEXT = previous_context
+
+        draft_token_num = int(
+            getattr(verify_input, "draft_token_num", getattr(self, "speculative_num_draft_tokens", 0))
+        )
+        draft_probs = (
+            _eagle_draft_probs_from_context({"draft_probs": draft_probs_list}, draft_token_num)
+            if enabled and draft_token_num > 0
+            else None
+        )
+        if torch.is_tensor(draft_probs) and verify_input is not None and draft_probs.shape[1] == draft_token_num:
+            setattr(verify_input, _VERL_EAGLE_DRAFT_PROBS_ATTR, draft_probs)
+        return verify_input
+
+    patched_draft._verl_patched_eagle_draft_probs = True
+    return patched_draft
+
+
+def _make_sglang_eagle_draft_extend_prefill_patch(original_method):
+    @wraps(original_method)
+    def patched_draft_extend_for_prefill(self, batch, *args, **kwargs):
+        global _SGLANG_EAGLE_DRAFT_CONTEXT
+        sampling_info = getattr(batch, "sampling_info", None)
+        enabled = _should_sample_eagle_draft_tokens(sampling_info, getattr(self, "topk", None))
+        previous_context = _SGLANG_EAGLE_DRAFT_CONTEXT
+        context = {"sampling_info": sampling_info, "draft_probs": []}
+        if enabled:
+            _SGLANG_EAGLE_DRAFT_CONTEXT = context
+        try:
+            next_draft_input = original_method(self, batch, *args, **kwargs)
+        finally:
+            _SGLANG_EAGLE_DRAFT_CONTEXT = previous_context
+
+        draft_probs = _eagle_draft_probs_from_context(context, 1) if enabled else None
+        if torch.is_tensor(draft_probs) and next_draft_input is not None:
+            setattr(next_draft_input, _VERL_EAGLE_DRAFT_PROBS_ATTR, draft_probs)
+        elif next_draft_input is not None:
+            _clear_eagle_draft_probs(next_draft_input)
+        return next_draft_input
+
+    patched_draft_extend_for_prefill._verl_patched_eagle_draft_probs = True
+    return patched_draft_extend_for_prefill
+
+
+def _make_sglang_eagle_draft_extend_decode_patch(original_method):
+    @wraps(original_method)
+    def patched_draft_extend_for_decode(self, batch, *args, **kwargs):
+        global _SGLANG_EAGLE_DRAFT_CONTEXT
+        sampling_info = getattr(batch, "sampling_info", None)
+        disable_graph = _should_sample_eagle_draft_tokens(sampling_info, getattr(self, "topk", None))
+        saved_cuda_graph_runner = getattr(self, "cuda_graph_runner_for_draft_extend", None) if disable_graph else None
+        previous_context = _SGLANG_EAGLE_DRAFT_CONTEXT
+        context = {"sampling_info": sampling_info, "draft_probs": []}
+        if disable_graph:
+            _SGLANG_EAGLE_DRAFT_CONTEXT = context
+        if disable_graph and hasattr(self, "cuda_graph_runner_for_draft_extend"):
+            self.cuda_graph_runner_for_draft_extend = None
+        try:
+            result = original_method(self, batch, *args, **kwargs)
+        finally:
+            if disable_graph and hasattr(self, "cuda_graph_runner_for_draft_extend"):
+                self.cuda_graph_runner_for_draft_extend = saved_cuda_graph_runner
+            _SGLANG_EAGLE_DRAFT_CONTEXT = previous_context
+
+        batch_result = args[0] if args else kwargs.get("batch_result")
+        next_draft_input = getattr(batch_result, "next_draft_input", None)
+        draft_probs = _eagle_draft_probs_from_context(context, 1) if disable_graph else None
+        if torch.is_tensor(draft_probs) and next_draft_input is not None:
+            setattr(next_draft_input, _VERL_EAGLE_DRAFT_PROBS_ATTR, draft_probs)
+        elif next_draft_input is not None:
+            _clear_eagle_draft_probs(next_draft_input)
+        return result
+
+    patched_draft_extend_for_decode._verl_patched_eagle_draft_probs = True
+    return patched_draft_extend_for_decode
+
+
+def _patch_sglang_eagle_draft_probs() -> list[str]:
+    module_name = "sglang.srt.speculative.eagle_worker_v2"
+    class_name = "EAGLEWorkerV2"
+    try:
+        module = importlib.import_module(module_name)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Skip SGLang EAGLE draft-probs patch for %s: %s", module_name, exc)
+        return []
+
+    cls = getattr(module, class_name, None)
+    if cls is None:
+        return []
+
+    patched_bits = []
+    original_fast_topk = getattr(module, "fast_topk", None)
+    if callable(original_fast_topk) and not getattr(original_fast_topk, "_verl_patched_eagle_draft_probs", False):
+        module.fast_topk = _make_sglang_eagle_fast_topk_patch(original_fast_topk)
+        patched_bits.append("fast_topk")
+
+    original_draft = getattr(cls, "draft", None)
+    if original_draft is not None and not getattr(original_draft, "_verl_patched_eagle_draft_probs", False):
+        cls.draft = _make_sglang_eagle_draft_patch(original_draft)
+        patched_bits.append("draft")
+
+    original_prefill = getattr(cls, "_draft_extend_for_prefill", None)
+    if original_prefill is not None and not getattr(original_prefill, "_verl_patched_eagle_draft_probs", False):
+        cls._draft_extend_for_prefill = _make_sglang_eagle_draft_extend_prefill_patch(original_prefill)
+        patched_bits.append("_draft_extend_for_prefill")
+
+    original_decode = getattr(cls, "_draft_extend_for_decode", None)
+    if original_decode is not None and not getattr(original_decode, "_verl_patched_eagle_draft_probs", False):
+        cls._draft_extend_for_decode = _make_sglang_eagle_draft_extend_decode_patch(original_decode)
+        patched_bits.append("_draft_extend_for_decode")
+
+    if not patched_bits:
+        return []
+    return [f"{module_name}.{class_name}({', '.join(patched_bits)})"]
+
+
 def patch_sglang_npu_eagle_target_sampling() -> None:
     """Patch SGLang NPU EAGLE verification to use target-distribution-preserving sampling."""
     global _SGLANG_NPU_EAGLE_SAMPLING_PATCHED
@@ -572,6 +900,8 @@ def patch_sglang_npu_eagle_target_sampling() -> None:
         patched_targets.append("sglang.srt.speculative.eagle_info")
     except Exception as exc:  # noqa: BLE001
         logger.debug("Skip SGLang EAGLE v1 target sampling patch: %s", exc)
+
+    patched_targets.extend(_patch_sglang_eagle_draft_probs())
 
     try:
         eagle_info_v2 = importlib.import_module("sglang.srt.speculative.eagle_info_v2")
