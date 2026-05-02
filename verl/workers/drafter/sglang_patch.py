@@ -39,6 +39,7 @@ _EAGLE_V2_VERIFY_MODE_ENV = "VERL_SGLANG_NPU_EAGLE_V2_VERIFY_MODE"
 _EAGLE_V1_TORCH_GREEDY_ENV = "VERL_SGLANG_NPU_EAGLE_V1_TORCH_GREEDY"
 _EAGLE_V1_TORCH_TOPK1_TREE_ENV = "VERL_SGLANG_NPU_EAGLE_V1_TORCH_TOPK1_TREE"
 _EAGLE_V1_FORCE_TARGET_TOKEN_ENV = "VERL_SGLANG_NPU_EAGLE_V1_FORCE_TARGET_TOKEN"
+_EAGLE_FORCE_TARGET_TOKEN_ENV = "VERL_SGLANG_NPU_EAGLE_FORCE_TARGET_TOKEN"
 
 _target_weight_loader: str | None = os.environ.get(_TARGET_WEIGHT_LOADER_ENV)
 _draft_weight_loader: str | None = os.environ.get(_DRAFT_WEIGHT_LOADER_ENV)
@@ -274,6 +275,13 @@ def _env_flag_enabled(name: str, default: bool) -> bool:
     return value.strip().lower() not in {"0", "false", "off", "no"}
 
 
+def _eagle_force_target_token_enabled() -> bool:
+    return _env_flag_enabled(_EAGLE_FORCE_TARGET_TOKEN_ENV, False) or _env_flag_enabled(
+        _EAGLE_V1_FORCE_TARGET_TOKEN_ENV,
+        False,
+    )
+
+
 def _renorm_probs_by_top_k_top_p(
     probs: torch.Tensor,
     top_ks: torch.Tensor,
@@ -483,6 +491,35 @@ def _tree_speculative_sampling_target_only_vectorized_torch(
     predicts.scatter_(dim=0, index=last_accepted_retrive_idx, src=final_token_ids.to(dtype=predicts.dtype))
 
 
+def _tree_speculative_sampling_force_target_token_torch(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    retrive_index: torch.Tensor,
+    uniform_samples_for_final_sampling: torch.Tensor,
+    target_probs: torch.Tensor,
+) -> None:
+    """Sample only the root target distribution for target-only isolation runs."""
+    del candidates
+
+    root_retrive_idx = retrive_index[:, 0].to(torch.long)
+    root_target_probs = target_probs[:, 0, :]
+    root_token_ids = _sample_from_probs_with_coin(
+        root_target_probs,
+        uniform_samples_for_final_sampling,
+    )
+
+    accept_index.fill_(-1)
+    accept_index[:, 0].copy_(root_retrive_idx.to(dtype=accept_index.dtype))
+    accept_token_num.zero_()
+    predicts.scatter_(
+        dim=0,
+        index=root_retrive_idx,
+        src=root_token_ids.to(dtype=predicts.dtype),
+    )
+
+
 def _tree_speculative_sampling_target_only_torch(
     predicts: torch.Tensor,
     accept_index: torch.Tensor,
@@ -499,6 +536,18 @@ def _tree_speculative_sampling_target_only_torch(
     threshold_acc: float = 1.0,
     deterministic: bool = True,
 ) -> None:
+    if _eagle_force_target_token_enabled():
+        _tree_speculative_sampling_force_target_token_torch(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates,
+            retrive_index=retrive_index,
+            uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
+            target_probs=target_probs,
+        )
+        return
+
     if _try_sglang_tree_speculative_sampling_kernel(
         predicts=predicts,
         accept_index=accept_index,
@@ -646,7 +695,7 @@ def _make_verify_tree_greedy_func_patch(original_verify_tree_greedy_func):
         topk: int = -1,
     ):
         if (
-            _env_flag_enabled(_EAGLE_V1_FORCE_TARGET_TOKEN_ENV, False)
+            _eagle_force_target_token_enabled()
             and candidates.dim() == 2
             and target_predict.numel() == candidates.numel()
         ):
@@ -822,7 +871,10 @@ def _make_build_tree_kernel_efficient_topk1_patch(original_build_tree_kernel_eff
         position_buf: torch.Tensor | None = None,
     ):
         if (
-            _env_flag_enabled(_EAGLE_V1_TORCH_TOPK1_TREE_ENV, False)
+            (
+                _env_flag_enabled(_EAGLE_V1_TORCH_TOPK1_TREE_ENV, False)
+                or _eagle_force_target_token_enabled()
+            )
             and int(topk) == 1
             and int(tree_mask_mode) in {0, 1}
         ):
@@ -865,6 +917,15 @@ def _make_sglang_eagle_v2_sample_patch(original_sample):
     sample_globals["top_k_renorm_prob"] = _top_k_renorm_prob_torch
     sample_globals["top_p_renorm_prob"] = _top_p_renorm_prob_torch
     sample_globals["tree_speculative_sampling_target_only"] = _tree_speculative_sampling_target_only_torch
+    try:
+        eagle_utils = importlib.import_module("sglang.srt.speculative.eagle_utils")
+        sample_globals["verify_tree_greedy_func"] = getattr(
+            eagle_utils,
+            "verify_tree_greedy_func",
+            sample_globals.get("verify_tree_greedy_func"),
+        )
+    except Exception:  # noqa: BLE001
+        pass
     sample = FunctionType(
         original_sample.__code__,
         sample_globals,
@@ -922,11 +983,11 @@ def patch_sglang_npu_eagle_target_sampling() -> None:
 
     if patched_targets:
         _SGLANG_NPU_EAGLE_SAMPLING_PATCHED = True
-        logger.info("Patched SGLang NPU EAGLE target sampling for %s", ", ".join(patched_targets))
+        logger.warning("Patched SGLang NPU EAGLE target sampling for %s", ", ".join(patched_targets))
 
 
 def patch_sglang_npu_eagle_v1_greedy_path() -> None:
-    """Patch SGLang NPU EAGLE v1 topk=1 greedy helpers for transparency diagnostics."""
+    """Patch SGLang NPU EAGLE topk=1 greedy/tree helpers for diagnostics."""
     global _SGLANG_NPU_EAGLE_GREEDY_PATCHED
     if _SGLANG_NPU_EAGLE_GREEDY_PATCHED or not _is_sglang_npu_backend():
         return
@@ -979,6 +1040,21 @@ def patch_sglang_npu_eagle_v1_greedy_path() -> None:
         logger.debug("Skip SGLang EAGLE v1 greedy verify binding patch: %s", exc)
 
     try:
+        eagle_info_v2 = importlib.import_module("sglang.srt.speculative.eagle_info_v2")
+        patched_verify = getattr(
+            importlib.import_module("sglang.srt.speculative.eagle_utils"),
+            "verify_tree_greedy_func",
+            None,
+        )
+        if patched_verify is not None:
+            eagle_info_v2.verify_tree_greedy_func = patched_verify
+            patched_targets.append(
+                "sglang.srt.speculative.eagle_info_v2.verify_tree_greedy_func"
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Skip SGLang EAGLE v2 greedy verify binding patch: %s", exc)
+
+    try:
         eagle_worker = importlib.import_module("sglang.srt.speculative.eagle_worker")
         patched_build_tree = getattr(
             importlib.import_module("sglang.srt.speculative.eagle_utils"),
@@ -993,10 +1069,25 @@ def patch_sglang_npu_eagle_v1_greedy_path() -> None:
     except Exception as exc:  # noqa: BLE001
         logger.debug("Skip SGLang EAGLE v1 tree builder binding patch: %s", exc)
 
+    try:
+        eagle_worker_v2 = importlib.import_module("sglang.srt.speculative.eagle_worker_v2")
+        patched_build_tree = getattr(
+            importlib.import_module("sglang.srt.speculative.eagle_utils"),
+            "build_tree_kernel_efficient",
+            None,
+        )
+        if patched_build_tree is not None:
+            eagle_worker_v2.build_tree_kernel_efficient = patched_build_tree
+            patched_targets.append(
+                "sglang.srt.speculative.eagle_worker_v2.build_tree_kernel_efficient"
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Skip SGLang EAGLE v2 tree builder binding patch: %s", exc)
+
     if patched_targets:
         _SGLANG_NPU_EAGLE_GREEDY_PATCHED = True
-        logger.info(
-            "Patched SGLang NPU EAGLE v1 greedy path for %s",
+        logger.warning(
+            "Patched SGLang NPU EAGLE greedy/tree path for %s",
             ", ".join(patched_targets),
         )
 

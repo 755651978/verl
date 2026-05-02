@@ -61,6 +61,8 @@ logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
 visible_devices_keyword = get_visible_devices_keyword()
+_DEBUG_OUTPUT_TOKENS_ENV = "VERL_SGLANG_DEBUG_OUTPUT_TOKENS"
+_DEBUG_OUTPUT_TOKENS_LIMIT_ENV = "VERL_SGLANG_DEBUG_OUTPUT_TOKENS_LIMIT"
 
 
 def _top_logprobs_to_tensor(top_logprobs: list, topk: int) -> Optional[torch.Tensor]:
@@ -626,6 +628,20 @@ class SGLangHttpServer:
         else:
             token_ids = output["output_ids"]
             log_probs = None
+
+        if os.getenv(_DEBUG_OUTPUT_TOKENS_ENV, "").strip().lower() not in {"", "0", "false", "off", "no"}:
+            limit = int(os.getenv(_DEBUG_OUTPUT_TOKENS_LIMIT_ENV, "8"))
+            head = list(token_ids[:limit])
+            tail = list(token_ids[-limit:]) if len(token_ids) > limit else []
+            logger.warning(
+                "[SGLangOutputDebug] rid=%s prompt_len=%s output_len=%s stop=%s head=%s tail=%s",
+                request_id,
+                len(prompt_ids),
+                len(token_ids),
+                finish_reason,
+                head,
+                tail,
+            )
 
         routed_experts = None
         if self.config.enable_rollout_routing_replay:
