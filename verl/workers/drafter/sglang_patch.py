@@ -36,15 +36,6 @@ _EAGLE_VERIFY_MODE_ENV = "VERL_SGLANG_NPU_EAGLE_VERIFY_MODE"
 _EAGLE_V1_TARGET_SAMPLING_ENV = "VERL_SGLANG_NPU_EAGLE_V1_TARGET_SAMPLING"
 _EAGLE_V1_VERIFY_MODE_ENV = "VERL_SGLANG_NPU_EAGLE_V1_VERIFY_MODE"
 _EAGLE_V2_VERIFY_MODE_ENV = "VERL_SGLANG_NPU_EAGLE_V2_VERIFY_MODE"
-_EAGLE_V1_FORCE_TARGET_TOKEN_ENV = "VERL_SGLANG_NPU_EAGLE_V1_FORCE_TARGET_TOKEN"
-_EAGLE_FORCE_TARGET_TOKEN_ENV = "VERL_SGLANG_NPU_EAGLE_FORCE_TARGET_TOKEN"
-_EAGLE_V1_BYPASS_DECODE_ENV = "VERL_SGLANG_NPU_EAGLE_V1_BYPASS_DECODE"
-_EAGLE_ROOT_DEBUG_ENV = "VERL_SGLANG_NPU_EAGLE_DEBUG_ROOT"
-_EAGLE_ROOT_DEBUG_LIMIT_ENV = "VERL_SGLANG_NPU_EAGLE_DEBUG_ROOT_LIMIT"
-_EAGLE_STATE_DEBUG_ENV = "VERL_SGLANG_EAGLE_STATE_DEBUG"
-_EAGLE_STATE_DEBUG_UPDATE_LIMIT_ENV = "VERL_SGLANG_EAGLE_STATE_DEBUG_UPDATE_LIMIT"
-_EAGLE_V1_DECODE_DEBUG_ENV = "VERL_SGLANG_EAGLE_V1_DECODE_DEBUG"
-_EAGLE_V1_DECODE_DEBUG_LIMIT_ENV = "VERL_SGLANG_EAGLE_V1_DECODE_DEBUG_LIMIT"
 
 _target_weight_loader: str | None = os.environ.get(_TARGET_WEIGHT_LOADER_ENV)
 _draft_weight_loader: str | None = os.environ.get(_DRAFT_WEIGHT_LOADER_ENV)
@@ -58,9 +49,6 @@ _SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED = False
 _SGLANG_SCHEDULER_PROCESS_PATCHED = False
 _SCHEDULER_PROCESS_PATCH_ATTR = "_verl_patched_scheduler_process"
 _SGLANG_TOP_K_ALL = 1 << 30
-_EAGLE_ROOT_DEBUG_COUNTER = 0
-_EAGLE_STATE_DEBUG_UPDATE_COUNTER = 0
-_EAGLE_V1_DECODE_DEBUG_COUNTER = 0
 
 
 def configure_sglang_eagle_weight_update_patch(
@@ -120,101 +108,6 @@ def _get_sglang_target_runner(worker):
     return None
 
 
-def _state_debug_enabled() -> bool:
-    return _env_flag_enabled(_EAGLE_STATE_DEBUG_ENV, False)
-
-
-def _runner_debug_summary(runner) -> str:
-    if runner is None:
-        return "missing"
-
-    model = getattr(runner, "model", None)
-    model_config = getattr(runner, "model_config", None)
-    hf_config = getattr(model_config, "hf_config", None)
-    if hf_config is None:
-        hf_config = getattr(model, "config", None)
-
-    fields = [
-        f"runner={type(runner).__name__}",
-        f"model={type(model).__name__ if model is not None else 'missing'}",
-    ]
-    for name in ("tp_rank", "rank"):
-        value = getattr(runner, name, None)
-        if value is not None:
-            fields.append(f"{name}={value}")
-            break
-    for name in ("model_path", "path"):
-        value = getattr(model_config, name, None)
-        if value is not None:
-            fields.append(f"{name}={value}")
-            break
-    if hf_config is not None:
-        architectures = getattr(hf_config, "architectures", None)
-        if architectures:
-            fields.append(f"architectures={architectures}")
-        for name in ("vocab_size", "draft_vocab_size", "hidden_size"):
-            value = getattr(hf_config, name, None)
-            if value is not None:
-                fields.append(f"{name}={value}")
-    return " ".join(fields)
-
-
-def _maybe_log_eagle_weight_update_state(
-    worker,
-    recv_req,
-    *,
-    target_weight_loader: str | None,
-    draft_weight_loader: str | None,
-    target_only: bool,
-    draft_only: bool,
-    disable_draft_model: bool,
-    disable_target_model: bool,
-    tp_rank: int | None = None,
-    named_tensors=None,
-) -> None:
-    global _EAGLE_STATE_DEBUG_UPDATE_COUNTER
-
-    if not _state_debug_enabled():
-        return
-
-    try:
-        call_limit = int(os.getenv(_EAGLE_STATE_DEBUG_UPDATE_LIMIT_ENV, "16"))
-    except ValueError:
-        call_limit = 16
-    if _EAGLE_STATE_DEBUG_UPDATE_COUNTER >= call_limit:
-        return
-
-    _EAGLE_STATE_DEBUG_UPDATE_COUNTER += 1
-    load_format = getattr(recv_req, "load_format", None)
-    serialized_named_tensors = getattr(recv_req, "serialized_named_tensors", None)
-    first_names = []
-    if named_tensors is not None:
-        try:
-            first_names = [name for name, _ in list(named_tensors)[:3]]
-        except Exception:  # noqa: BLE001
-            first_names = []
-
-    logger.warning(
-        "[SGLangEagleStateDebug] update call=%s worker=%s tp_rank=%s load_format=%s "
-        "target_loader_match=%s draft_loader_match=%s disable_draft=%s disable_target=%s "
-        "num_serialized_shards=%s num_tensors=%s first_names=%s "
-        "target_runner={%s} draft_runner={%s}",
-        _EAGLE_STATE_DEBUG_UPDATE_COUNTER,
-        type(worker).__name__,
-        tp_rank,
-        load_format,
-        target_only,
-        draft_only,
-        disable_draft_model,
-        disable_target_model,
-        len(serialized_named_tensors) if serialized_named_tensors is not None else None,
-        len(named_tensors) if named_tensors is not None else None,
-        first_names,
-        _runner_debug_summary(_get_sglang_target_runner(worker)),
-        _runner_debug_summary(_get_sglang_draft_runner(worker)),
-    )
-
-
 def _make_verl_eagle_update_weights_patch(original_update_weights):
     @wraps(original_update_weights)
     def patched_update_weights_from_tensor(self, recv_req):
@@ -224,19 +117,6 @@ def _make_verl_eagle_update_weights_patch(original_update_weights):
         draft_only = draft_weight_loader is not None and load_format == draft_weight_loader
         disable_draft_model = bool(getattr(recv_req, "disable_draft_model", False)) or target_only
         disable_target_model = bool(getattr(recv_req, "disable_target_model", False)) or draft_only
-        should_log_state = _state_debug_enabled()
-
-        if should_log_state:
-            _maybe_log_eagle_weight_update_state(
-                self,
-                recv_req,
-                target_weight_loader=target_weight_loader,
-                draft_weight_loader=draft_weight_loader,
-                target_only=target_only,
-                draft_only=draft_only,
-                disable_draft_model=disable_draft_model,
-                disable_target_model=disable_target_model,
-            )
 
         if not (disable_draft_model or disable_target_model):
             return original_update_weights(self, recv_req)
@@ -260,19 +140,6 @@ def _make_verl_eagle_update_weights_patch(original_update_weights):
 
         monkey_patch_torch_reductions()
         named_tensors = MultiprocessingSerializer.deserialize(serialized_named_tensors[tp_rank])
-        if should_log_state:
-            _maybe_log_eagle_weight_update_state(
-                self,
-                recv_req,
-                target_weight_loader=target_weight_loader,
-                draft_weight_loader=draft_weight_loader,
-                target_only=target_only,
-                draft_only=draft_only,
-                disable_draft_model=disable_draft_model,
-                disable_target_model=disable_target_model,
-                tp_rank=tp_rank,
-                named_tensors=named_tensors,
-            )
 
         # The verl-only custom loaders are route markers. After EAGLEWorker
         # selects the correct side, let that model runner use its normal loader.
@@ -397,212 +264,64 @@ def _sglang_npu_eagle_v2_verify_mode() -> str:
     return _sglang_npu_eagle_verify_mode(_EAGLE_V2_VERIFY_MODE_ENV)
 
 
-def _env_flag_enabled(name: str, default: bool) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() not in {"0", "false", "off", "no"}
-
-
-def _eagle_force_target_token_enabled() -> bool:
-    return _env_flag_enabled(_EAGLE_FORCE_TARGET_TOKEN_ENV, False) or _env_flag_enabled(
-        _EAGLE_V1_FORCE_TARGET_TOKEN_ENV,
-        False,
+def _eagle_v1_accepted_tail_indices(accept_length_cpu, device: torch.device) -> torch.Tensor | None:
+    if not accept_length_cpu:
+        return None
+    lengths = torch.tensor(
+        [int(accept_len) + 1 for accept_len in accept_length_cpu],
+        dtype=torch.long,
+        device=device,
     )
+    if lengths.numel() == 0:
+        return None
+    return torch.cumsum(lengths, dim=0) - 1
 
 
-def _debug_tensor_head(tensor: torch.Tensor, limit: int) -> list:
-    return tensor.detach().reshape(-1)[:limit].to("cpu").tolist()
-
-
-def _maybe_log_eagle_root_debug(kind: str, token_ids: torch.Tensor, **tensors: torch.Tensor) -> None:
-    global _EAGLE_ROOT_DEBUG_COUNTER
-
-    if not _env_flag_enabled(_EAGLE_ROOT_DEBUG_ENV, False):
+def _trim_eagle_v1_draft_input_to_request_tails(draft_input) -> None:
+    """Keep only per-request tail state after v1 draft-extend over accepted spans."""
+    verified_id = getattr(draft_input, "verified_id", None)
+    if not torch.is_tensor(verified_id):
         return
 
-    try:
-        call_limit = int(os.getenv(_EAGLE_ROOT_DEBUG_LIMIT_ENV, "8"))
-    except ValueError:
-        call_limit = 8
-    if _EAGLE_ROOT_DEBUG_COUNTER >= call_limit:
+    batch_size = int(verified_id.numel())
+    if batch_size == 0:
         return
 
-    _EAGLE_ROOT_DEBUG_COUNTER += 1
-    head_limit = min(8, max(1, token_ids.numel()))
-    parts = [f"tokens={_debug_tensor_head(token_ids, head_limit)}"]
-    for name, tensor in tensors.items():
-        parts.append(f"{name}={_debug_tensor_head(tensor, head_limit)}")
-    logger.warning(
-        "[SGLangEagleRootDebug] kind=%s call=%s %s",
-        kind,
-        _EAGLE_ROOT_DEBUG_COUNTER,
-        " ".join(parts),
-    )
+    accept_length_cpu = getattr(draft_input, "accept_length_cpu", None)
+    tail_indices = _eagle_v1_accepted_tail_indices(accept_length_cpu, verified_id.device)
+    if tail_indices is None:
+        return
 
+    total_accepted = int(tail_indices[-1].item()) + 1
+    if total_accepted == batch_size:
+        return
 
-def _eagle_v1_decode_debug_enabled() -> bool:
-    return _env_flag_enabled(_EAGLE_V1_DECODE_DEBUG_ENV, False)
-
-
-def _take_eagle_v1_decode_debug_slot(force: bool = False) -> int | None:
-    global _EAGLE_V1_DECODE_DEBUG_COUNTER
-
-    if not _eagle_v1_decode_debug_enabled():
-        return None
-    try:
-        call_limit = int(os.getenv(_EAGLE_V1_DECODE_DEBUG_LIMIT_ENV, "16"))
-    except ValueError:
-        call_limit = 16
-    if not force and _EAGLE_V1_DECODE_DEBUG_COUNTER >= call_limit:
-        return None
-
-    _EAGLE_V1_DECODE_DEBUG_COUNTER += 1
-    return _EAGLE_V1_DECODE_DEBUG_COUNTER
-
-
-def _debug_shape(value) -> tuple | None:
-    return tuple(value.shape) if torch.is_tensor(value) else None
-
-
-def _tensor_has_zero(value) -> bool:
-    return torch.is_tensor(value) and value.numel() > 0 and bool(torch.any(value == 0).item())
-
-
-def _debug_req_output_entries(batch, limit: int = 8, max_reqs: int = 2) -> list[dict]:
-    entries = []
-    seen_indices = set()
-    reqs = list(getattr(batch, "reqs", []) or [])
-    for i, req in enumerate(reqs):
-        output_ids = getattr(req, "output_ids", []) or []
-        has_zero = any(int(token_id) == 0 for token_id in output_ids[-limit:])
-        if i >= max_reqs and not has_zero:
+    for attr_name in ("topk_p", "topk_index", "hidden_states"):
+        value = getattr(draft_input, attr_name, None)
+        if not torch.is_tensor(value) or value.shape[0] == batch_size:
             continue
-        seen_indices.add(i)
-        entries.append(
-            {
-                "i": i,
-                "rid": getattr(req, "rid", None),
-                "len": len(output_ids),
-                "tail": [int(token_id) for token_id in output_ids[-limit:]],
-                "tail_has_zero": has_zero,
-            }
-        )
-    return entries
-
-
-def _batch_tail_has_zero(batch, limit: int = 8) -> bool:
-    for req in getattr(batch, "reqs", []) or []:
-        output_ids = getattr(req, "output_ids", []) or []
-        if any(int(token_id) == 0 for token_id in output_ids[-limit:]):
-            return True
-    return False
-
-
-def _log_eagle_v1_worker_debug(stage: str, batch, result=None) -> None:
-    force = _batch_tail_has_zero(batch) or _tensor_has_zero(getattr(result, "next_token_ids", None))
-    call = _take_eagle_v1_decode_debug_slot(force=force)
-    if call is None:
-        return
-
-    spec_info = getattr(batch, "spec_info", None)
-    logger.warning(
-        "[SGLangEagleV1DecodeDebug] stage=%s call=%s forward_mode=%s batch_size=%s "
-        "input_ids_shape=%s output_ids_shape=%s out_cache_loc_shape=%s seq_lens=%s "
-        "spec=%s verified_shape=%s accept_cpu=%s req_entries=%s result_next=%s result_accept=%s force=%s",
-        stage,
-        call,
-        getattr(batch, "forward_mode", None),
-        batch.batch_size() if hasattr(batch, "batch_size") else None,
-        _debug_shape(getattr(batch, "input_ids", None)),
-        _debug_shape(getattr(batch, "output_ids", None)),
-        _debug_shape(getattr(batch, "out_cache_loc", None)),
-        _debug_tensor_head(getattr(batch, "seq_lens", torch.empty(0)), 8)
-        if torch.is_tensor(getattr(batch, "seq_lens", None))
-        else None,
-        type(spec_info).__name__ if spec_info is not None else None,
-        _debug_shape(getattr(spec_info, "verified_id", None)),
-        getattr(spec_info, "accept_length_cpu", None),
-        _debug_req_output_entries(batch),
-        _debug_tensor_head(getattr(result, "next_token_ids", torch.empty(0)), 8)
-        if result is not None and torch.is_tensor(getattr(result, "next_token_ids", None))
-        else None,
-        getattr(result, "accept_length_per_req_cpu", None) if result is not None else None,
-        force,
-    )
-
-
-def _make_eagle_verify_input_debug_patch(original_verify):
-    @wraps(original_verify)
-    def patched_verify(self, batch, logits_output, *args, **kwargs):
-        if not _eagle_v1_decode_debug_enabled():
-            return original_verify(self, batch, logits_output, *args, **kwargs)
-
-        next_token_logits = getattr(logits_output, "next_token_logits", None)
-        root_top_ids = root_top_vals = root_finite = None
-        if torch.is_tensor(next_token_logits):
-            try:
-                bs = int(self.retrive_index.shape[0])
-                draft_token_num = int(self.draft_token_num)
-                root_logits = next_token_logits.reshape(bs, draft_token_num, -1)[:, 0, :]
-                root_top_vals, root_top_ids = torch.max(root_logits, dim=-1)
-                root_finite = torch.isfinite(root_logits).all(dim=-1)
-            except Exception:  # noqa: BLE001
-                root_top_ids = root_top_vals = root_finite = None
-
-        before_force = _tensor_has_zero(root_top_ids) or _batch_tail_has_zero(batch)
-        before_call = _take_eagle_v1_decode_debug_slot(force=before_force)
-        if before_call is not None:
+        if value.shape[0] < total_accepted:
             logger.warning(
-                "[SGLangEagleV1DecodeDebug] stage=verify_before call=%s bs=%s "
-                "draft_token_num=%s topk=%s spec_steps=%s logits_shape=%s "
-                "draft_head=%s retrive0=%s root_top=%s root_top_val=%s root_finite=%s "
-                "req_entries=%s force=%s",
-                before_call,
-                getattr(self.retrive_index, "shape", [None])[0],
-                getattr(self, "draft_token_num", None),
-                getattr(self, "topk", None),
-                getattr(self, "spec_steps", None),
-                _debug_shape(next_token_logits),
-                _debug_tensor_head(getattr(self, "draft_token", torch.empty(0)), 12),
-                _debug_tensor_head(getattr(self, "retrive_index", torch.empty(0))[0], 12)
-                if torch.is_tensor(getattr(self, "retrive_index", None))
-                and self.retrive_index.numel() > 0
-                else None,
-                _debug_tensor_head(root_top_ids, 8) if torch.is_tensor(root_top_ids) else None,
-                _debug_tensor_head(root_top_vals, 8) if torch.is_tensor(root_top_vals) else None,
-                _debug_tensor_head(root_finite, 8) if torch.is_tensor(root_finite) else None,
-                _debug_req_output_entries(batch),
-                before_force,
+                "[SGLangEagleV1StatePatch] skip trimming %s: rows=%s expected_at_least=%s",
+                attr_name,
+                value.shape[0],
+                total_accepted,
             )
-
-        result = original_verify(self, batch, logits_output, *args, **kwargs)
-        after_force = (
-            _tensor_has_zero(getattr(result, "verified_id", None))
-            or _tensor_has_zero(getattr(result, "accepted_indices", None))
-            or _batch_tail_has_zero(batch)
+            continue
+        setattr(
+            draft_input,
+            attr_name,
+            value.index_select(0, tail_indices.to(value.device)).contiguous(),
         )
-        after_call = _take_eagle_v1_decode_debug_slot(force=after_force)
-        if after_call is not None:
-            logger.warning(
-                "[SGLangEagleV1DecodeDebug] stage=verify_after call=%s verified=%s "
-                "accept_cpu=%s accepted_indices=%s req_entries=%s hidden_shape=%s force=%s",
-                after_call,
-                _debug_tensor_head(getattr(result, "verified_id", torch.empty(0)), 12)
-                if result is not None and torch.is_tensor(getattr(result, "verified_id", None))
-                else None,
-                getattr(result, "accept_length_per_req_cpu", None) if result is not None else None,
-                _debug_tensor_head(getattr(result, "accepted_indices", torch.empty(0)), 16)
-                if result is not None and torch.is_tensor(getattr(result, "accepted_indices", None))
-                else None,
-                _debug_req_output_entries(batch),
-                _debug_shape(getattr(getattr(result, "draft_input", None), "hidden_states", None)),
-                after_force,
-            )
-        return result
 
-    patched_verify._verl_patched_npu_eagle_v1_decode_debug = True
-    return patched_verify
+
+def _repair_eagle_v1_post_draft_extend_state(batch) -> None:
+    draft_input = getattr(batch, "spec_info", None)
+    _trim_eagle_v1_draft_input_to_request_tails(draft_input)
+
+    verified_id = getattr(draft_input, "verified_id", None)
+    if torch.is_tensor(verified_id) and verified_id.numel() > 0:
+        batch.input_ids = verified_id
 
 
 def _renorm_probs_by_top_k_top_p(
@@ -814,44 +533,6 @@ def _tree_speculative_sampling_target_only_vectorized_torch(
     predicts.scatter_(dim=0, index=last_accepted_retrive_idx, src=final_token_ids.to(dtype=predicts.dtype))
 
 
-def _tree_speculative_sampling_force_target_token_torch(
-    predicts: torch.Tensor,
-    accept_index: torch.Tensor,
-    accept_token_num: torch.Tensor,
-    candidates: torch.Tensor,
-    retrive_index: torch.Tensor,
-    uniform_samples_for_final_sampling: torch.Tensor,
-    target_probs: torch.Tensor,
-) -> None:
-    """Sample only the root target distribution for target-only isolation runs."""
-    del candidates
-
-    root_retrive_idx = retrive_index[:, 0].to(torch.long)
-    root_target_probs = target_probs[:, 0, :]
-    root_token_ids = _sample_from_probs_with_coin(
-        root_target_probs,
-        uniform_samples_for_final_sampling,
-    )
-    if _env_flag_enabled(_EAGLE_ROOT_DEBUG_ENV, False):
-        root_prob_max, root_prob_top1 = torch.max(root_target_probs, dim=-1)
-        _maybe_log_eagle_root_debug(
-            "target_only_force_root",
-            root_token_ids,
-            top1=root_prob_top1,
-            prob_sum=root_target_probs.sum(dim=-1),
-            prob_max=root_prob_max,
-        )
-
-    accept_index.fill_(-1)
-    accept_index[:, 0].copy_(root_retrive_idx.to(dtype=accept_index.dtype))
-    accept_token_num.zero_()
-    predicts.scatter_(
-        dim=0,
-        index=root_retrive_idx,
-        src=root_token_ids.to(dtype=predicts.dtype),
-    )
-
-
 def _tree_speculative_sampling_target_only_torch(
     predicts: torch.Tensor,
     accept_index: torch.Tensor,
@@ -868,18 +549,6 @@ def _tree_speculative_sampling_target_only_torch(
     threshold_acc: float = 1.0,
     deterministic: bool = True,
 ) -> None:
-    if _eagle_force_target_token_enabled():
-        _tree_speculative_sampling_force_target_token_torch(
-            predicts=predicts,
-            accept_index=accept_index,
-            accept_token_num=accept_token_num,
-            candidates=candidates,
-            retrive_index=retrive_index,
-            uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
-            target_probs=target_probs,
-        )
-        return
-
     if _try_sglang_tree_speculative_sampling_kernel(
         predicts=predicts,
         accept_index=accept_index,
@@ -915,128 +584,15 @@ def _tree_speculative_sampling_target_only_torch(
     )
 
 
-def _verify_tree_greedy_force_target_token_torch(
-    predicts: torch.Tensor,
-    accept_index: torch.Tensor,
-    accept_token_num: torch.Tensor,
-    candidates: torch.Tensor,
-    retrive_index: torch.Tensor,
-    retrive_next_token: torch.Tensor,
-    retrive_next_sibling: torch.Tensor,
-    target_predict: torch.Tensor,
-    topk: int = -1,
-):
-    """Accept only the target prediction at the root node for isolation runs."""
-    del retrive_next_token, retrive_next_sibling, topk
-
-    batch_size, num_draft_tokens = candidates.shape
-    if num_draft_tokens == 0:
-        return predicts, accept_index, accept_token_num
-
-    target_predict = target_predict.reshape(batch_size, num_draft_tokens)
-    root_indices = retrive_index[:, 0].to(device=candidates.device, dtype=torch.long)
-    _maybe_log_eagle_root_debug(
-        "greedy_force_root",
-        target_predict[:, 0],
-        candidate0=candidates[:, 0],
-    )
-
-    accept_index.fill_(-1)
-    accept_index[:, 0].copy_(root_indices.to(dtype=accept_index.dtype))
-    accept_token_num.zero_()
-    predicts.scatter_(
-        dim=0,
-        index=root_indices,
-        src=target_predict[:, 0].to(dtype=predicts.dtype),
-    )
-    return predicts, accept_index, accept_token_num
-
-
-def _make_verify_tree_greedy_func_patch(original_verify_tree_greedy_func):
-    @wraps(original_verify_tree_greedy_func)
-    def patched_verify_tree_greedy_func(
-        predicts: torch.Tensor,
-        accept_index: torch.Tensor,
-        accept_token_num: torch.Tensor,
-        candidates: torch.Tensor,
-        retrive_index: torch.Tensor,
-        retrive_next_token: torch.Tensor,
-        retrive_next_sibling: torch.Tensor,
-        target_predict: torch.Tensor,
-        topk: int = -1,
-    ):
-        if (
-            _eagle_force_target_token_enabled()
-            and candidates.dim() == 2
-            and target_predict.numel() == candidates.numel()
-        ):
-            return _verify_tree_greedy_force_target_token_torch(
-                predicts=predicts,
-                accept_index=accept_index,
-                accept_token_num=accept_token_num,
-                candidates=candidates,
-                retrive_index=retrive_index,
-                retrive_next_token=retrive_next_token,
-                retrive_next_sibling=retrive_next_sibling,
-                target_predict=target_predict,
-                topk=topk,
-            )
-        return original_verify_tree_greedy_func(
-            predicts=predicts,
-            accept_index=accept_index,
-            accept_token_num=accept_token_num,
-            candidates=candidates,
-            retrive_index=retrive_index,
-            retrive_next_token=retrive_next_token,
-            retrive_next_sibling=retrive_next_sibling,
-            target_predict=target_predict,
-            topk=topk,
-        )
-
-    patched_verify_tree_greedy_func._verl_patched_npu_eagle_greedy = True
-    return patched_verify_tree_greedy_func
-
-
-def _make_eagle_v1_bypass_decode_patch(original_forward_batch_generation):
-    @wraps(original_forward_batch_generation)
-    def patched_forward_batch_generation(self, batch):
-        _log_eagle_v1_worker_debug("worker_before", batch)
-        if (
-            _env_flag_enabled(_EAGLE_V1_BYPASS_DECODE_ENV, False)
-            and not batch.forward_mode.is_extend()
-            and not batch.is_extend_in_batch
-        ):
-            from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-
-            spec_info_backup = batch.spec_info
-            spec_algorithm_backup = batch.spec_algorithm
-            return_hidden_states_backup = batch.return_hidden_states
-            try:
-                batch.spec_info = None
-                batch.spec_algorithm = SpeculativeAlgorithm.NONE
-                # Scheduler.prepare_for_decode returns early for spec v1 batches.
-                # Re-run it here with speculative disabled so the target worker
-                # receives a normal decode batch with one input token per request.
-                if getattr(batch, "output_ids", None) is not None:
-                    batch.prepare_for_decode()
-                batch.return_hidden_states = False
-                model_worker_batch = batch.get_model_worker_batch()
-                result = self.target_worker.forward_batch_generation(model_worker_batch)
-                result.num_accepted_tokens = 0
-                result.accept_length_per_req_cpu = [0] * batch.batch_size()
-                _log_eagle_v1_worker_debug("worker_bypass_after", batch, result)
-                return result
-            finally:
-                batch.spec_info = spec_info_backup
-                batch.spec_algorithm = spec_algorithm_backup
-                batch.return_hidden_states = return_hidden_states_backup
-
-        result = original_forward_batch_generation(self, batch)
-        _log_eagle_v1_worker_debug("worker_after", batch, result)
+def _make_eagle_v1_draft_extend_state_patch(original_forward_draft_extend_after_decode):
+    @wraps(original_forward_draft_extend_after_decode)
+    def patched_forward_draft_extend_after_decode(self, batch):
+        result = original_forward_draft_extend_after_decode(self, batch)
+        _repair_eagle_v1_post_draft_extend_state(batch)
         return result
 
-    patched_forward_batch_generation._verl_patched_npu_eagle_v1_bypass_decode = True
-    return patched_forward_batch_generation
+    patched_forward_draft_extend_after_decode._verl_patched_npu_eagle_v1_state_repair = True
+    return patched_forward_draft_extend_after_decode
 
 
 def _make_sglang_eagle_v2_sample_patch(original_sample):
@@ -1115,105 +671,39 @@ def patch_sglang_npu_eagle_target_sampling() -> None:
 
 
 def patch_sglang_npu_eagle_v1_greedy_path() -> None:
-    """Patch SGLang NPU EAGLE greedy verify only for root-token diagnostics."""
+    """Patch SGLang NPU EAGLE v1 multi-round state advancement."""
     global _SGLANG_NPU_EAGLE_GREEDY_PATCHED
     if _SGLANG_NPU_EAGLE_GREEDY_PATCHED or not _is_sglang_npu_backend():
         return
 
     patched_targets = []
     try:
-        eagle_utils = importlib.import_module("sglang.srt.speculative.eagle_utils")
-        original_verify = getattr(eagle_utils, "verify_tree_greedy_func", None)
-        if original_verify is not None and not getattr(
-            original_verify,
-            "_verl_patched_npu_eagle_greedy",
-            False,
-        ):
-            patched_verify = _make_verify_tree_greedy_func_patch(original_verify)
-            eagle_utils.verify_tree_greedy_func = patched_verify
-            patched_targets.append(
-                "sglang.srt.speculative.eagle_utils.verify_tree_greedy_func"
-            )
-
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Skip SGLang EAGLE v1 greedy verify patch: %s", exc)
-        return
-
-    try:
-        eagle_info = importlib.import_module("sglang.srt.speculative.eagle_info")
-        eagle_verify_input_cls = getattr(eagle_info, "EagleVerifyInput", None)
-        original_input_verify = (
-            getattr(eagle_verify_input_cls, "verify", None)
-            if eagle_verify_input_cls is not None
-            else None
-        )
-        if original_input_verify is not None and not getattr(
-            original_input_verify,
-            "_verl_patched_npu_eagle_v1_decode_debug",
-            False,
-        ):
-            eagle_verify_input_cls.verify = _make_eagle_verify_input_debug_patch(
-                original_input_verify
-            )
-            patched_targets.append(
-                "sglang.srt.speculative.eagle_info.EagleVerifyInput.verify"
-            )
-
-        patched_verify = getattr(
-            importlib.import_module("sglang.srt.speculative.eagle_utils"),
-            "verify_tree_greedy_func",
-            None,
-        )
-        if patched_verify is not None:
-            eagle_info.verify_tree_greedy_func = patched_verify
-            patched_targets.append(
-                "sglang.srt.speculative.eagle_info.verify_tree_greedy_func"
-            )
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Skip SGLang EAGLE v1 greedy verify binding patch: %s", exc)
-
-    try:
-        eagle_info_v2 = importlib.import_module("sglang.srt.speculative.eagle_info_v2")
-        patched_verify = getattr(
-            importlib.import_module("sglang.srt.speculative.eagle_utils"),
-            "verify_tree_greedy_func",
-            None,
-        )
-        if patched_verify is not None:
-            eagle_info_v2.verify_tree_greedy_func = patched_verify
-            patched_targets.append(
-                "sglang.srt.speculative.eagle_info_v2.verify_tree_greedy_func"
-            )
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Skip SGLang EAGLE v2 greedy verify binding patch: %s", exc)
-
-    try:
         eagle_worker = importlib.import_module("sglang.srt.speculative.eagle_worker")
         eagle_worker_cls = getattr(eagle_worker, "EAGLEWorker", None)
-        original_forward = (
-            getattr(eagle_worker_cls, "forward_batch_generation", None)
+        original_draft_extend = (
+            getattr(eagle_worker_cls, "forward_draft_extend_after_decode", None)
             if eagle_worker_cls is not None
             else None
         )
-        if original_forward is not None and not getattr(
-            original_forward,
-            "_verl_patched_npu_eagle_v1_bypass_decode",
+        if original_draft_extend is not None and not getattr(
+            original_draft_extend,
+            "_verl_patched_npu_eagle_v1_state_repair",
             False,
         ):
-            eagle_worker_cls.forward_batch_generation = _make_eagle_v1_bypass_decode_patch(
-                original_forward
+            eagle_worker_cls.forward_draft_extend_after_decode = _make_eagle_v1_draft_extend_state_patch(
+                original_draft_extend
             )
             patched_targets.append(
-                "sglang.srt.speculative.eagle_worker.EAGLEWorker.forward_batch_generation"
+                "sglang.srt.speculative.eagle_worker.EAGLEWorker.forward_draft_extend_after_decode"
             )
 
     except Exception as exc:  # noqa: BLE001
-        logger.debug("Skip SGLang EAGLE v1 bypass decode patch: %s", exc)
+        logger.debug("Skip SGLang EAGLE v1 worker state patch: %s", exc)
 
     if patched_targets:
         _SGLANG_NPU_EAGLE_GREEDY_PATCHED = True
         logger.warning(
-            "Patched SGLang NPU EAGLE greedy diagnostics for %s",
+            "Patched SGLang NPU EAGLE v1 state advancement for %s",
             ", ".join(patched_targets),
         )
 
