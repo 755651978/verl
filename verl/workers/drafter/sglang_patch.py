@@ -714,11 +714,20 @@ def _make_eagle_v1_bypass_decode_patch(original_forward_batch_generation):
             and not batch.forward_mode.is_extend()
             and not batch.is_extend_in_batch
         ):
+            from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
             spec_info_backup = batch.spec_info
+            spec_algorithm_backup = batch.spec_algorithm
             return_hidden_states_backup = batch.return_hidden_states
-            batch.spec_info = None
-            batch.return_hidden_states = False
             try:
+                batch.spec_info = None
+                batch.spec_algorithm = SpeculativeAlgorithm.NONE
+                # Scheduler.prepare_for_decode returns early for spec v1 batches.
+                # Re-run it here with speculative disabled so the target worker
+                # receives a normal decode batch with one input token per request.
+                if getattr(batch, "output_ids", None) is not None:
+                    batch.prepare_for_decode()
+                batch.return_hidden_states = False
                 model_worker_batch = batch.get_model_worker_batch()
                 result = self.target_worker.forward_batch_generation(model_worker_batch)
                 result.num_accepted_tokens = 0
@@ -726,6 +735,7 @@ def _make_eagle_v1_bypass_decode_patch(original_forward_batch_generation):
                 return result
             finally:
                 batch.spec_info = spec_info_backup
+                batch.spec_algorithm = spec_algorithm_backup
                 batch.return_hidden_states = return_hidden_states_backup
 
         return original_forward_batch_generation(self, batch)
