@@ -633,12 +633,28 @@ class SGLangHttpServer:
             limit = int(os.getenv(_DEBUG_OUTPUT_TOKENS_LIMIT_ENV, "8"))
             head = list(token_ids[:limit])
             tail = list(token_ids[-limit:]) if len(token_ids) > limit else []
+            eos_token_ids = getattr(self.model_config.hf_config, "eos_token_id", None)
+            if eos_token_ids is None:
+                eos_token_set = set()
+            elif isinstance(eos_token_ids, (list, tuple, set)):
+                eos_token_set = {int(token_id) for token_id in eos_token_ids}
+            else:
+                eos_token_set = {int(eos_token_ids)}
+            first_eos_pos = next(
+                (idx for idx, token_id in enumerate(token_ids) if int(token_id) in eos_token_set),
+                None,
+            )
             logger.warning(
-                "[SGLangOutputDebug] rid=%s prompt_len=%s output_len=%s stop=%s head=%s tail=%s",
+                "[SGLangOutputDebug] rid=%s prompt_len=%s output_len=%s max_new=%s "
+                "reached_max=%s stop=%s eos=%s first_eos=%s head=%s tail=%s",
                 request_id,
                 len(prompt_ids),
                 len(token_ids),
+                max_new_tokens,
+                len(token_ids) >= max_new_tokens,
                 finish_reason,
+                sorted(eos_token_set),
+                first_eos_pos,
                 head,
                 tail,
             )
