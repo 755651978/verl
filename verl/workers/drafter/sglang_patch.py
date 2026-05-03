@@ -37,6 +37,7 @@ _EAGLE_V1_TARGET_SAMPLING_ENV = "VERL_SGLANG_NPU_EAGLE_V1_TARGET_SAMPLING"
 _EAGLE_V1_VERIFY_MODE_ENV = "VERL_SGLANG_NPU_EAGLE_V1_VERIFY_MODE"
 _EAGLE_V2_VERIFY_MODE_ENV = "VERL_SGLANG_NPU_EAGLE_V2_VERIFY_MODE"
 _EAGLE_V1_STATE_REPAIR_ENV = "VERL_SGLANG_NPU_EAGLE_V1_STATE_REPAIR"
+_EAGLE_FORCE_FP32_SAMPLING_ENV = "VERL_SGLANG_NPU_EAGLE_FORCE_FP32_SAMPLING"
 _DISABLE_SGLANG_PATCH_ENV = "VERL_DISABLE_SGLANG_PATCH"
 _SGLANG_PATCHES_ENV = "VERL_SGLANG_PATCHES"
 _DISABLE_DRAFT_CUDA_GRAPH_ENV = "VERL_DISABLE_SGLANG_DRAFT_CUDA_GRAPH"
@@ -289,6 +290,10 @@ def _sglang_npu_eagle_v1_state_repair_enabled() -> bool:
     return _env_flag_enabled(_EAGLE_V1_STATE_REPAIR_ENV, default=False)
 
 
+def _sglang_npu_eagle_force_fp32_sampling_enabled() -> bool:
+    return _env_flag_enabled(_EAGLE_FORCE_FP32_SAMPLING_ENV, default=True)
+
+
 def _sglang_verl_patches_disabled() -> bool:
     return _env_flag_enabled(_DISABLE_SGLANG_PATCH_ENV, default=False)
 
@@ -360,6 +365,12 @@ def _sglang_npu_eagle_v1_verify_mode() -> str:
 
 def _sglang_npu_eagle_v2_verify_mode() -> str:
     return _sglang_npu_eagle_verify_mode(_EAGLE_V2_VERIFY_MODE_ENV)
+
+
+def _as_sglang_npu_eagle_sampling_float(tensor: torch.Tensor) -> torch.Tensor:
+    if _sglang_npu_eagle_force_fp32_sampling_enabled() and tensor.is_floating_point():
+        return tensor.to(dtype=torch.float32)
+    return tensor
 
 
 def _eagle_v1_accepted_tail_indices(accept_length_cpu, device: torch.device) -> torch.Tensor | None:
@@ -1360,33 +1371,42 @@ def _renorm_probs_by_top_k_top_p(
     top_ps: torch.Tensor,
 ) -> torch.Tensor:
     vocab_size = probs.shape[-1]
-    top_ks = top_ks.to(device=probs.device, dtype=torch.long).view(-1)
-    top_ps = top_ps.to(device=probs.device, dtype=probs.dtype).view(-1)
+    probs_for_sampling = _as_sglang_npu_eagle_sampling_float(probs)
+    top_ks = top_ks.to(device=probs_for_sampling.device, dtype=torch.long).view(-1)
+    top_ps = top_ps.to(device=probs_for_sampling.device, dtype=probs_for_sampling.dtype).view(-1)
 
     vocab_size_tensor = torch.full_like(top_ks, vocab_size)
     top_ks = torch.where((top_ks <= 0) | (top_ks >= _SGLANG_TOP_K_ALL), vocab_size_tensor, top_ks)
     top_ks = torch.minimum(top_ks, vocab_size_tensor)
 
     if bool(torch.all(top_ks >= vocab_size).item()) and bool(torch.all(top_ps >= 1.0).item()):
-        return probs
+        return probs_for_sampling
 
-    sorted_probs, sorted_indices = torch.sort(probs, dim=-1, descending=True)
-    ranks = torch.arange(vocab_size, device=probs.device).view(1, -1)
+    sorted_probs, sorted_indices = torch.sort(probs_for_sampling, dim=-1, descending=True)
+    ranks = torch.arange(vocab_size, device=probs_for_sampling.device).view(1, -1)
     sorted_probs = sorted_probs.masked_fill(ranks >= top_ks.view(-1, 1), 0.0)
 
     cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
     sorted_probs = sorted_probs.masked_fill((cumulative_probs - sorted_probs) > top_ps.view(-1, 1), 0.0)
 
     normalizer = sorted_probs.sum(dim=-1, keepdim=True)
-    sorted_probs = torch.where(normalizer > 0, sorted_probs / normalizer.clamp_min(torch.finfo(probs.dtype).tiny), 0.0)
+    sorted_probs = torch.where(
+        normalizer > 0,
+        sorted_probs / normalizer.clamp_min(torch.finfo(probs_for_sampling.dtype).tiny),
+        0.0,
+    )
 
-    renormed_probs = torch.zeros_like(probs)
+    renormed_probs = torch.zeros_like(probs_for_sampling)
     renormed_probs.scatter_(dim=1, index=sorted_indices, src=sorted_probs)
     return renormed_probs
 
 
 def _top_k_renorm_prob_torch(probs: torch.Tensor, top_ks: torch.Tensor) -> torch.Tensor:
-    top_ps = torch.ones((probs.shape[0],), dtype=probs.dtype, device=probs.device)
+    top_ps = torch.ones(
+        (probs.shape[0],),
+        dtype=torch.float32 if _sglang_npu_eagle_force_fp32_sampling_enabled() else probs.dtype,
+        device=probs.device,
+    )
     return _renorm_probs_by_top_k_top_p(probs, top_ks, top_ps)
 
 
@@ -1400,11 +1420,19 @@ def _sample_from_probs_with_coin(probs: torch.Tensor, coin: torch.Tensor) -> tor
     if squeeze_output:
         probs = probs.unsqueeze(0)
 
-    totals = probs.sum(dim=-1, keepdim=True)
-    probs = torch.where(totals > 0, probs, torch.ones_like(probs))
-    totals = probs.sum(dim=-1, keepdim=True)
-    threshold = coin.to(dtype=probs.dtype, device=probs.device).view(-1, 1) * totals
-    cumulative = torch.cumsum(probs, dim=-1)
+    probs_for_sampling = _as_sglang_npu_eagle_sampling_float(probs)
+    totals = probs_for_sampling.sum(dim=-1, keepdim=True)
+    probs_for_sampling = torch.where(
+        totals > 0,
+        probs_for_sampling,
+        torch.ones_like(probs_for_sampling),
+    )
+    totals = probs_for_sampling.sum(dim=-1, keepdim=True)
+    threshold = coin.to(
+        dtype=probs_for_sampling.dtype,
+        device=probs_for_sampling.device,
+    ).view(-1, 1) * totals
+    cumulative = torch.cumsum(probs_for_sampling, dim=-1)
     samples = torch.argmax((cumulative > threshold).to(torch.int32), dim=-1).to(torch.int32)
     return samples[0] if squeeze_output else samples
 
@@ -1474,8 +1502,13 @@ def _tree_speculative_sampling_target_only_vectorized_torch(
 ) -> None:
     batch_size, num_draft_tokens = candidates.shape
     num_speculative_tokens = accept_index.shape[1]
-    device = target_probs.device
-    vocab_size = target_probs.shape[-1]
+    target_probs_for_sampling = _as_sglang_npu_eagle_sampling_float(target_probs)
+    uniform_samples_for_sampling = _as_sglang_npu_eagle_sampling_float(uniform_samples)
+    final_uniform_samples_for_sampling = _as_sglang_npu_eagle_sampling_float(
+        uniform_samples_for_final_sampling
+    )
+    device = target_probs_for_sampling.device
+    vocab_size = target_probs_for_sampling.shape[-1]
 
     threshold_acc = max(float(threshold_acc), 1e-9)
     threshold_single = float(threshold_single)
@@ -1490,9 +1523,12 @@ def _tree_speculative_sampling_target_only_vectorized_torch(
 
     last_accepted_retrive_idx = retrive_index[:, 0].to(torch.long)
     accept_index[:, 0].copy_(last_accepted_retrive_idx.to(dtype=accept_index.dtype))
-    coin = uniform_samples[:, 0]
-    residual_draft_probs = draft_probs[:, 0, :]
-    residual_draft_probs.zero_()
+    coin = uniform_samples_for_sampling[:, 0]
+    residual_draft_probs = torch.zeros(
+        (batch_size, vocab_size),
+        dtype=target_probs_for_sampling.dtype,
+        device=device,
+    )
 
     for _ in range(1, num_speculative_tokens):
         sibling_idx = torch.where(
@@ -1501,19 +1537,34 @@ def _tree_speculative_sampling_target_only_vectorized_torch(
             torch.full_like(cur_prob_idx, -1),
         )
         found_idx = torch.full_like(cur_prob_idx, -1)
-        prob_acc = torch.zeros((batch_size,), dtype=target_probs.dtype, device=device)
+        prob_acc = torch.zeros(
+            (batch_size,),
+            dtype=target_probs_for_sampling.dtype,
+            device=device,
+        )
 
         for _ in range(num_draft_tokens):
             valid = active & (found_idx < 0) & (sibling_idx >= 0)
             safe_sibling_idx = sibling_idx.clamp_min(0)
             draft_token_id = candidates[batch_indices, safe_sibling_idx].to(torch.long)
-            target_prob_single = target_probs[batch_indices, cur_prob_idx, draft_token_id]
+            target_prob_single = target_probs_for_sampling[
+                batch_indices,
+                cur_prob_idx,
+                draft_token_id,
+            ]
             target_prob_single = torch.where(valid, target_prob_single, torch.zeros_like(target_prob_single))
             next_prob_acc = prob_acc + target_prob_single
 
-            old_residual = residual_draft_probs.gather(dim=1, index=draft_token_id.view(-1, 1)).squeeze(1)
+            old_residual = residual_draft_probs.gather(
+                dim=1,
+                index=draft_token_id.view(-1, 1),
+            ).squeeze(1)
             residual_update = torch.where(valid, target_prob_single, old_residual)
-            residual_draft_probs.scatter_(dim=1, index=draft_token_id.view(-1, 1), src=residual_update.view(-1, 1))
+            residual_draft_probs.scatter_(
+                dim=1,
+                index=draft_token_id.view(-1, 1),
+                src=residual_update.view(-1, 1),
+            )
 
             accepted = valid & (
                 (coin <= (next_prob_acc / threshold_acc)) | (target_prob_single >= threshold_single)
@@ -1548,18 +1599,18 @@ def _tree_speculative_sampling_target_only_vectorized_torch(
         cur_prob_idx = torch.where(accepted, safe_found_idx, cur_prob_idx)
         last_accepted_retrive_idx = torch.where(accepted, accepted_retrive_idx, last_accepted_retrive_idx)
         accepted_count = next_accepted_count
-        coin = uniform_samples[batch_indices, cur_prob_idx]
+        coin = uniform_samples_for_sampling[batch_indices, cur_prob_idx]
         active = accepted
         residual_draft_probs.mul_((~accepted).to(dtype=residual_draft_probs.dtype).view(-1, 1))
 
     accept_token_num.copy_(accepted_count.to(dtype=accept_token_num.dtype))
 
-    final_target_probs = target_probs[batch_indices, cur_prob_idx]
+    final_target_probs = target_probs_for_sampling[batch_indices, cur_prob_idx]
     residual_probs = torch.clamp(final_target_probs - residual_draft_probs, min=0.0)
     need_residual = accepted_count != (num_speculative_tokens - 1)
     final_probs = torch.where(need_residual.view(-1, 1), residual_probs, final_target_probs)
     final_probs = torch.where(final_probs.sum(dim=-1, keepdim=True) > 0, final_probs, final_target_probs)
-    final_token_ids = _sample_from_probs_with_coin(final_probs, uniform_samples_for_final_sampling)
+    final_token_ids = _sample_from_probs_with_coin(final_probs, final_uniform_samples_for_sampling)
     predicts.scatter_(dim=0, index=last_accepted_retrive_idx, src=final_token_ids.to(dtype=predicts.dtype))
 
 
