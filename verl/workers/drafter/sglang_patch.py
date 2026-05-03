@@ -38,6 +38,7 @@ _EAGLE_V1_VERIFY_MODE_ENV = "VERL_SGLANG_NPU_EAGLE_V1_VERIFY_MODE"
 _EAGLE_V2_VERIFY_MODE_ENV = "VERL_SGLANG_NPU_EAGLE_V2_VERIFY_MODE"
 _EAGLE_V1_STATE_REPAIR_ENV = "VERL_SGLANG_NPU_EAGLE_V1_STATE_REPAIR"
 _DISABLE_SGLANG_PATCH_ENV = "VERL_DISABLE_SGLANG_PATCH"
+_SGLANG_PATCHES_ENV = "VERL_SGLANG_PATCHES"
 
 _target_weight_loader: str | None = os.environ.get(_TARGET_WEIGHT_LOADER_ENV)
 _draft_weight_loader: str | None = os.environ.get(_DRAFT_WEIGHT_LOADER_ENV)
@@ -52,6 +53,31 @@ _SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED = False
 _SGLANG_SCHEDULER_PROCESS_PATCHED = False
 _SCHEDULER_PROCESS_PATCH_ATTR = "_verl_patched_scheduler_process"
 _SGLANG_TOP_K_ALL = 1 << 30
+_SGLANG_PATCH_ALIASES = {
+    "all": "all",
+    "none": "none",
+    "off": "none",
+    "0": "none",
+    "eagle_update_weights": "eagle_update_weights",
+    "eagle_weight_update": "eagle_update_weights",
+    "weight_update": "eagle_update_weights",
+    "weight_routing": "eagle_update_weights",
+    "route_weights": "eagle_update_weights",
+    "target_draft_weight_routing": "eagle_update_weights",
+    "npu_eagle_v1_state_repair": "npu_eagle_v1_state_repair",
+    "v1_state_repair": "npu_eagle_v1_state_repair",
+    "npu_eagle_v1_batch_ops": "npu_eagle_v1_batch_ops",
+    "v1_batch_ops": "npu_eagle_v1_batch_ops",
+    "accept_length": "npu_eagle_v1_batch_ops",
+    "accept_length_batch_ops": "npu_eagle_v1_batch_ops",
+    "npu_eagle_target_sampling": "npu_eagle_target_sampling",
+    "target_sampling": "npu_eagle_target_sampling",
+    "transformers_eagle3_capture": "transformers_eagle3_capture",
+    "eagle3_capture": "transformers_eagle3_capture",
+    "hidden_states_tensor_output": "hidden_states_tensor_output",
+    "hidden_states": "hidden_states_tensor_output",
+    "hidden_state_tensor_output": "hidden_states_tensor_output",
+}
 
 
 def configure_sglang_eagle_weight_update_patch(
@@ -240,6 +266,30 @@ def _sglang_npu_eagle_v1_state_repair_enabled() -> bool:
 
 def _sglang_verl_patches_disabled() -> bool:
     return _env_flag_enabled(_DISABLE_SGLANG_PATCH_ENV, default=False)
+
+
+def _selected_sglang_patches() -> set[str] | None:
+    raw_value = os.getenv(_SGLANG_PATCHES_ENV)
+    if raw_value is None or not raw_value.strip():
+        return None
+
+    selected = set()
+    for item in re.split(r"[\s,]+", raw_value.strip()):
+        key = item.strip().lower().replace("-", "_")
+        if not key:
+            continue
+        patch_name = _SGLANG_PATCH_ALIASES.get(key, key)
+        if patch_name == "all":
+            return None
+        if patch_name == "none":
+            return set()
+        selected.add(patch_name)
+    return selected
+
+
+def _sglang_patch_enabled(patch_name: str) -> bool:
+    selected = _selected_sglang_patches()
+    return selected is None or patch_name in selected
 
 
 def _normalize_sglang_npu_eagle_verify_mode(mode: str | None) -> str | None:
@@ -1326,17 +1376,36 @@ def patch_sglang_hidden_states_tensor_output() -> None:
         logger.info("Patched SGLang hidden-state tensor output for %s", ", ".join(patched_methods))
 
 
+def _apply_selected_sglang_patches() -> bool:
+    patchers = (
+        ("transformers_eagle3_capture", patch_sglang_transformers_eagle3_capture),
+        ("eagle_update_weights", patch_sglang_eagle_update_weights_from_tensor),
+        ("npu_eagle_v1_state_repair", patch_sglang_npu_eagle_v1_greedy_path),
+        ("npu_eagle_v1_batch_ops", patch_sglang_npu_eagle_v1_batch_ops),
+        ("npu_eagle_target_sampling", patch_sglang_npu_eagle_target_sampling),
+        ("hidden_states_tensor_output", patch_sglang_hidden_states_tensor_output),
+    )
+
+    applied_any = False
+    skipped = []
+    for patch_name, patcher in patchers:
+        if _sglang_patch_enabled(patch_name):
+            patcher()
+            applied_any = True
+        else:
+            skipped.append(patch_name)
+
+    if skipped:
+        logger.info("Skip verl SGLang patches not selected by %s: %s", _SGLANG_PATCHES_ENV, ", ".join(skipped))
+    return applied_any
+
+
 def _apply_sglang_child_process_patches() -> None:
     if _sglang_verl_patches_disabled():
         logger.warning("Skip all verl SGLang patches because %s=1.", _DISABLE_SGLANG_PATCH_ENV)
         return
 
-    patch_sglang_transformers_eagle3_capture()
-    patch_sglang_eagle_update_weights_from_tensor()
-    patch_sglang_npu_eagle_v1_greedy_path()
-    patch_sglang_npu_eagle_v1_batch_ops()
-    patch_sglang_npu_eagle_target_sampling()
-    patch_sglang_hidden_states_tensor_output()
+    _apply_selected_sglang_patches()
 
 
 def _run_scheduler_process_with_verl_patches(*args, **kwargs):
@@ -1404,14 +1473,11 @@ def install_sglang_verl_patches(
         logger.warning("Skip installing verl SGLang patches because %s=1.", _DISABLE_SGLANG_PATCH_ENV)
         return
 
-    configure_sglang_eagle_weight_update_patch(target_weight_loader, draft_weight_loader)
-    patch_sglang_transformers_eagle3_capture()
-    patch_sglang_eagle_update_weights_from_tensor()
-    patch_sglang_npu_eagle_v1_greedy_path()
-    patch_sglang_npu_eagle_v1_batch_ops()
-    patch_sglang_npu_eagle_target_sampling()
-    patch_sglang_hidden_states_tensor_output()
-    patch_sglang_scheduler_process_entrypoints()
+    if _sglang_patch_enabled("eagle_update_weights"):
+        configure_sglang_eagle_weight_update_patch(target_weight_loader, draft_weight_loader)
+    applied_any = _apply_selected_sglang_patches()
+    if applied_any:
+        patch_sglang_scheduler_process_entrypoints()
 
     if set_envs_and_config is not None:
         sglang.srt.entrypoints.engine._set_envs_and_config = set_envs_and_config
