@@ -51,6 +51,7 @@ _SGLANG_NPU_EAGLE_GREEDY_PATCHED = False
 _SGLANG_NPU_EAGLE_V1_BATCH_OPS_PATCHED = False
 _SGLANG_DRAFT_CUDA_GRAPH_PATCHED = False
 _SGLANG_DRAFT_WORKER_MODEL_RUNNER_PATCHED = False
+_SGLANG_NPU_ASCEND_LOW_LEVEL_PATCHED = False
 _SGLANG_TRANSFORMERS_EAGLE3_CAPTURE_PATCHED = False
 _SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED = False
 _SGLANG_SCHEDULER_PROCESS_PATCHED = False
@@ -75,6 +76,19 @@ _SGLANG_PATCH_ALIASES = {
     "draft_routed_experts": "draft_worker_model_runner",
     "routed_experts_draft": "draft_worker_model_runner",
     "draft_offloader": "draft_worker_model_runner",
+    "npu_ascend_low_level": "npu_ascend_low_level",
+    "ascend_low_level": "npu_ascend_low_level",
+    "npu_low_level": "npu_ascend_low_level",
+    "npu_rl_numeric_path": "npu_ascend_low_level",
+    "ascend_numeric": "npu_ascend_low_level",
+    "npu_sampler_logits": "npu_ascend_low_level",
+    "sampler_logits": "npu_ascend_low_level",
+    "rotary_rmsnorm": "npu_ascend_low_level",
+    "npu_moe_low_level": "npu_ascend_low_level",
+    "moe_low_level": "npu_ascend_low_level",
+    "routed_experts_deepep": "npu_ascend_low_level",
+    "deterministic_moe": "npu_ascend_low_level",
+    "parallel_state_rank_fallback": "npu_ascend_low_level",
     "npu_eagle_v1_state_repair": "npu_eagle_v1_state_repair",
     "v1_state_repair": "npu_eagle_v1_state_repair",
     "npu_eagle_v1_batch_ops": "npu_eagle_v1_batch_ops",
@@ -921,6 +935,425 @@ def patch_sglang_draft_worker_model_runner() -> None:
         logger.warning("Patched SGLang draft worker ModelRunner for %s", ", ".join(patched_targets))
 
 
+def _sglang_rl_on_policy_target_enabled(globals_dict: dict | None = None) -> bool:
+    get_server_args = None if globals_dict is None else globals_dict.get("get_global_server_args")
+    if get_server_args is None:
+        try:
+            server_args_module = importlib.import_module("sglang.srt.server_args")
+            get_server_args = getattr(server_args_module, "get_global_server_args", None)
+        except Exception:  # noqa: BLE001
+            get_server_args = None
+    if get_server_args is None:
+        return False
+
+    try:
+        server_args = get_server_args()
+    except Exception:  # noqa: BLE001
+        return False
+    return getattr(server_args, "rl_on_policy_target", None) is not None
+
+
+def _compile_sglang_source_rewrite(
+    original_func,
+    patch_attr: str,
+    replacements: tuple[tuple[str, str], ...] = (),
+    regex_replacements: tuple[tuple[str, str], ...] = (),
+    extra_globals: dict | None = None,
+):
+    try:
+        source = inspect.getsource(original_func)
+    except (OSError, TypeError):
+        return None
+
+    source = textwrap.dedent(source)
+    patched_source = source
+    for old, new in replacements:
+        patched_source = patched_source.replace(old, new)
+    for pattern, replacement in regex_replacements:
+        patched_source = re.sub(pattern, replacement, patched_source, flags=re.MULTILINE | re.DOTALL)
+
+    if patched_source == source:
+        return None
+
+    globals_dict = original_func.__globals__
+    if extra_globals:
+        globals_dict.update(extra_globals)
+    namespace = {}
+    exec(  # noqa: S102
+        "from __future__ import annotations\n" + patched_source,
+        globals_dict,
+        namespace,
+    )
+    patched_func = namespace[original_func.__name__]
+    patched_func = wraps(original_func)(patched_func)
+    setattr(patched_func, patch_attr, True)
+    return patched_func
+
+
+def _make_sglang_logits_processor_npu_rl_patch(original_compute_lm_head):
+    old_block = """            elif get_global_server_args().rl_on_policy_target is not None:
+                # Due to tie-weight, we may not be able to change lm_head's weight dtype
+                logits = torch.matmul(
+                    hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
+                )
+            else:
+                logits = torch.matmul(
+                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
+                )
+"""
+    new_block = """            else:
+                logits = torch.matmul(
+                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
+                )
+"""
+    return _compile_sglang_source_rewrite(
+        original_compute_lm_head,
+        "_verl_patched_npu_rl_logits_processor",
+        replacements=((old_block, new_block),),
+    )
+
+
+def _make_sglang_sampler_npu_rl_patch(original_forward):
+    return _compile_sglang_source_rewrite(
+        original_forward,
+        "_verl_patched_npu_rl_sampler",
+        regex_replacements=(
+            (
+                r"logits_div_temperature = \(\s*"
+                r"logits\.bfloat16\(\)\.div\(sampling_info\.temperatures\)\.bfloat16\(\)\s*\)",
+                "logits_div_temperature = logits.div(sampling_info.temperatures)",
+            ),
+        ),
+    )
+
+
+def _make_sglang_rmsnorm_init_npu_rl_patch(original_init):
+    @wraps(original_init)
+    def patched_init(self, *args, **kwargs):
+        if _is_sglang_npu_backend() and _sglang_rl_on_policy_target_enabled(original_init.__globals__):
+            # slime-ascend keeps the residual path in the incoming activation dtype
+            # on NPU instead of forcing an fp32 residual through override_orig_dtype.
+            kwargs.pop("override_orig_dtype", None)
+        return original_init(self, *args, **kwargs)
+
+    patched_init._verl_patched_npu_rl_rmsnorm_init = True
+    return patched_init
+
+
+def _make_sglang_rmsnorm_native_npu_rl_patch(original_forward_native):
+    old_block = """            if self.fp32_residual:
+                residual = x.clone()
+            else:
+                residual = x.to(orig_dtype)
+"""
+    new_block = """            residual = x.to(orig_dtype)
+"""
+    return _compile_sglang_source_rewrite(
+        original_forward_native,
+        "_verl_patched_npu_rl_rmsnorm_native",
+        replacements=((old_block, new_block),),
+    )
+
+
+def _make_sglang_rotary_no_compile_npu_rl_patch(original_init):
+    @wraps(original_init)
+    def patched_init(self, *args, **kwargs):
+        if not (_is_sglang_npu_backend() and _sglang_rl_on_policy_target_enabled(original_init.__globals__)):
+            return original_init(self, *args, **kwargs)
+
+        torch_module = original_init.__globals__.get("torch")
+        original_compile = getattr(torch_module, "compile", None)
+        if torch_module is None or original_compile is None:
+            return original_init(self, *args, **kwargs)
+
+        def identity_compile(*compile_args, **compile_kwargs):
+            del compile_kwargs
+            if compile_args and callable(compile_args[0]):
+                return compile_args[0]
+
+            def decorator(func):
+                return func
+
+            return decorator
+
+        torch_module.compile = identity_compile
+        try:
+            return original_init(self, *args, **kwargs)
+        finally:
+            torch_module.compile = original_compile
+
+    patched_init._verl_patched_npu_rl_rotary_no_compile = True
+    return patched_init
+
+
+def _make_sglang_parallel_rank_fallback_patch(original_get_tp_rank):
+    @wraps(original_get_tp_rank)
+    def patched_get_tensor_model_parallel_rank(*args, **kwargs):
+        try:
+            return original_get_tp_rank(*args, **kwargs)
+        except Exception:  # noqa: BLE001
+            return 0
+
+    patched_get_tensor_model_parallel_rank._verl_patched_npu_tp_rank_fallback = True
+    return patched_get_tensor_model_parallel_rank
+
+
+def _make_sglang_fused_moe_deterministic_patch(original_fused_experts_impl):
+    try:
+        server_args_module = importlib.import_module("sglang.srt.server_args")
+        get_global_server_args = getattr(server_args_module, "get_global_server_args")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Skip SGLang deterministic MoE rewrite: %s", exc)
+        return None
+
+    return _compile_sglang_source_rewrite(
+        original_fused_experts_impl,
+        "_verl_patched_npu_deterministic_moe",
+        replacements=(
+            (
+                "if tokens_in_chunk <= 32:",
+                "if not get_global_server_args().enable_deterministic_inference and tokens_in_chunk <= 32:",
+            ),
+        ),
+        extra_globals={"get_global_server_args": get_global_server_args},
+    )
+
+
+def _is_sglang_deepep_moe_backend() -> bool:
+    try:
+        moe_module = importlib.import_module("sglang.srt.layers.moe")
+        get_moe_a2a_backend = getattr(moe_module, "get_moe_a2a_backend", None)
+        if get_moe_a2a_backend is None:
+            return False
+        backend = get_moe_a2a_backend()
+        return bool(getattr(backend, "is_deepep", lambda: False)())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _ensure_sglang_deepep_routed_experts_gather_buffer(capturer):
+    if not _is_sglang_deepep_moe_backend():
+        return None
+
+    device_cache = getattr(capturer, "device_cache", None)
+    device_buffer = getattr(device_cache, "buffer", None)
+    if device_buffer is None or device_buffer.dim() < 3:
+        return None
+
+    try:
+        dp_attention = importlib.import_module("sglang.srt.layers.dp_attention")
+        is_dp_attention_enabled = getattr(dp_attention, "is_dp_attention_enabled")
+        get_attention_tp_size = getattr(dp_attention, "get_attention_tp_size")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Skip DeepEP routed experts gather buffer: %s", exc)
+        return None
+
+    attn_tp_size = get_attention_tp_size() if is_dp_attention_enabled() else 1
+    expected_shape = (device_buffer.shape[0] * attn_tp_size, device_buffer.shape[2])
+    gather_buffer = getattr(capturer, "gather_buffer", None)
+    if gather_buffer is not None and tuple(gather_buffer.shape) == expected_shape:
+        return gather_buffer
+
+    capturer.gather_buffer = torch.empty(
+        expected_shape,
+        dtype=torch.int32,
+        device=device_buffer.device,
+    )
+    return capturer.gather_buffer
+
+
+def _make_sglang_routed_experts_init_deepep_patch(original_init):
+    @wraps(original_init)
+    def patched_init(self, *args, **kwargs):
+        result = original_init(self, *args, **kwargs)
+        _ensure_sglang_deepep_routed_experts_gather_buffer(self)
+        return result
+
+    patched_init._verl_patched_npu_deepep_routed_experts_init = True
+    return patched_init
+
+
+def _make_sglang_routed_experts_capture_deepep_patch(original_capture):
+    @wraps(original_capture)
+    def patched_capture(self, layer_id: int, topk_ids: torch.Tensor):
+        if _is_sglang_deepep_moe_backend():
+            try:
+                dp_attention = importlib.import_module("sglang.srt.layers.dp_attention")
+                get_attention_tp_size = getattr(dp_attention, "get_attention_tp_size")
+                attn_tp_all_gather_into_tensor = getattr(dp_attention, "attn_tp_all_gather_into_tensor")
+                local_topk_ids = topk_ids
+                gather_buffer = _ensure_sglang_deepep_routed_experts_gather_buffer(self)
+                if gather_buffer is not None:
+                    topk_ids = gather_buffer[: local_topk_ids.size(0) * get_attention_tp_size()]
+                    attn_tp_all_gather_into_tensor(topk_ids, local_topk_ids)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Skip DeepEP routed experts capture gather: %s", exc)
+        return original_capture(self, layer_id, topk_ids)
+
+    patched_capture._verl_patched_npu_deepep_routed_experts_capture = True
+    return patched_capture
+
+
+def _make_sglang_routed_experts_sync_deepep_patch(original_sync):
+    try:
+        moe_module = importlib.import_module("sglang.srt.layers.moe")
+        get_moe_a2a_backend = getattr(moe_module, "get_moe_a2a_backend")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Skip DeepEP routed experts sync rewrite: %s", exc)
+        return None
+
+    return _compile_sglang_source_rewrite(
+        original_sync,
+        "_verl_patched_npu_deepep_routed_experts_sync",
+        replacements=(
+            (
+                "if is_dp_attention_enabled():",
+                "if is_dp_attention_enabled() and not get_moe_a2a_backend().is_deepep():",
+            ),
+        ),
+        extra_globals={"get_moe_a2a_backend": get_moe_a2a_backend},
+    )
+
+
+def patch_sglang_npu_ascend_low_level() -> None:
+    """Apply slime-ascend's NPU low-level fixes that can affect speculative rollout numerics."""
+    global _SGLANG_NPU_ASCEND_LOW_LEVEL_PATCHED
+    if _SGLANG_NPU_ASCEND_LOW_LEVEL_PATCHED or not _is_sglang_npu_backend():
+        return
+
+    patched_targets = []
+
+    try:
+        logits_module = importlib.import_module("sglang.srt.layers.logits_processor")
+        logits_processor_cls = getattr(logits_module, "LogitsProcessor", None)
+        original_compute_lm_head = (
+            getattr(logits_processor_cls, "_compute_lm_head", None) if logits_processor_cls is not None else None
+        )
+        if original_compute_lm_head is not None and not getattr(
+            original_compute_lm_head,
+            "_verl_patched_npu_rl_logits_processor",
+            False,
+        ):
+            patched_compute_lm_head = _make_sglang_logits_processor_npu_rl_patch(original_compute_lm_head)
+            if patched_compute_lm_head is not None:
+                logits_processor_cls._compute_lm_head = patched_compute_lm_head
+                patched_targets.append("LogitsProcessor._compute_lm_head")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Skip SGLang NPU logits processor patch: %s", exc)
+
+    try:
+        sampler_module = importlib.import_module("sglang.srt.layers.sampler")
+        sampler_cls = getattr(sampler_module, "Sampler", None)
+        original_forward = getattr(sampler_cls, "forward", None) if sampler_cls is not None else None
+        if original_forward is not None and not getattr(original_forward, "_verl_patched_npu_rl_sampler", False):
+            patched_forward = _make_sglang_sampler_npu_rl_patch(original_forward)
+            if patched_forward is not None:
+                sampler_cls.forward = patched_forward
+                patched_targets.append("Sampler.forward")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Skip SGLang NPU sampler patch: %s", exc)
+
+    try:
+        rotary_module = importlib.import_module("sglang.srt.layers.rotary_embedding")
+        rotary_cls = getattr(rotary_module, "RotaryEmbedding", None)
+        original_init = getattr(rotary_cls, "__init__", None) if rotary_cls is not None else None
+        if original_init is not None and not getattr(original_init, "_verl_patched_npu_rl_rotary_no_compile", False):
+            rotary_cls.__init__ = _make_sglang_rotary_no_compile_npu_rl_patch(original_init)
+            patched_targets.append("RotaryEmbedding.__init__")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Skip SGLang NPU rotary patch: %s", exc)
+
+    try:
+        layernorm_module = importlib.import_module("sglang.srt.layers.layernorm")
+        rmsnorm_cls = getattr(layernorm_module, "RMSNorm", None)
+        original_init = getattr(rmsnorm_cls, "__init__", None) if rmsnorm_cls is not None else None
+        if original_init is not None and not getattr(original_init, "_verl_patched_npu_rl_rmsnorm_init", False):
+            rmsnorm_cls.__init__ = _make_sglang_rmsnorm_init_npu_rl_patch(original_init)
+            patched_targets.append("RMSNorm.__init__")
+
+        original_forward_native = getattr(rmsnorm_cls, "forward_native", None) if rmsnorm_cls is not None else None
+        if original_forward_native is not None and not getattr(
+            original_forward_native,
+            "_verl_patched_npu_rl_rmsnorm_native",
+            False,
+        ):
+            patched_forward_native = _make_sglang_rmsnorm_native_npu_rl_patch(original_forward_native)
+            if patched_forward_native is not None:
+                rmsnorm_cls.forward_native = patched_forward_native
+                patched_targets.append("RMSNorm.forward_native")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Skip SGLang NPU RMSNorm patch: %s", exc)
+
+    try:
+        parallel_state_module = importlib.import_module("sglang.srt.distributed.parallel_state")
+        original_get_tp_rank = getattr(parallel_state_module, "get_tensor_model_parallel_rank", None)
+        if original_get_tp_rank is not None and not getattr(
+            original_get_tp_rank,
+            "_verl_patched_npu_tp_rank_fallback",
+            False,
+        ):
+            parallel_state_module.get_tensor_model_parallel_rank = _make_sglang_parallel_rank_fallback_patch(
+                original_get_tp_rank
+            )
+            patched_targets.append("parallel_state.get_tensor_model_parallel_rank")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Skip SGLang NPU TP-rank fallback patch: %s", exc)
+
+    try:
+        fused_moe_module = importlib.import_module("sglang.srt.layers.moe.fused_moe_triton.fused_moe")
+        original_fused_experts_impl = getattr(fused_moe_module, "fused_experts_impl", None)
+        if original_fused_experts_impl is not None and not getattr(
+            original_fused_experts_impl,
+            "_verl_patched_npu_deterministic_moe",
+            False,
+        ):
+            patched_fused_experts_impl = _make_sglang_fused_moe_deterministic_patch(original_fused_experts_impl)
+            if patched_fused_experts_impl is not None:
+                fused_moe_module.fused_experts_impl = patched_fused_experts_impl
+                patched_targets.append("fused_moe.fused_experts_impl")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Skip SGLang deterministic MoE patch: %s", exc)
+
+    try:
+        routed_module = importlib.import_module("sglang.srt.layers.moe.routed_experts_capturer")
+        capturer_cls = getattr(routed_module, "_RoutedExpertsCapturerReal", None)
+        if capturer_cls is not None:
+            original_init = getattr(capturer_cls, "__init__", None)
+            if original_init is not None and not getattr(
+                original_init,
+                "_verl_patched_npu_deepep_routed_experts_init",
+                False,
+            ):
+                capturer_cls.__init__ = _make_sglang_routed_experts_init_deepep_patch(original_init)
+                patched_targets.append("_RoutedExpertsCapturerReal.__init__")
+
+            original_sync = getattr(capturer_cls, "_sync_fwd_experts_buffer_DtoH", None)
+            if original_sync is not None and not getattr(
+                original_sync,
+                "_verl_patched_npu_deepep_routed_experts_sync",
+                False,
+            ):
+                patched_sync = _make_sglang_routed_experts_sync_deepep_patch(original_sync)
+                if patched_sync is not None:
+                    capturer_cls._sync_fwd_experts_buffer_DtoH = patched_sync
+                    patched_targets.append("_RoutedExpertsCapturerReal._sync_fwd_experts_buffer_DtoH")
+
+            original_capture = getattr(capturer_cls, "capture", None)
+            if original_capture is not None and not getattr(
+                original_capture,
+                "_verl_patched_npu_deepep_routed_experts_capture",
+                False,
+            ):
+                capturer_cls.capture = _make_sglang_routed_experts_capture_deepep_patch(original_capture)
+                patched_targets.append("_RoutedExpertsCapturerReal.capture")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Skip SGLang DeepEP routed experts patch: %s", exc)
+
+    if patched_targets:
+        _SGLANG_NPU_ASCEND_LOW_LEVEL_PATCHED = True
+        logger.warning("Patched SGLang NPU/Ascend low-level paths for %s", ", ".join(patched_targets))
+
+
 def _renorm_probs_by_top_k_top_p(
     probs: torch.Tensor,
     top_ks: torch.Tensor,
@@ -1696,6 +2129,7 @@ def patch_sglang_hidden_states_tensor_output() -> None:
 def _apply_selected_sglang_patches() -> bool:
     patchers = (
         ("draft_worker_model_runner", patch_sglang_draft_worker_model_runner),
+        ("npu_ascend_low_level", patch_sglang_npu_ascend_low_level),
         ("draft_cuda_graph", patch_sglang_draft_cuda_graph),
         ("transformers_eagle3_capture", patch_sglang_transformers_eagle3_capture),
         ("eagle_update_weights", patch_sglang_eagle_update_weights_from_tensor),
