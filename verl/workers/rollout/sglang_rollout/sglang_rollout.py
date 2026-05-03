@@ -58,6 +58,7 @@ VERL_SGLANG_TARGET_WEIGHT_LOADER = (
 VERL_SGLANG_DRAFT_WEIGHT_LOADER = (
     "verl.workers.rollout.sglang_rollout.sglang_rollout.verl_sglang_draft_weight_loader"
 )
+_DISABLE_SPECULATIVE_WEIGHT_SYNC_GUARD_ENV = "VERL_DISABLE_SGLANG_SPECULATIVE_WEIGHT_SYNC_GUARD"
 
 
 def _is_sglang_eagle_draft_model(model) -> bool:
@@ -73,6 +74,22 @@ def _is_sglang_eagle_draft_model(model) -> bool:
 
 def _supports_sglang_custom_weight_loader() -> bool:
     return "custom_weight_loader" in getattr(ServerArgs, "__dataclass_fields__", {})
+
+
+def _env_flag_enabled(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "on", "yes", "y"}:
+        return True
+    if normalized in {"0", "false", "off", "no", "n", ""}:
+        return False
+    return default
+
+
+def _speculative_weight_sync_guard_disabled() -> bool:
+    return _env_flag_enabled(_DISABLE_SPECULATIVE_WEIGHT_SYNC_GUARD_ENV, default=False)
 
 
 def verl_sglang_target_weight_loader(model, named_tensors):
@@ -399,7 +416,9 @@ class ServerAdapter(BaseRollout):
             )
             disable_draft_model = True if self.config.drafter.enable else None
             disable_target_model = False if self.config.drafter.enable else None
-            pause_for_speculative_update = bool(self.config.drafter.enable)
+            pause_for_speculative_update = bool(
+                self.config.drafter.enable and not _speculative_weight_sync_guard_disabled()
+            )
             generation_paused = False
             try:
                 if self.device_mesh["infer_tp"].get_local_rank() == 0 and pause_for_speculative_update:
