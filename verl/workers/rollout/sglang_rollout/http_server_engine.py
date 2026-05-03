@@ -370,6 +370,7 @@ class HttpServerAdapter(EngineBase):
         named_tensors = req.serialized_named_tensors
         load_format = req.load_format
         flush_cache = req.flush_cache
+        abort_all_requests = getattr(req, "abort_all_requests", None)
         disable_draft_model = getattr(req, "disable_draft_model", None)
         disable_target_model = getattr(req, "disable_target_model", None)
 
@@ -385,6 +386,8 @@ class HttpServerAdapter(EngineBase):
             "load_format": load_format,
             "flush_cache": flush_cache,
         }
+        if abort_all_requests is not None:
+            payload["abort_all_requests"] = abort_all_requests
         if disable_draft_model is not None:
             payload["disable_draft_model"] = disable_draft_model
         if disable_target_model is not None:
@@ -570,6 +573,14 @@ class HttpServerAdapter(EngineBase):
             Dict[str, Any]: Server response indicating abort status
         """
         return self._make_request("abort_request", {"rid": rid, "abort_all": abort_all})
+
+    def pause_generation(self) -> dict[str, Any]:
+        """Pause new generation work while keeping the server alive."""
+        return self._make_request("pause_generation", {})
+
+    def continue_generation(self) -> dict[str, Any]:
+        """Resume generation after a temporary pause."""
+        return self._make_request("continue_generation", {})
 
 
 class AsyncHttpServerAdapter(HttpServerAdapter):
@@ -768,6 +779,7 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
         named_tensors = req.serialized_named_tensors
         load_format = req.load_format
         flush_cache = req.flush_cache
+        abort_all_requests = getattr(req, "abort_all_requests", None)
         disable_draft_model = getattr(req, "disable_draft_model", None)
         disable_target_model = getattr(req, "disable_target_model", None)
 
@@ -777,6 +789,8 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
             "load_format": load_format,
             "flush_cache": flush_cache,
         }
+        if abort_all_requests is not None:
+            payload["abort_all_requests"] = abort_all_requests
         if disable_draft_model is not None:
             payload["disable_draft_model"] = disable_draft_model
         if disable_target_model is not None:
@@ -804,6 +818,14 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
 
     async def available_models(self):
         return await self._make_async_request(endpoint="v1/models", method="GET")
+
+    async def pause_generation(self) -> dict[str, Any]:
+        """Pause new generation work while keeping the server alive."""
+        return await self._make_async_request("pause_generation", {})
+
+    async def continue_generation(self) -> dict[str, Any]:
+        """Resume generation after a temporary pause."""
+        return await self._make_async_request("continue_generation", {})
 
     async def flush_cache(self) -> dict[str, Any]:
         """Flush the cache of the server asynchronously.

@@ -152,6 +152,8 @@ async def _sgl_update_weights_with_route(
     disable_target_model: bool | None,
     load_format: str | None = None,
     stage_cpu_tensors_to_device: bool = False,
+    flush_cache: bool = False,
+    abort_all_requests: bool = False,
 ):
     """Update SGLang weights through the official request path with explicit target/draft routing."""
     from sglang.srt.model_executor.model_runner import LocalSerializedTensor
@@ -207,8 +209,9 @@ async def _sgl_update_weights_with_route(
             MultiprocessingSerializer.serialize(named_tensors) for _ in range(infer_tp_size)
         ],
         load_format=load_format,
-        flush_cache=False,
+        flush_cache=flush_cache,
     )
+    setattr(update_weights_request, "abort_all_requests", abort_all_requests)
     if disable_draft_model is not None:
         setattr(update_weights_request, "disable_draft_model", disable_draft_model)
     if disable_target_model is not None:
@@ -355,6 +358,7 @@ class ServerAdapter(BaseRollout):
         await self._init_server_adapter()
 
         peft_config, base_sync_done = kwargs.get("peft_config", None), kwargs.get("base_sync_done", False)
+        post_update_done = False
         if peft_config and base_sync_done:
             if self.device_mesh["infer_tp"].get_local_rank() == 0:
                 # unload lora
@@ -395,18 +399,39 @@ class ServerAdapter(BaseRollout):
             )
             disable_draft_model = True if self.config.drafter.enable else None
             disable_target_model = False if self.config.drafter.enable else None
-            async for params_batch in get_named_tensor_buckets(weights, update_weights_bucket_bytes):
-                await _sgl_update_weights_with_route(
-                    engine=self._engine,
-                    params_batch=params_batch,
-                    device_mesh_key="infer_tp",
-                    device_mesh=self.device_mesh,
-                    disable_draft_model=disable_draft_model,
-                    disable_target_model=disable_target_model,
-                    load_format=load_format,
-                )
+            pause_for_speculative_update = bool(self.config.drafter.enable)
+            generation_paused = False
+            try:
+                if self.device_mesh["infer_tp"].get_local_rank() == 0 and pause_for_speculative_update:
+                    # Match slime's weight-sync discipline: stop new generation
+                    # and wait for SGLang to drop stale speculative KV/prefix
+                    # state before loading target weights.
+                    await self._engine.pause_generation()
+                    generation_paused = True
+                    await self._engine.flush_cache()
 
-        if self.device_mesh["infer_tp"].get_local_rank() == 0:
+                async for params_batch in get_named_tensor_buckets(weights, update_weights_bucket_bytes):
+                    await _sgl_update_weights_with_route(
+                        engine=self._engine,
+                        params_batch=params_batch,
+                        device_mesh_key="infer_tp",
+                        device_mesh=self.device_mesh,
+                        disable_draft_model=disable_draft_model,
+                        disable_target_model=disable_target_model,
+                        load_format=load_format,
+                        flush_cache=False,
+                        abort_all_requests=False,
+                    )
+                if self.device_mesh["infer_tp"].get_local_rank() == 0:
+                    await self._engine.flush_cache()
+                    if global_steps is not None:
+                        await self.server_actor.set_global_steps.remote(global_steps)
+                    post_update_done = True
+            finally:
+                if self.device_mesh["infer_tp"].get_local_rank() == 0 and generation_paused:
+                    await self._engine.continue_generation()
+
+        if not post_update_done and self.device_mesh["infer_tp"].get_local_rank() == 0:
             await self._engine.flush_cache()
             if global_steps is not None:
                 await self.server_actor.set_global_steps.remote(global_steps)
@@ -429,6 +454,8 @@ class ServerAdapter(BaseRollout):
                     VERL_SGLANG_DRAFT_WEIGHT_LOADER if _supports_sglang_custom_weight_loader() else None
                 ),
                 stage_cpu_tensors_to_device=True,
+                flush_cache=False,
+                abort_all_requests=False,
             )
 
         if self.device_mesh["infer_tp"].get_local_rank() == 0:

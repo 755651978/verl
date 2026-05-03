@@ -36,6 +36,7 @@ _EAGLE_VERIFY_MODE_ENV = "VERL_SGLANG_NPU_EAGLE_VERIFY_MODE"
 _EAGLE_V1_TARGET_SAMPLING_ENV = "VERL_SGLANG_NPU_EAGLE_V1_TARGET_SAMPLING"
 _EAGLE_V1_VERIFY_MODE_ENV = "VERL_SGLANG_NPU_EAGLE_V1_VERIFY_MODE"
 _EAGLE_V2_VERIFY_MODE_ENV = "VERL_SGLANG_NPU_EAGLE_V2_VERIFY_MODE"
+_EAGLE_V1_STATE_REPAIR_ENV = "VERL_SGLANG_NPU_EAGLE_V1_STATE_REPAIR"
 
 _target_weight_loader: str | None = os.environ.get(_TARGET_WEIGHT_LOADER_ENV)
 _draft_weight_loader: str | None = os.environ.get(_DRAFT_WEIGHT_LOADER_ENV)
@@ -44,6 +45,7 @@ _ORIGINAL_SGLANG_DIRECT_RUN_SCHEDULER_PROCESS = None
 _SGLANG_EAGLE_UPDATE_PATCHED = False
 _SGLANG_NPU_EAGLE_SAMPLING_PATCHED = False
 _SGLANG_NPU_EAGLE_GREEDY_PATCHED = False
+_SGLANG_NPU_EAGLE_V1_BATCH_OPS_PATCHED = False
 _SGLANG_TRANSFORMERS_EAGLE3_CAPTURE_PATCHED = False
 _SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED = False
 _SGLANG_SCHEDULER_PROCESS_PATCHED = False
@@ -219,6 +221,22 @@ def _is_sglang_npu_backend() -> bool:
     return hasattr(torch, "npu") and torch.npu.is_available()
 
 
+def _env_flag_enabled(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "on", "yes", "y"}:
+        return True
+    if normalized in {"0", "false", "off", "no", "n", ""}:
+        return False
+    return default
+
+
+def _sglang_npu_eagle_v1_state_repair_enabled() -> bool:
+    return _env_flag_enabled(_EAGLE_V1_STATE_REPAIR_ENV, default=False)
+
+
 def _normalize_sglang_npu_eagle_verify_mode(mode: str | None) -> str | None:
     if mode is None:
         return None
@@ -315,6 +333,14 @@ def _trim_eagle_v1_draft_input_to_request_tails(draft_input) -> None:
         )
 
 
+def _trim_eagle_v1_tensor_to_request_tails(value, tail_indices: torch.Tensor, total_accepted: int):
+    if not torch.is_tensor(value) or value.shape[0] == tail_indices.numel():
+        return value
+    if value.shape[0] < total_accepted:
+        return value
+    return value.index_select(0, tail_indices.to(value.device)).contiguous()
+
+
 def _repair_eagle_v1_post_draft_extend_state(batch) -> None:
     draft_input = getattr(batch, "spec_info", None)
     _trim_eagle_v1_draft_input_to_request_tails(draft_input)
@@ -322,6 +348,205 @@ def _repair_eagle_v1_post_draft_extend_state(batch) -> None:
     verified_id = getattr(draft_input, "verified_id", None)
     if torch.is_tensor(verified_id) and verified_id.numel() > 0:
         batch.input_ids = verified_id
+
+    seq_lens = getattr(batch, "seq_lens", None)
+    if torch.is_tensor(seq_lens):
+        batch.seq_lens_sum = int(seq_lens.sum().item())
+
+
+def _normalize_eagle_v1_generation_result_to_request_tails(result) -> None:
+    """Expose v1 speculative decode results to the scheduler as one row per request."""
+    next_token_ids = getattr(result, "next_token_ids", None)
+    if not torch.is_tensor(next_token_ids):
+        return
+
+    tail_indices = _eagle_v1_accepted_tail_indices(
+        getattr(result, "accept_length_per_req_cpu", None),
+        next_token_ids.device,
+    )
+    if tail_indices is None:
+        return
+
+    total_accepted = int(tail_indices[-1].item()) + 1
+    result.next_token_ids = _trim_eagle_v1_tensor_to_request_tails(
+        next_token_ids,
+        tail_indices,
+        total_accepted,
+    )
+
+    logits_output = getattr(result, "logits_output", None)
+    if logits_output is None:
+        return
+    for attr_name in ("next_token_logits", "hidden_states"):
+        value = getattr(logits_output, attr_name, None)
+        trimmed_value = _trim_eagle_v1_tensor_to_request_tails(
+            value,
+            tail_indices,
+            total_accepted,
+        )
+        if trimmed_value is not value:
+            setattr(logits_output, attr_name, trimmed_value)
+
+
+def _eagle_v1_spec_rows(spec_info) -> int:
+    for attr_name in ("verified_id", "topk_p", "hidden_states"):
+        value = getattr(spec_info, attr_name, None)
+        if torch.is_tensor(value):
+            return int(value.shape[0])
+    accept_length_cpu = getattr(spec_info, "accept_length_cpu", None)
+    if accept_length_cpu is not None:
+        return len(accept_length_cpu)
+    return 0
+
+
+def _filter_eagle_v1_accept_length(spec_info, new_indices, has_been_filtered: bool) -> None:
+    accept_length = getattr(spec_info, "accept_length", None)
+    accept_length_cpu = getattr(spec_info, "accept_length_cpu", None)
+    new_size = len(new_indices)
+
+    if torch.is_tensor(accept_length):
+        if has_been_filtered:
+            filtered = accept_length[:new_size]
+        else:
+            index = torch.as_tensor(new_indices, dtype=torch.long, device=accept_length.device)
+            filtered = accept_length[index]
+        setattr(spec_info, "accept_length", filtered)
+        setattr(spec_info, "accept_length_cpu", filtered.detach().cpu().tolist())
+        return
+
+    if accept_length_cpu is None:
+        return
+    accept_length_cpu = list(accept_length_cpu)
+    if has_been_filtered:
+        filtered_cpu = accept_length_cpu[:new_size]
+    else:
+        if torch.is_tensor(new_indices):
+            index_list = new_indices.detach().cpu().tolist()
+        else:
+            index_list = list(new_indices)
+        filtered_cpu = [accept_length_cpu[int(i)] for i in index_list]
+    setattr(spec_info, "accept_length_cpu", filtered_cpu)
+
+
+def _merge_eagle_v1_accept_length(
+    spec_info,
+    old_accept_length,
+    old_accept_length_cpu,
+    old_rows: int,
+    other,
+) -> None:
+    other_rows = _eagle_v1_spec_rows(other)
+    other_accept_length = getattr(other, "accept_length", None)
+    other_accept_length_cpu = getattr(other, "accept_length_cpu", None)
+
+    if torch.is_tensor(old_accept_length) or torch.is_tensor(other_accept_length):
+        if torch.is_tensor(old_accept_length):
+            left = old_accept_length
+            dtype = left.dtype
+            device = left.device
+        else:
+            dtype = other_accept_length.dtype
+            device = other_accept_length.device
+            left = torch.zeros(old_rows, dtype=dtype, device=device)
+
+        if torch.is_tensor(other_accept_length):
+            right = other_accept_length.to(device=device, dtype=dtype)
+        else:
+            right = torch.zeros(other_rows, dtype=dtype, device=device)
+
+        merged = torch.cat([left, right], dim=0)
+        setattr(spec_info, "accept_length", merged)
+        setattr(spec_info, "accept_length_cpu", merged.detach().cpu().tolist())
+        return
+
+    if old_accept_length_cpu is None and other_accept_length_cpu is None:
+        return
+
+    left_cpu = list(old_accept_length_cpu) if old_accept_length_cpu is not None else [0] * old_rows
+    right_cpu = list(other_accept_length_cpu) if other_accept_length_cpu is not None else [0] * other_rows
+    setattr(spec_info, "accept_length_cpu", left_cpu + right_cpu)
+
+
+def _make_eagle_v1_filter_batch_accept_length_patch(original_filter_batch):
+    @wraps(original_filter_batch)
+    def patched_filter_batch(self, new_indices, has_been_filtered: bool = True):
+        has_future_indices = getattr(self, "future_indices", None) is not None
+        result = original_filter_batch(self, new_indices, has_been_filtered)
+        if not has_future_indices:
+            _filter_eagle_v1_accept_length(self, new_indices, has_been_filtered)
+        return result
+
+    patched_filter_batch._verl_patched_npu_eagle_v1_accept_length = True
+    return patched_filter_batch
+
+
+def _make_eagle_v1_merge_batch_accept_length_patch(original_merge_batch):
+    @wraps(original_merge_batch)
+    def patched_merge_batch(self, spec_info):
+        has_future_indices = getattr(self, "future_indices", None) is not None
+        old_hidden_states = getattr(self, "hidden_states", None)
+        other_hidden_states = getattr(spec_info, "hidden_states", None)
+        old_accept_length = getattr(self, "accept_length", None)
+        old_accept_length_cpu = getattr(self, "accept_length_cpu", None)
+        old_rows = 0 if old_hidden_states is None else _eagle_v1_spec_rows(self)
+
+        result = original_merge_batch(self, spec_info)
+        if has_future_indices:
+            return result
+        if old_hidden_states is not None and other_hidden_states is None:
+            return result
+
+        _merge_eagle_v1_accept_length(
+            self,
+            old_accept_length,
+            old_accept_length_cpu,
+            old_rows,
+            spec_info,
+        )
+        return result
+
+    patched_merge_batch._verl_patched_npu_eagle_v1_accept_length = True
+    return patched_merge_batch
+
+
+def patch_sglang_npu_eagle_v1_batch_ops() -> None:
+    """Keep v1 accept-length metadata aligned when SGLang filters or merges batches."""
+    global _SGLANG_NPU_EAGLE_V1_BATCH_OPS_PATCHED
+    if _SGLANG_NPU_EAGLE_V1_BATCH_OPS_PATCHED or not _is_sglang_npu_backend():
+        return
+
+    try:
+        eagle_info = importlib.import_module("sglang.srt.speculative.eagle_info")
+        eagle_draft_input_cls = getattr(eagle_info, "EagleDraftInput", None)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Skip SGLang EAGLE v1 batch-op patch: %s", exc)
+        return
+
+    if eagle_draft_input_cls is None:
+        return
+
+    patched_targets = []
+    original_filter_batch = getattr(eagle_draft_input_cls, "filter_batch", None)
+    if original_filter_batch is not None and not getattr(
+        original_filter_batch,
+        "_verl_patched_npu_eagle_v1_accept_length",
+        False,
+    ):
+        eagle_draft_input_cls.filter_batch = _make_eagle_v1_filter_batch_accept_length_patch(original_filter_batch)
+        patched_targets.append("EagleDraftInput.filter_batch")
+
+    original_merge_batch = getattr(eagle_draft_input_cls, "merge_batch", None)
+    if original_merge_batch is not None and not getattr(
+        original_merge_batch,
+        "_verl_patched_npu_eagle_v1_accept_length",
+        False,
+    ):
+        eagle_draft_input_cls.merge_batch = _make_eagle_v1_merge_batch_accept_length_patch(original_merge_batch)
+        patched_targets.append("EagleDraftInput.merge_batch")
+
+    if patched_targets:
+        _SGLANG_NPU_EAGLE_V1_BATCH_OPS_PATCHED = True
+        logger.warning("Patched SGLang NPU EAGLE v1 batch ops for %s", ", ".join(patched_targets))
 
 
 def _renorm_probs_by_top_k_top_p(
@@ -595,6 +820,17 @@ def _make_eagle_v1_draft_extend_state_patch(original_forward_draft_extend_after_
     return patched_forward_draft_extend_after_decode
 
 
+def _make_eagle_v1_generation_result_state_patch(original_forward_batch_generation):
+    @wraps(original_forward_batch_generation)
+    def patched_forward_batch_generation(self, batch):
+        result = original_forward_batch_generation(self, batch)
+        _normalize_eagle_v1_generation_result_to_request_tails(result)
+        return result
+
+    patched_forward_batch_generation._verl_patched_npu_eagle_v1_result_state_repair = True
+    return patched_forward_batch_generation
+
+
 def _make_sglang_eagle_v2_sample_patch(original_sample):
     sample_globals = dict(original_sample.__globals__)
     sample_globals["_is_npu"] = False
@@ -675,6 +911,12 @@ def patch_sglang_npu_eagle_v1_greedy_path() -> None:
     global _SGLANG_NPU_EAGLE_GREEDY_PATCHED
     if _SGLANG_NPU_EAGLE_GREEDY_PATCHED or not _is_sglang_npu_backend():
         return
+    if not _sglang_npu_eagle_v1_state_repair_enabled():
+        logger.info(
+            "Skip SGLang NPU EAGLE v1 state repair. Set %s=1 to enable it.",
+            _EAGLE_V1_STATE_REPAIR_ENV,
+        )
+        return
 
     patched_targets = []
     try:
@@ -695,6 +937,23 @@ def patch_sglang_npu_eagle_v1_greedy_path() -> None:
             )
             patched_targets.append(
                 "sglang.srt.speculative.eagle_worker.EAGLEWorker.forward_draft_extend_after_decode"
+            )
+
+        original_generation = (
+            getattr(eagle_worker_cls, "forward_batch_generation", None)
+            if eagle_worker_cls is not None
+            else None
+        )
+        if original_generation is not None and not getattr(
+            original_generation,
+            "_verl_patched_npu_eagle_v1_result_state_repair",
+            False,
+        ):
+            eagle_worker_cls.forward_batch_generation = _make_eagle_v1_generation_result_state_patch(
+                original_generation
+            )
+            patched_targets.append(
+                "sglang.srt.speculative.eagle_worker.EAGLEWorker.forward_batch_generation"
             )
 
     except Exception as exc:  # noqa: BLE001
@@ -1066,6 +1325,7 @@ def _apply_sglang_child_process_patches() -> None:
     patch_sglang_transformers_eagle3_capture()
     patch_sglang_eagle_update_weights_from_tensor()
     patch_sglang_npu_eagle_v1_greedy_path()
+    patch_sglang_npu_eagle_v1_batch_ops()
     patch_sglang_npu_eagle_target_sampling()
     patch_sglang_hidden_states_tensor_output()
 
@@ -1135,6 +1395,7 @@ def install_sglang_verl_patches(
     patch_sglang_transformers_eagle3_capture()
     patch_sglang_eagle_update_weights_from_tensor()
     patch_sglang_npu_eagle_v1_greedy_path()
+    patch_sglang_npu_eagle_v1_batch_ops()
     patch_sglang_npu_eagle_target_sampling()
     patch_sglang_hidden_states_tensor_output()
     patch_sglang_scheduler_process_entrypoints()
