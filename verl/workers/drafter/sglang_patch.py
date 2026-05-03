@@ -39,6 +39,7 @@ _EAGLE_V2_VERIFY_MODE_ENV = "VERL_SGLANG_NPU_EAGLE_V2_VERIFY_MODE"
 _EAGLE_V1_STATE_REPAIR_ENV = "VERL_SGLANG_NPU_EAGLE_V1_STATE_REPAIR"
 _DISABLE_SGLANG_PATCH_ENV = "VERL_DISABLE_SGLANG_PATCH"
 _SGLANG_PATCHES_ENV = "VERL_SGLANG_PATCHES"
+_DISABLE_DRAFT_CUDA_GRAPH_ENV = "VERL_DISABLE_SGLANG_DRAFT_CUDA_GRAPH"
 
 _target_weight_loader: str | None = os.environ.get(_TARGET_WEIGHT_LOADER_ENV)
 _draft_weight_loader: str | None = os.environ.get(_DRAFT_WEIGHT_LOADER_ENV)
@@ -48,6 +49,8 @@ _SGLANG_EAGLE_UPDATE_PATCHED = False
 _SGLANG_NPU_EAGLE_SAMPLING_PATCHED = False
 _SGLANG_NPU_EAGLE_GREEDY_PATCHED = False
 _SGLANG_NPU_EAGLE_V1_BATCH_OPS_PATCHED = False
+_SGLANG_DRAFT_CUDA_GRAPH_PATCHED = False
+_SGLANG_DRAFT_WORKER_MODEL_RUNNER_PATCHED = False
 _SGLANG_TRANSFORMERS_EAGLE3_CAPTURE_PATCHED = False
 _SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED = False
 _SGLANG_SCHEDULER_PROCESS_PATCHED = False
@@ -64,6 +67,14 @@ _SGLANG_PATCH_ALIASES = {
     "weight_routing": "eagle_update_weights",
     "route_weights": "eagle_update_weights",
     "target_draft_weight_routing": "eagle_update_weights",
+    "draft_cuda_graph": "draft_cuda_graph",
+    "disable_draft_cuda_graph": "draft_cuda_graph",
+    "draft_graph": "draft_cuda_graph",
+    "draft_worker_model_runner": "draft_worker_model_runner",
+    "draft_worker_runner": "draft_worker_model_runner",
+    "draft_routed_experts": "draft_worker_model_runner",
+    "routed_experts_draft": "draft_worker_model_runner",
+    "draft_offloader": "draft_worker_model_runner",
     "npu_eagle_v1_state_repair": "npu_eagle_v1_state_repair",
     "v1_state_repair": "npu_eagle_v1_state_repair",
     "npu_eagle_v1_batch_ops": "npu_eagle_v1_batch_ops",
@@ -602,6 +613,312 @@ def patch_sglang_npu_eagle_v1_batch_ops() -> None:
     if patched_targets:
         _SGLANG_NPU_EAGLE_V1_BATCH_OPS_PATCHED = True
         logger.warning("Patched SGLang NPU EAGLE v1 batch ops for %s", ", ".join(patched_targets))
+
+
+def _is_draft_worker_init_call(original_init, args, kwargs) -> bool:
+    try:
+        bound = inspect.signature(original_init).bind_partial(None, *args, **kwargs)
+    except TypeError:
+        return bool(kwargs.get("is_draft_worker", False))
+    return bool(bound.arguments.get("is_draft_worker", False))
+
+
+def _draft_cuda_graph_disabled_for_worker(worker) -> bool:
+    server_args = getattr(worker, "server_args", None)
+    return bool(getattr(server_args, "disable_draft_cuda_graph", False)) or _env_flag_enabled(
+        _DISABLE_DRAFT_CUDA_GRAPH_ENV,
+        default=False,
+    )
+
+
+def _zero_draft_cuda_graph_buffer_owner(owner) -> None:
+    for attr_name in ("topk_p", "topk_index", "hidden_states", "req_pool_indices"):
+        value = getattr(owner, attr_name, None)
+        if torch.is_tensor(value):
+            value.zero_()
+
+
+def _zero_draft_cuda_graph_padding_buffers(runner) -> None:
+    _zero_draft_cuda_graph_buffer_owner(runner)
+    for container_name in ("buffers", "cuda_graph_buffers", "input_buffers"):
+        container = getattr(runner, container_name, None)
+        if container is None:
+            continue
+        if isinstance(container, dict):
+            for key, value in container.items():
+                if key in {"topk_p", "topk_index", "hidden_states", "req_pool_indices"} and torch.is_tensor(value):
+                    value.zero_()
+                else:
+                    _zero_draft_cuda_graph_buffer_owner(value)
+            continue
+        values = container
+        if not isinstance(values, (list, tuple, set)):
+            values = [values]
+        for owner in values:
+            _zero_draft_cuda_graph_buffer_owner(owner)
+
+
+def _draft_cuda_graph_vocab_size(runner):
+    model_runner = getattr(runner, "model_runner", None)
+    model_config = getattr(model_runner, "model_config", None)
+    return getattr(model_config, "vocab_size", None)
+
+
+def _clamp_draft_cuda_graph_inputs(runner, forward_batch):
+    spec_info = getattr(forward_batch, "spec_info", None)
+    if spec_info is None:
+        return None
+
+    backup = []
+    topk_p = getattr(spec_info, "topk_p", None)
+    if torch.is_tensor(topk_p):
+        backup.append(("topk_p", topk_p))
+        spec_info.topk_p = topk_p.clamp(0, 1)
+
+    topk_index = getattr(spec_info, "topk_index", None)
+    if torch.is_tensor(topk_index):
+        backup.append(("topk_index", topk_index))
+        vocab_size = _draft_cuda_graph_vocab_size(runner)
+        if vocab_size is None:
+            spec_info.topk_index = topk_index.clamp_min(0)
+        else:
+            spec_info.topk_index = topk_index.clamp(0, int(vocab_size) - 1)
+
+    return (spec_info, backup) if backup else None
+
+
+def _restore_draft_cuda_graph_inputs(backup_state) -> None:
+    if backup_state is None:
+        return
+    spec_info, backup = backup_state
+    for attr_name, value in backup:
+        setattr(spec_info, attr_name, value)
+
+
+def _make_draft_cuda_graph_replay_patch(original_replay):
+    @wraps(original_replay)
+    def patched_replay(self, forward_batch, *args, **kwargs):
+        _zero_draft_cuda_graph_padding_buffers(self)
+        backup_state = _clamp_draft_cuda_graph_inputs(self, forward_batch)
+        try:
+            return original_replay(self, forward_batch, *args, **kwargs)
+        finally:
+            _restore_draft_cuda_graph_inputs(backup_state)
+
+    patched_replay._verl_patched_draft_cuda_graph_replay = True
+    return patched_replay
+
+
+def _make_draft_cuda_graph_init_patch(original_init_cuda_graphs):
+    @wraps(original_init_cuda_graphs)
+    def patched_init_cuda_graphs(self, *args, **kwargs):
+        if _draft_cuda_graph_disabled_for_worker(self):
+            self.cuda_graph_runner = None
+            self.cuda_graph_runner_for_draft_extend = None
+            return None
+        return original_init_cuda_graphs(self, *args, **kwargs)
+
+    patched_init_cuda_graphs._verl_patched_draft_cuda_graph_init = True
+    return patched_init_cuda_graphs
+
+
+def patch_sglang_draft_cuda_graph() -> None:
+    """Apply slime's draft graph fixes: disable hook, padding cleanup, and top-k clamp."""
+    global _SGLANG_DRAFT_CUDA_GRAPH_PATCHED
+    if _SGLANG_DRAFT_CUDA_GRAPH_PATCHED:
+        return
+
+    patched_targets = []
+    try:
+        module = importlib.import_module("sglang.srt.speculative.eagle_draft_cuda_graph_runner")
+        runner_cls = getattr(module, "EAGLEDraftCudaGraphRunner", None)
+        original_replay = getattr(runner_cls, "replay", None) if runner_cls is not None else None
+        if original_replay is not None and not getattr(
+            original_replay,
+            "_verl_patched_draft_cuda_graph_replay",
+            False,
+        ):
+            runner_cls.replay = _make_draft_cuda_graph_replay_patch(original_replay)
+            patched_targets.append("EAGLEDraftCudaGraphRunner.replay")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Skip SGLang draft cuda graph replay patch: %s", exc)
+
+    for module_name in ("sglang.srt.speculative.eagle_worker", "sglang.srt.speculative.eagle_worker_v2"):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Skip SGLang draft cuda graph init patch for %s: %s", module_name, exc)
+            continue
+        for class_name, cls in vars(module).items():
+            if not isinstance(cls, type) or not class_name.lower().startswith("eagle"):
+                continue
+            original_init_cuda_graphs = getattr(cls, "init_cuda_graphs", None)
+            if original_init_cuda_graphs is None or getattr(
+                original_init_cuda_graphs,
+                "_verl_patched_draft_cuda_graph_init",
+                False,
+            ):
+                continue
+            cls.init_cuda_graphs = _make_draft_cuda_graph_init_patch(original_init_cuda_graphs)
+            patched_targets.append(f"{module_name}.{class_name}.init_cuda_graphs")
+
+    if patched_targets:
+        _SGLANG_DRAFT_CUDA_GRAPH_PATCHED = True
+        logger.warning("Patched SGLang draft cuda graph for %s", ", ".join(patched_targets))
+
+
+class _NoopRoutedExpertsCapturer:
+    def on_forward_end(self, *args, **kwargs):
+        return None
+
+
+def _make_model_runner_init_no_draft_offloader_patch(original_init):
+    @wraps(original_init)
+    def patched_model_runner_init(self, *args, **kwargs):
+        if not _is_draft_worker_init_call(original_init, args, kwargs):
+            return original_init(self, *args, **kwargs)
+
+        original_set_offloader = original_init.__globals__.get("set_offloader")
+        if original_set_offloader is None:
+            return original_init(self, *args, **kwargs)
+
+        def noop_set_offloader(*_args, **_kwargs):
+            return None
+
+        original_init.__globals__["set_offloader"] = noop_set_offloader
+        try:
+            return original_init(self, *args, **kwargs)
+        finally:
+            original_init.__globals__["set_offloader"] = original_set_offloader
+
+    patched_model_runner_init._verl_patched_draft_worker_no_offloader = True
+    return patched_model_runner_init
+
+
+def _make_init_routed_experts_skip_draft_patch(original_init_routed_experts):
+    @wraps(original_init_routed_experts)
+    def patched_init_routed_experts(self, *args, **kwargs):
+        if getattr(self, "is_draft_worker", False):
+            return None
+        return original_init_routed_experts(self, *args, **kwargs)
+
+    patched_init_routed_experts._verl_patched_skip_draft_routed_experts = True
+    return patched_init_routed_experts
+
+
+def _make_model_runner_forward_routed_experts_patch(original_forward):
+    try:
+        source = inspect.getsource(original_forward)
+    except (OSError, TypeError):
+        return None
+
+    source = textwrap.dedent(source)
+    old_block = """    # Copy cached routing experts' buffers back to CPU cache
+    get_global_experts_capturer().on_forward_end(
+        forward_batch=forward_batch,
+        can_run_graph=output.can_run_graph,
+        cuda_graph_batch=getattr(self.graph_runner, "bs", None),
+    )
+"""
+    new_block = """    if not self.is_draft_worker:
+        # In speculative decoding, num_tokens_per_bs > 1, so pass the
+        # actual graph token count instead of the request batch size.
+        cuda_graph_num_tokens = None
+        if getattr(self.graph_runner, "bs", None):
+            cuda_graph_num_tokens = self.graph_runner.bs * self.graph_runner.num_tokens_per_bs
+        get_global_experts_capturer().on_forward_end(
+            forward_batch=forward_batch,
+            can_run_graph=output.can_run_graph,
+            cuda_graph_batch=cuda_graph_num_tokens,
+        )
+"""
+    patched_source = source.replace(old_block, new_block)
+    if patched_source == source:
+        return None
+
+    namespace = {}
+    exec(  # noqa: S102
+        "from __future__ import annotations\n" + patched_source,
+        original_forward.__globals__,
+        namespace,
+    )
+    patched_forward = namespace[original_forward.__name__]
+    patched_forward = wraps(original_forward)(patched_forward)
+    patched_forward._verl_patched_draft_worker_routed_experts_forward = True
+    return patched_forward
+
+
+def _make_model_runner_forward_routed_experts_fallback(original_forward):
+    @wraps(original_forward)
+    def patched_forward(self, *args, **kwargs):
+        if not getattr(self, "is_draft_worker", False):
+            return original_forward(self, *args, **kwargs)
+
+        globals_dict = original_forward.__globals__
+        get_capturer = globals_dict.get("get_global_experts_capturer")
+        set_capturer = globals_dict.get("set_global_experts_capturer")
+        if get_capturer is None or set_capturer is None:
+            return original_forward(self, *args, **kwargs)
+
+        original_capturer = get_capturer()
+        set_capturer(_NoopRoutedExpertsCapturer())
+        try:
+            return original_forward(self, *args, **kwargs)
+        finally:
+            set_capturer(original_capturer)
+
+    patched_forward._verl_patched_draft_worker_routed_experts_forward = True
+    return patched_forward
+
+
+def patch_sglang_draft_worker_model_runner() -> None:
+    """Apply slime's draft-worker ModelRunner guards for offloader and routed experts."""
+    global _SGLANG_DRAFT_WORKER_MODEL_RUNNER_PATCHED
+    if _SGLANG_DRAFT_WORKER_MODEL_RUNNER_PATCHED:
+        return
+
+    try:
+        module = importlib.import_module("sglang.srt.model_executor.model_runner")
+        model_runner_cls = getattr(module, "ModelRunner", None)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Skip SGLang draft worker ModelRunner patch: %s", exc)
+        return
+
+    if model_runner_cls is None:
+        return
+
+    patched_targets = []
+    original_init = getattr(model_runner_cls, "__init__", None)
+    if original_init is not None and not getattr(original_init, "_verl_patched_draft_worker_no_offloader", False):
+        model_runner_cls.__init__ = _make_model_runner_init_no_draft_offloader_patch(original_init)
+        patched_targets.append("ModelRunner.__init__")
+
+    original_init_routed_experts = getattr(model_runner_cls, "init_routed_experts_capturer", None)
+    if original_init_routed_experts is not None and not getattr(
+        original_init_routed_experts,
+        "_verl_patched_skip_draft_routed_experts",
+        False,
+    ):
+        model_runner_cls.init_routed_experts_capturer = _make_init_routed_experts_skip_draft_patch(
+            original_init_routed_experts
+        )
+        patched_targets.append("ModelRunner.init_routed_experts_capturer")
+
+    original_forward = getattr(model_runner_cls, "forward", None)
+    if original_forward is not None and not getattr(
+        original_forward,
+        "_verl_patched_draft_worker_routed_experts_forward",
+        False,
+    ):
+        patched_forward = _make_model_runner_forward_routed_experts_patch(original_forward)
+        if patched_forward is None:
+            patched_forward = _make_model_runner_forward_routed_experts_fallback(original_forward)
+        model_runner_cls.forward = patched_forward
+        patched_targets.append("ModelRunner.forward")
+
+    if patched_targets:
+        _SGLANG_DRAFT_WORKER_MODEL_RUNNER_PATCHED = True
+        logger.warning("Patched SGLang draft worker ModelRunner for %s", ", ".join(patched_targets))
 
 
 def _renorm_probs_by_top_k_top_p(
@@ -1378,6 +1695,8 @@ def patch_sglang_hidden_states_tensor_output() -> None:
 
 def _apply_selected_sglang_patches() -> bool:
     patchers = (
+        ("draft_worker_model_runner", patch_sglang_draft_worker_model_runner),
+        ("draft_cuda_graph", patch_sglang_draft_cuda_graph),
         ("transformers_eagle3_capture", patch_sglang_transformers_eagle3_capture),
         ("eagle_update_weights", patch_sglang_eagle_update_weights_from_tensor),
         ("npu_eagle_v1_state_repair", patch_sglang_npu_eagle_v1_greedy_path),
