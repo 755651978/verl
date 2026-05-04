@@ -38,6 +38,7 @@ _EAGLE_V1_VERIFY_MODE_ENV = "VERL_SGLANG_NPU_EAGLE_V1_VERIFY_MODE"
 _EAGLE_V2_VERIFY_MODE_ENV = "VERL_SGLANG_NPU_EAGLE_V2_VERIFY_MODE"
 _EAGLE_V1_STATE_REPAIR_ENV = "VERL_SGLANG_NPU_EAGLE_V1_STATE_REPAIR"
 _EAGLE_FORCE_FP32_SAMPLING_ENV = "VERL_SGLANG_NPU_EAGLE_FORCE_FP32_SAMPLING"
+_EAGLE_TOP_K_RENORM_FAST_PATH_ENV = "VERL_SGLANG_NPU_EAGLE_TOP_K_RENORM_FAST_PATH"
 _DISABLE_SGLANG_PATCH_ENV = "VERL_DISABLE_SGLANG_PATCH"
 _SGLANG_PATCHES_ENV = "VERL_SGLANG_PATCHES"
 _DISABLE_DRAFT_CUDA_GRAPH_ENV = "VERL_DISABLE_SGLANG_DRAFT_CUDA_GRAPH"
@@ -291,7 +292,11 @@ def _sglang_npu_eagle_v1_state_repair_enabled() -> bool:
 
 
 def _sglang_npu_eagle_force_fp32_sampling_enabled() -> bool:
-    return _env_flag_enabled(_EAGLE_FORCE_FP32_SAMPLING_ENV, default=True)
+    return _env_flag_enabled(_EAGLE_FORCE_FP32_SAMPLING_ENV, default=False)
+
+
+def _sglang_npu_eagle_top_k_renorm_fast_path_enabled() -> bool:
+    return _env_flag_enabled(_EAGLE_TOP_K_RENORM_FAST_PATH_ENV, default=False)
 
 
 def _sglang_verl_patches_disabled() -> bool:
@@ -1453,7 +1458,57 @@ def _renorm_probs_by_top_k_top_p(
     return renormed_probs
 
 
+def _top_k_renorm_prob_torch_fast(probs: torch.Tensor, top_ks: torch.Tensor) -> torch.Tensor:
+    vocab_size = probs.shape[-1]
+    probs_for_sampling = _as_sglang_npu_eagle_sampling_float(probs)
+    if probs_for_sampling.numel() == 0:
+        return probs_for_sampling
+
+    top_ks = top_ks.to(device=probs_for_sampling.device, dtype=torch.long).view(-1)
+    vocab_size_tensor = torch.full_like(top_ks, vocab_size)
+    top_ks = torch.where((top_ks <= 0) | (top_ks >= _SGLANG_TOP_K_ALL), vocab_size_tensor, top_ks)
+    top_ks = torch.minimum(top_ks, vocab_size_tensor)
+
+    if bool(torch.all(top_ks >= vocab_size).item()):
+        return probs_for_sampling
+
+    fast_row_indices = torch.nonzero(top_ks < vocab_size, as_tuple=False).view(-1)
+    if fast_row_indices.numel() == 0:
+        return probs_for_sampling
+
+    fast_top_ks = top_ks.index_select(0, fast_row_indices)
+    max_top_k = int(fast_top_ks.max().item())
+    if max_top_k <= 0:
+        return probs_for_sampling
+
+    fast_probs = probs_for_sampling.index_select(0, fast_row_indices)
+    topk_probs, topk_indices = torch.topk(fast_probs, max_top_k, dim=-1)
+    ranks = torch.arange(max_top_k, device=probs_for_sampling.device).view(1, -1)
+    topk_probs = topk_probs.masked_fill(ranks >= fast_top_ks.view(-1, 1), 0.0)
+
+    normalizer = topk_probs.sum(dim=-1, keepdim=True)
+    topk_probs = torch.where(
+        normalizer > 0,
+        topk_probs / normalizer.clamp_min(torch.finfo(probs_for_sampling.dtype).tiny),
+        0.0,
+    )
+
+    fast_renormed_probs = torch.zeros_like(fast_probs)
+    fast_renormed_probs.scatter_(dim=1, index=topk_indices, src=topk_probs)
+    if fast_row_indices.numel() == probs_for_sampling.shape[0]:
+        return fast_renormed_probs
+
+    renormed_probs = probs_for_sampling.clone()
+    renormed_probs.index_copy_(0, fast_row_indices, fast_renormed_probs)
+    return renormed_probs
+
+
 def _top_k_renorm_prob_torch(probs: torch.Tensor, top_ks: torch.Tensor) -> torch.Tensor:
+    if _sglang_npu_eagle_top_k_renorm_fast_path_enabled():
+        try:
+            return _top_k_renorm_prob_torch_fast(probs, top_ks)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("SGLang NPU top-k renorm fast path failed; falling back to sort path: %s", exc)
     top_ps = torch.ones(
         (probs.shape[0],),
         dtype=torch.float32 if _sglang_npu_eagle_force_fp32_sampling_enabled() else probs.dtype,
@@ -1535,6 +1590,120 @@ def _try_sglang_tree_speculative_sampling_kernel(
     except Exception as exc:  # noqa: BLE001
         logger.debug("SGLang tree speculative CUDA kernel failed; falling back to torch path: %s", exc)
         return False
+
+
+def _tree_speculative_sampling_target_only_linear_torch(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    uniform_samples: torch.Tensor,
+    uniform_samples_for_final_sampling: torch.Tensor,
+    target_probs: torch.Tensor,
+    threshold_single: float,
+    threshold_acc: float,
+) -> None:
+    """Fast path for linear EAGLE trees without siblings."""
+    batch_size, _ = candidates.shape
+    num_speculative_tokens = accept_index.shape[1]
+    target_probs_for_sampling = _as_sglang_npu_eagle_sampling_float(target_probs)
+    uniform_samples_for_sampling = _as_sglang_npu_eagle_sampling_float(uniform_samples)
+    final_uniform_samples_for_sampling = _as_sglang_npu_eagle_sampling_float(
+        uniform_samples_for_final_sampling
+    )
+    device = target_probs_for_sampling.device
+
+    threshold_acc = max(float(threshold_acc), 1e-9)
+    threshold_single = float(threshold_single)
+
+    accept_index.fill_(-1)
+    accept_token_num.zero_()
+
+    batch_indices = torch.arange(batch_size, dtype=torch.long, device=device)
+    inactive_next_idx = torch.full((batch_size,), -1, dtype=torch.long, device=device)
+    reset_retrive_idx = torch.full((batch_size,), -1, dtype=torch.long, device=device)
+    reset_residual_prob = torch.zeros(
+        (batch_size,),
+        dtype=target_probs_for_sampling.dtype,
+        device=device,
+    )
+
+    cur_prob_idx = torch.zeros((batch_size,), dtype=torch.long, device=device)
+    accepted_count = torch.zeros((batch_size,), dtype=torch.long, device=device)
+    active = torch.ones((batch_size,), dtype=torch.bool, device=device)
+
+    last_accepted_retrive_idx = retrive_index[:, 0].to(torch.long)
+    accept_index[:, 0].copy_(last_accepted_retrive_idx.to(dtype=accept_index.dtype))
+    coin = uniform_samples_for_sampling[:, 0]
+    residual_token_id = reset_retrive_idx.clone()
+    residual_token_prob = reset_residual_prob.clone()
+
+    for _ in range(1, num_speculative_tokens):
+        next_idx = torch.where(
+            active,
+            retrive_next_token[batch_indices, cur_prob_idx],
+            inactive_next_idx,
+        )
+        valid = active & (next_idx >= 0)
+        safe_next_idx = next_idx.clamp_min(0)
+        draft_token_id = candidates[batch_indices, safe_next_idx].to(torch.long)
+        target_prob_single = target_probs_for_sampling[
+            batch_indices,
+            cur_prob_idx,
+            draft_token_id,
+        ]
+        target_prob_single = torch.where(valid, target_prob_single, torch.zeros_like(target_prob_single))
+        accepted = valid & (
+            (coin <= (target_prob_single / threshold_acc)) | (target_prob_single >= threshold_single)
+        )
+        rejected = valid & ~accepted
+
+        residual_token_id = torch.where(rejected, draft_token_id, residual_token_id)
+        residual_token_prob = torch.where(rejected, target_prob_single, residual_token_prob)
+
+        accepted_retrive_idx = retrive_index[batch_indices, safe_next_idx].to(torch.long)
+        old_predicts = predicts.gather(dim=0, index=last_accepted_retrive_idx)
+        predict_updates = torch.where(accepted, draft_token_id.to(dtype=predicts.dtype), old_predicts)
+        predicts.scatter_(dim=0, index=last_accepted_retrive_idx, src=predict_updates)
+
+        next_accepted_count = accepted_count + accepted.to(dtype=torch.long)
+        accept_index_position = next_accepted_count.clamp_max(num_speculative_tokens - 1).view(-1, 1)
+        old_accept_index = accept_index.gather(dim=1, index=accept_index_position).squeeze(1)
+        accept_index_updates = torch.where(
+            accepted,
+            accepted_retrive_idx.to(dtype=accept_index.dtype),
+            old_accept_index,
+        )
+        accept_index.scatter_(dim=1, index=accept_index_position, src=accept_index_updates.view(-1, 1))
+
+        cur_prob_idx = torch.where(accepted, safe_next_idx, cur_prob_idx)
+        last_accepted_retrive_idx = torch.where(accepted, accepted_retrive_idx, last_accepted_retrive_idx)
+        accepted_count = next_accepted_count
+        coin = uniform_samples_for_sampling[batch_indices, cur_prob_idx]
+        active = accepted
+        residual_token_id = torch.where(accepted, reset_retrive_idx, residual_token_id)
+        residual_token_prob = torch.where(accepted, reset_residual_prob, residual_token_prob)
+
+    accept_token_num.copy_(accepted_count.to(dtype=accept_token_num.dtype))
+
+    final_target_probs = target_probs_for_sampling[batch_indices, cur_prob_idx]
+    need_residual = accepted_count != (num_speculative_tokens - 1)
+    residual_mask = need_residual & (residual_token_id >= 0)
+    if bool(residual_mask.any().item()):
+        final_probs = final_target_probs.clone()
+        residual_rows = torch.nonzero(residual_mask, as_tuple=False).view(-1)
+        residual_cols = residual_token_id[residual_rows]
+        final_probs[residual_rows, residual_cols] = torch.clamp(
+            final_probs[residual_rows, residual_cols] - residual_token_prob[residual_rows],
+            min=0.0,
+        )
+    else:
+        final_probs = final_target_probs
+    final_probs = torch.where(final_probs.sum(dim=-1, keepdim=True) > 0, final_probs, final_target_probs)
+    final_token_ids = _sample_from_probs_with_coin(final_probs, final_uniform_samples_for_sampling)
+    predicts.scatter_(dim=0, index=last_accepted_retrive_idx, src=final_token_ids.to(dtype=predicts.dtype))
 
 
 def _tree_speculative_sampling_target_only_vectorized_torch(
@@ -1698,6 +1867,23 @@ def _tree_speculative_sampling_target_only_torch(
         threshold_acc=threshold_acc,
         deterministic=deterministic,
     ):
+        return
+
+    # Linear EAGLE trees (for example spec_topk=1) can skip sibling scanning.
+    if not bool(torch.any(retrive_next_sibling >= 0).item()):
+        _tree_speculative_sampling_target_only_linear_torch(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates,
+            retrive_index=retrive_index,
+            retrive_next_token=retrive_next_token,
+            uniform_samples=uniform_samples,
+            uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
+            target_probs=target_probs,
+            threshold_single=threshold_single,
+            threshold_acc=threshold_acc,
+        )
         return
 
     _tree_speculative_sampling_target_only_vectorized_torch(

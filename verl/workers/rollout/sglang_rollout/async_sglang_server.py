@@ -100,6 +100,21 @@ def _top_logprobs_to_tensor(top_logprobs: list, topk: int) -> Optional[torch.Ten
     return torch.tensor(rows, dtype=torch.float32)
 
 
+def _response_aligned_top_logprobs_to_tensor(
+    prompt_len: int,
+    output_top_logprobs: list,
+    topk: int,
+) -> Optional[torch.Tensor]:
+    if not output_top_logprobs:
+        return None
+
+    # Drafter loss is response-only. Some SGLang GPU speculative paths may
+    # return partial input_top_logprobs, so keep prompt target rows as masked
+    # placeholders and align finite rows only from generated response tokens.
+    prompt_target_padding = [[] for _ in range(max(int(prompt_len) - 1, 0))]
+    return _top_logprobs_to_tensor(prompt_target_padding + output_top_logprobs, topk)
+
+
 def _hidden_state_chunk_to_tensor(hidden_state_chunk: Any) -> Optional[torch.Tensor]:
     if hidden_state_chunk is None:
         return None
@@ -649,27 +664,14 @@ class SGLangHttpServer:
         if should_collect:
             target_logprobs = None
             if self.config.drafter.training.use_logits:
-                input_top = output.get("meta_info", {}).get("input_top_logprobs", [])
                 output_top = output.get("meta_info", {}).get("output_top_logprobs", [])
-                if len(input_top) > 1:
-                    target_logprobs = _top_logprobs_to_tensor(
-                        input_top[1:] + output_top,
-                        int(self.config.drafter.training.logits_topk),
-                    )
-                    if target_logprobs is None:
-                        logger.warning("Failed to convert top_logprobs to tensor; skip target_logprobs collection")
-                elif output_top:
-                    # Keep prompt-prefix logprob collection off by default so
-                    # drafter targets do not force SGLang onto a different
-                    # prefix-cache/logprob path. Prompt rows are masked out
-                    # during drafter training, so invalid placeholders are OK.
-                    prompt_target_padding = [[] for _ in range(max(len(prompt_ids) - 1, 0))]
-                    target_logprobs = _top_logprobs_to_tensor(
-                        prompt_target_padding + output_top,
-                        int(self.config.drafter.training.logits_topk),
-                    )
-                    if target_logprobs is None:
-                        logger.warning("Failed to convert output top_logprobs to tensor; skip target_logprobs collection")
+                target_logprobs = _response_aligned_top_logprobs_to_tensor(
+                    prompt_len=len(prompt_ids),
+                    output_top_logprobs=output_top,
+                    topk=int(self.config.drafter.training.logits_topk),
+                )
+                if target_logprobs is None:
+                    logger.warning("Failed to convert output top_logprobs to tensor; skip target_logprobs collection")
 
             hidden_states_data = output.get("meta_info", {}).get("hidden_states", [])
             hidden_states_list = []
