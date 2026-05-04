@@ -49,6 +49,7 @@ from verl.workers.rollout.vllm_rollout.utils import (
     VLLM_LORA_PATH,
     SuppressSignalInThread,
     build_cli_args_from_config,
+    build_vllm_drafter_speculative_config,
     extract_prompt_logprobs,
     get_vllm_max_lora_rank,
 )
@@ -283,8 +284,11 @@ class vLLMHttpServer:
                     served_model_name = served_model_name.split("/")[-1]
                 args["served_model_name"] = served_model_name
 
+        drafter_speculative_config = build_vllm_drafter_speculative_config(self.config)
+        if drafter_speculative_config is not None:
+            args["speculative_config"] = drafter_speculative_config
         # mtp (None for diffusion models; only LLM models use speculative decoding)
-        if self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout:
+        elif self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout:
             speculative_config = {
                 "method": self.config.mtp.method,
                 "num_speculative_tokens": self.config.mtp.num_speculative_tokens,

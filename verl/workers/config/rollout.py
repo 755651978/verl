@@ -83,6 +83,7 @@ class DrafterRolloutConfig(BaseConfig):
 @dataclass
 class DrafterTrainingConfig(BaseConfig):
     collect_hidden_states_from_sgl: bool = False
+    collect_hidden_states_from_vllm: bool = False
     use_data_buffer: bool = False
     collect_interval_steps: int = 1
     collection_sample_rate: float = 1.0

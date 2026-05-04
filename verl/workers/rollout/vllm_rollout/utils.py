@@ -103,6 +103,63 @@ def get_vllm_max_lora_rank(lora_rank: int):
             return rank
 
 
+def _get_config_value(config: Any, key: str, default: Any = None) -> Any:
+    if config is None:
+        return default
+    if isinstance(config, dict):
+        return config.get(key, default)
+    getter = getattr(config, "get", None)
+    if callable(getter):
+        try:
+            return getter(key, default)
+        except TypeError:
+            pass
+    return getattr(config, key, default)
+
+
+def build_vllm_drafter_speculative_config(config: Any) -> Optional[dict[str, Any]]:
+    """Build the minimal vLLM/vLLM-Ascend speculative_config from rollout.drafter."""
+    drafter_config = _get_config_value(config, "drafter")
+    if not bool(_get_config_value(drafter_config, "enable", False)):
+        return None
+
+    mtp_config = _get_config_value(config, "mtp")
+    mtp_enabled = bool(
+        _get_config_value(mtp_config, "enable", False) and _get_config_value(mtp_config, "enable_rollout", False)
+    )
+    if mtp_enabled:
+        raise ValueError("rollout.drafter and rollout.mtp cannot both configure vLLM speculative_config")
+
+    pipeline_model_parallel_size = int(_get_config_value(config, "pipeline_model_parallel_size", 1) or 1)
+    if pipeline_model_parallel_size != 1:
+        raise ValueError("vLLM speculative decoding with drafter requires pipeline_model_parallel_size=1")
+
+    algorithm = str(_get_config_value(drafter_config, "speculative_algorithm", "")).lower()
+    if algorithm not in {"eagle", "eagle3"}:
+        raise ValueError(f"Unknown vLLM drafter speculative_algorithm: {algorithm}")
+
+    drafter_rollout_config = _get_config_value(drafter_config, "rollout")
+    num_speculative_tokens = int(_get_config_value(drafter_rollout_config, "spec_verify_tokens", 0) or 0)
+    if num_speculative_tokens <= 0:
+        raise ValueError("rollout.drafter.rollout.spec_verify_tokens must be positive for vLLM speculative decoding")
+
+    model_path = _get_config_value(drafter_config, "model_path")
+    if not model_path:
+        raise ValueError("rollout.drafter.model_path is required for vLLM speculative decoding")
+
+    speculative_config = {
+        "model": model_path,
+        "method": algorithm,
+        "num_speculative_tokens": num_speculative_tokens,
+    }
+
+    draft_tensor_parallel_size = _get_config_value(drafter_rollout_config, "draft_tensor_parallel_size")
+    if draft_tensor_parallel_size is not None:
+        speculative_config["draft_tensor_parallel_size"] = int(draft_tensor_parallel_size)
+
+    return {key: value for key, value in speculative_config.items() if value is not None}
+
+
 # https://github.com/vllm-project/vllm/issues/13175
 def monkey_patch_compute_logits(model, vocab_size: int):
     original_compute_logits = model.compute_logits

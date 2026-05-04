@@ -461,6 +461,7 @@ drafter:
   training:
     _target_: verl.workers.config.DrafterTrainingConfig
     collect_hidden_states_from_sgl: false
+    collect_hidden_states_from_vllm: false
     use_data_buffer: false
     collect_interval_steps: 1
     collection_sample_rate: 1.0
