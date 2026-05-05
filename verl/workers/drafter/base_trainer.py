@@ -1057,6 +1057,7 @@ class DrafterBaseTrainer:
             packed_loss_tokens += int(item_loss_mask[1 : 1 + train_seq_len].detach().float().sum().cpu().item())
 
             if alignment_debug_enabled():
+                source_item = items[item_idx] if item_idx < len(items) else {}
                 sample_index = self._alignment_debug_sample_index(current_step, "prepare_item")
                 train_target_logprobs = None
                 if self.backend.model_type == "eagle3" and use_logits:
@@ -1087,14 +1088,14 @@ class DrafterBaseTrainer:
                             "hidden_len": int(h_states.size(0)),
                             "loss_len": int(item_loss_mask.size(0)),
                             "target_len": int(target_logprobs_item.size(0)) if target_logprobs_item is not None else None,
-                            "prompt_len": item.get("_verl_prompt_len"),
-                            "response_len": item.get("_verl_response_len"),
-                            "feature_start": item.get("_verl_feature_start"),
-                            "feature_end": item.get("_verl_feature_end"),
-                            "hidden_start": item.get("_verl_hidden_start"),
-                            "hidden_end": item.get("_verl_hidden_end"),
-                            "target_start": item.get("_verl_target_start"),
-                            "target_end": item.get("_verl_target_end"),
+                            "prompt_len": source_item.get("_verl_prompt_len"),
+                            "response_len": source_item.get("_verl_response_len"),
+                            "feature_start": source_item.get("_verl_feature_start"),
+                            "feature_end": source_item.get("_verl_feature_end"),
+                            "hidden_start": source_item.get("_verl_hidden_start"),
+                            "hidden_end": source_item.get("_verl_hidden_end"),
+                            "target_start": source_item.get("_verl_target_start"),
+                            "target_end": source_item.get("_verl_target_end"),
                             "loss_after_shift": int(item_loss_mask[1 : 1 + train_seq_len].detach().float().sum().cpu().item()),
                             "target_rows": int(train_target_logprobs.size(0)) if train_target_logprobs is not None else None,
                             "row_valid": row_valid_count,
@@ -1107,9 +1108,9 @@ class DrafterBaseTrainer:
                         ids,
                         item_loss_mask,
                         train_target_logprobs,
-                        feature_start=int(item.get("_verl_feature_start", 0) or 0),
-                        prompt_len=item.get("_verl_prompt_len"),
-                        response_len=item.get("_verl_response_len"),
+                        feature_start=int(source_item.get("_verl_feature_start", 0) or 0),
+                        prompt_len=source_item.get("_verl_prompt_len"),
+                        response_len=source_item.get("_verl_response_len"),
                     )
                     if window_rows:
                         log_alignment_event(
