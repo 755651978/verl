@@ -18,6 +18,12 @@ from torch.nn import SmoothL1Loss
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from verl.utils.device import get_device_name, get_torch_device
+from verl.workers.drafter.alignment_debug import (
+    alignment_debug_enabled,
+    alignment_debug_token_window,
+    log_alignment_event,
+    should_log_alignment,
+)
 from verl.workers.drafter.data_buffer import DataBuffer
 from verl.utils.fsdp_utils import (
     get_fsdp_full_state_dict,
@@ -37,6 +43,122 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 device_name = get_device_name()
+
+
+def _tensor_shape(tensor: Optional[torch.Tensor]) -> list[int] | None:
+    if torch.is_tensor(tensor):
+        return list(tensor.shape)
+    return None
+
+
+def _tensor_sum_int(tensor: torch.Tensor) -> int:
+    return int(tensor.detach().float().sum().cpu().item())
+
+
+def _tensor_scalar_int(tensor: torch.Tensor) -> int | None:
+    if tensor.numel() == 0:
+        return None
+    return int(tensor.detach().view(-1)[0].cpu().item())
+
+
+def _target_row_valid_mask(target_logprobs: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    if target_logprobs is None or target_logprobs.numel() == 0:
+        return None
+    return torch.isfinite(target_logprobs[..., 0]).any(dim=-1) & (target_logprobs[..., 1] >= 0).any(dim=-1)
+
+
+def _target_top_ids(target_logprobs: torch.Tensor, row: int, limit: int) -> list[int]:
+    if target_logprobs is None or target_logprobs.numel() == 0 or row >= target_logprobs.size(0):
+        return []
+    token_ids = target_logprobs[row, :, 1].detach().cpu()
+    top_ids = []
+    for token_id in token_ids[:limit].tolist():
+        try:
+            token_id_int = int(token_id)
+        except (TypeError, ValueError):
+            continue
+        if token_id_int >= 0:
+            top_ids.append(token_id_int)
+    return top_ids
+
+
+def _first_index(mask: torch.Tensor) -> int | None:
+    indices = torch.nonzero(mask, as_tuple=False).view(-1)
+    if indices.numel() == 0:
+        return None
+    return int(indices[0].detach().cpu().item())
+
+
+def _last_index(mask: torch.Tensor) -> int | None:
+    indices = torch.nonzero(mask, as_tuple=False).view(-1)
+    if indices.numel() == 0:
+        return None
+    return int(indices[-1].detach().cpu().item())
+
+
+def _alignment_window_rows(
+    input_ids: torch.Tensor,
+    loss_mask: torch.Tensor,
+    target_logprobs: Optional[torch.Tensor],
+    *,
+    feature_start: int,
+    prompt_len: int | None,
+    response_len: int | None,
+) -> list[dict]:
+    if target_logprobs is None:
+        return []
+    target_rows = min(target_logprobs.size(0), max(input_ids.size(0) - 1, 0), max(loss_mask.size(0) - 1, 0))
+    if target_rows <= 0:
+        return []
+
+    row_valid = _target_row_valid_mask(target_logprobs[:target_rows])
+    if row_valid is None:
+        return []
+    active_mask = loss_mask[1 : 1 + target_rows].bool()
+    invalid_active_mask = active_mask & ~row_valid
+
+    candidates = [
+        ("first_active", _first_index(active_mask)),
+        ("first_invalid_active", _first_index(invalid_active_mask)),
+        ("last_active", _last_index(active_mask)),
+    ]
+
+    rows = []
+    seen_rows = set()
+    topk_limit = alignment_debug_token_window()
+    prompt_len_int = int(prompt_len) if prompt_len is not None else None
+    response_len_int = int(response_len) if response_len is not None else None
+    for kind, local_row in candidates:
+        if local_row is None or local_row in seen_rows:
+            continue
+        seen_rows.add(local_row)
+        predict_token = _tensor_scalar_int(input_ids[local_row + 1])
+        orig_hidden_pos = int(feature_start) + local_row
+        predict_pos = orig_hidden_pos + 1
+        response_idx = None
+        if prompt_len_int is not None:
+            response_idx_candidate = predict_pos - prompt_len_int
+            if response_idx_candidate >= 0 and (
+                response_len_int is None or response_idx_candidate < response_len_int
+            ):
+                response_idx = response_idx_candidate
+        top_ids = _target_top_ids(target_logprobs, local_row, topk_limit)
+        rows.append(
+            {
+                "kind": kind,
+                "local_row": local_row,
+                "orig_hidden_pos": orig_hidden_pos,
+                "predict_pos": predict_pos,
+                "predict_token": predict_token,
+                "response_idx": response_idx,
+                "loss": int(loss_mask[local_row + 1].detach().cpu().item() > 0),
+                "target_row": orig_hidden_pos,
+                "target_valid": bool(row_valid[local_row].detach().cpu().item()),
+                "top_ids": top_ids,
+                "contains_predict": predict_token in top_ids if predict_token is not None else None,
+            }
+        )
+    return rows
 
 class DrafterBaseTrainer:
     def __init__(
@@ -98,6 +220,8 @@ class DrafterBaseTrainer:
         self._training_initialized = False
         self._training_active = False
         self.training_steps = 0
+        self._alignment_debug_step = None
+        self._alignment_debug_counts = {}
 
         self.collected_data = deque(maxlen=int(self.config.rollout.drafter.training.get("current_max_samples", 2000)))
         self.shared_data_buffer = None
@@ -504,15 +628,87 @@ class DrafterBaseTrainer:
                 target_end = min(max(feature_start, feature_end - 1), cpu_target_logprobs.size(1))
                 target_logprobs_item = cpu_target_logprobs[i, target_start:target_end, ...]
 
-            data_item = { 
+            data_item = {
                 "input_ids": cpu_input_ids[i, feature_start:feature_end],
                 "hidden_states": cpu_h_states[i, hidden_start:hidden_end, :],
                 "loss_mask": full_loss_mask[feature_start:feature_end],
                 "position_ids": torch.arange(feature_seq_length, dtype=torch.long),
                 "target_logprobs": target_logprobs_item,
-                "responses": cpu_responses[i] if cpu_responses is not None else None, 
-                "prompts": cpu_prompts[i] if cpu_prompts is not None else None, 
+                "responses": cpu_responses[i] if cpu_responses is not None else None,
+                "prompts": cpu_prompts[i] if cpu_prompts is not None else None,
+                "_verl_feature_start": feature_start,
+                "_verl_feature_end": feature_end,
+                "_verl_hidden_start": hidden_start,
+                "_verl_hidden_end": hidden_end,
+                "_verl_target_start": target_start if cpu_target_logprobs is not None else None,
+                "_verl_target_end": target_end if cpu_target_logprobs is not None else None,
+                "_verl_prompt_len": prompt_len if cpu_prompts is not None else None,
+                "_verl_response_len": response_len if cpu_responses is not None else None,
+                "_verl_input_seq_length": input_seq_length,
             }
+
+            if alignment_debug_enabled():
+                sample_index = self._alignment_debug_sample_index(self.current_rl_step, "collect")
+                row_valid_count = None
+                active_rows = None
+                active_valid = None
+                if target_logprobs_item is not None:
+                    row_valid = _target_row_valid_mask(target_logprobs_item)
+                    if row_valid is not None and row_valid.numel() > 0:
+                        active_mask = data_item["loss_mask"][1 : 1 + row_valid.size(0)].bool()
+                        row_valid_count = int(row_valid.detach().sum().cpu().item())
+                        active_rows = int(active_mask.detach().sum().cpu().item())
+                        active_valid = int((row_valid & active_mask).detach().sum().cpu().item())
+                force_alignment_log = target_logprobs_item is not None and active_valid is not None and active_valid <= 0
+                if should_log_alignment(self.current_rl_step, self.rank, sample_index, force=force_alignment_log):
+                    log_alignment_event(
+                        logger,
+                        {
+                            "event": "drafter_align_collect",
+                            "step": self.current_rl_step,
+                            "rank": self.rank,
+                            "sample": sample_index,
+                            "input_len": input_seq_length,
+                            "hidden_len": hidden_seq_length,
+                            "hidden_raw_len": hidden_seq_length,
+                            "hidden_kept_len": feature_seq_length,
+                            "feature_start": feature_start,
+                            "feature_end": feature_end,
+                            "hidden_start": hidden_start,
+                            "hidden_end": hidden_end,
+                            "target_start": target_start if cpu_target_logprobs is not None else None,
+                            "target_end": target_end if cpu_target_logprobs is not None else None,
+                            "prompt_len": prompt_len if cpu_prompts is not None else None,
+                            "response_len": response_len if cpu_responses is not None else None,
+                            "loss_before": int(full_loss_mask.sum().item()),
+                            "loss_after_slice": int(data_item["loss_mask"].sum().item()),
+                            "target_rows": int(target_logprobs_item.size(0)) if target_logprobs_item is not None else None,
+                            "row_valid": row_valid_count,
+                            "active_rows": active_rows,
+                            "active_valid": active_valid,
+                            "target_shape": _tensor_shape(target_logprobs_item),
+                        },
+                    )
+                    window_rows = _alignment_window_rows(
+                        data_item["input_ids"],
+                        data_item["loss_mask"],
+                        target_logprobs_item,
+                        feature_start=feature_start,
+                        prompt_len=prompt_len if cpu_prompts is not None else None,
+                        response_len=response_len if cpu_responses is not None else None,
+                    )
+                    if window_rows:
+                        log_alignment_event(
+                            logger,
+                            {
+                                "event": "drafter_align_window",
+                                "stage": "collect",
+                                "step": self.current_rl_step,
+                                "rank": self.rank,
+                                "sample": sample_index,
+                                "rows": window_rows,
+                            },
+                        )
 
             # 同步 DataBuffer
             if self.use_data_buffer:
@@ -613,6 +809,14 @@ class DrafterBaseTrainer:
 
         return batch
 
+    def _alignment_debug_sample_index(self, step: int | None, stage: str) -> int:
+        if self._alignment_debug_step != step:
+            self._alignment_debug_step = step
+            self._alignment_debug_counts = {}
+        sample_index = int(self._alignment_debug_counts.get(stage, 0))
+        self._alignment_debug_counts[stage] = sample_index + 1
+        return sample_index
+
     def _prepare_training_batch(
         self, buffer_steps: int = 2
     ) -> Optional[dict[str, torch.Tensor]]:
@@ -674,6 +878,12 @@ class DrafterBaseTrainer:
         dev = next(self.model.parameters()).device
         
         preprocessed_lists = self.backend.preprocess_individual_items(items, dev, self.model_config)
+        items_seen = len(items)
+        items_used = 0
+        items_dropped_short = 0
+        items_dropped_missing_target = 0
+        packed_tokens_before_shift = 0
+        packed_loss_tokens = 0
        
         # Build next-token training chunks inside each sample before packing.
         # Shifting after concatenation would create cross-sample targets and
@@ -697,6 +907,7 @@ class DrafterBaseTrainer:
         ):
             seq_len = min(ids.size(0), h_states.size(0), item_loss_mask.size(0), item_position_ids.size(0))
             if seq_len < 2:
+                items_dropped_short += 1
                 continue
 
             if self.backend.model_type == "eagle3" and use_logits:
@@ -711,7 +922,81 @@ class DrafterBaseTrainer:
                 train_seq_len = seq_len - 1
 
             if train_seq_len < 1:
+                items_dropped_missing_target += 1
                 continue
+
+            items_used += 1
+            packed_tokens_before_shift += train_seq_len
+            packed_loss_tokens += int(item_loss_mask[1 : 1 + train_seq_len].detach().float().sum().cpu().item())
+
+            if alignment_debug_enabled():
+                sample_index = self._alignment_debug_sample_index(current_step, "prepare_item")
+                train_target_logprobs = None
+                if self.backend.model_type == "eagle3" and use_logits:
+                    train_target_logprobs = target_logprobs_item[:train_seq_len]
+                row_valid_count = None
+                active_rows = None
+                active_valid = None
+                if train_target_logprobs is not None:
+                    row_valid = _target_row_valid_mask(train_target_logprobs)
+                    if row_valid is not None and row_valid.numel() > 0:
+                        active_mask = item_loss_mask[1 : 1 + train_seq_len].bool()
+                        row_valid_count = int(row_valid.detach().sum().cpu().item())
+                        active_rows = int(active_mask.detach().sum().cpu().item())
+                        active_valid = int((row_valid & active_mask).detach().sum().cpu().item())
+                force_alignment_log = train_target_logprobs is not None and active_valid is not None and active_valid <= 0
+                if should_log_alignment(current_step, self.rank, sample_index, force=force_alignment_log):
+                    log_alignment_event(
+                        logger,
+                        {
+                            "event": "drafter_align_prepare_item",
+                            "step": current_step,
+                            "rank": self.rank,
+                            "sample": sample_index,
+                            "item_idx": item_idx,
+                            "seq_len": seq_len,
+                            "train_seq_len": train_seq_len,
+                            "input_len": int(ids.size(0)),
+                            "hidden_len": int(h_states.size(0)),
+                            "loss_len": int(item_loss_mask.size(0)),
+                            "target_len": int(target_logprobs_item.size(0)) if target_logprobs_item is not None else None,
+                            "prompt_len": item.get("_verl_prompt_len"),
+                            "response_len": item.get("_verl_response_len"),
+                            "feature_start": item.get("_verl_feature_start"),
+                            "feature_end": item.get("_verl_feature_end"),
+                            "hidden_start": item.get("_verl_hidden_start"),
+                            "hidden_end": item.get("_verl_hidden_end"),
+                            "target_start": item.get("_verl_target_start"),
+                            "target_end": item.get("_verl_target_end"),
+                            "loss_after_shift": int(item_loss_mask[1 : 1 + train_seq_len].detach().float().sum().cpu().item()),
+                            "target_rows": int(train_target_logprobs.size(0)) if train_target_logprobs is not None else None,
+                            "row_valid": row_valid_count,
+                            "active_rows": active_rows,
+                            "active_valid": active_valid,
+                            "target_shape": _tensor_shape(train_target_logprobs),
+                        },
+                    )
+                    window_rows = _alignment_window_rows(
+                        ids,
+                        item_loss_mask,
+                        train_target_logprobs,
+                        feature_start=int(item.get("_verl_feature_start", 0) or 0),
+                        prompt_len=item.get("_verl_prompt_len"),
+                        response_len=item.get("_verl_response_len"),
+                    )
+                    if window_rows:
+                        log_alignment_event(
+                            logger,
+                            {
+                                "event": "drafter_align_window",
+                                "stage": "prepare_item",
+                                "step": current_step,
+                                "rank": self.rank,
+                                "sample": sample_index,
+                                "item_idx": item_idx,
+                                "rows": window_rows,
+                            },
+                        )
 
             input_id_chunks.append(ids[:train_seq_len])
             hidden_state_chunks.append(h_states[:train_seq_len])
@@ -842,6 +1127,55 @@ class DrafterBaseTrainer:
                 batch["last_hidden_states"] = last_hidden_states
         elif self.backend.model_type == "eagle":
             batch["target"] = target
+
+        if alignment_debug_enabled():
+            final_target = None
+            if self.backend.model_type == "eagle3" and use_logits:
+                final_target = batch.get("target_logprobs")
+            elif self.backend.model_type == "eagle3":
+                final_target = batch.get("last_hidden_states")
+            elif self.backend.model_type == "eagle":
+                final_target = batch.get("target")
+
+            final_loss_mask = batch["loss_mask"]
+            final_target_rows = int(final_target.size(1)) if torch.is_tensor(final_target) and final_target.dim() >= 2 else None
+            final_row_valid = None
+            final_active_rows = None
+            final_active_valid = None
+            if torch.is_tensor(final_target) and final_target.dim() >= 3 and final_target_rows is not None:
+                if self.backend.model_type == "eagle3" and use_logits:
+                    final_row_valid_mask = _target_row_valid_mask(final_target.squeeze(0))
+                    if final_row_valid_mask is not None and final_row_valid_mask.numel() > 0:
+                        final_loss_mask_slice = final_loss_mask.squeeze(0)[: final_row_valid_mask.size(0)].bool()
+                        final_row_valid = int(final_row_valid_mask.detach().sum().cpu().item())
+                        final_active_rows = int(final_loss_mask_slice.detach().sum().cpu().item())
+                        final_active_valid = int((final_row_valid_mask & final_loss_mask_slice).detach().sum().cpu().item())
+            force_alignment_log = final_active_valid is not None and final_active_valid <= 0
+            sample_index = self._alignment_debug_sample_index(current_step, "prepare_summary")
+            if should_log_alignment(current_step, self.rank, sample_index, force=force_alignment_log):
+                log_alignment_event(
+                    logger,
+                    {
+                        "event": "drafter_align_prepare",
+                        "step": current_step,
+                        "rank": self.rank,
+                        "items_seen": items_seen,
+                        "items_used": items_used,
+                        "items_dropped_short": items_dropped_short,
+                        "items_dropped_missing_target": items_dropped_missing_target,
+                        "packed_tokens_before_shift": packed_tokens_before_shift,
+                        "packed_loss_tokens": packed_loss_tokens,
+                        "input_shape": _tensor_shape(batch["input_ids"]),
+                        "hidden_shape": _tensor_shape(batch["hidden_states"]),
+                        "loss_shape": _tensor_shape(final_loss_mask),
+                        "target_shape": _tensor_shape(final_target),
+                        "target_rows": final_target_rows,
+                        "row_valid": final_row_valid,
+                        "active_rows": final_active_rows,
+                        "active_valid": final_active_valid,
+                        "loss_sum": int(final_loss_mask.detach().float().sum().cpu().item()),
+                    },
+                )
 
         return batch
 

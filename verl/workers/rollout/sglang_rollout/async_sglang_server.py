@@ -47,6 +47,7 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_visible_devices_keyword
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.utils.profiler import DistProfiler, build_sglang_profiler_args
+from verl.workers.drafter.alignment_debug import log_alignment_event, should_log_alignment
 from verl.workers.drafter.sglang_patch import install_sglang_verl_patches
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
@@ -61,6 +62,47 @@ logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
 visible_devices_keyword = get_visible_devices_keyword()
+
+
+def _tensor_shape(tensor: Any) -> list[int] | None:
+    if torch.is_tensor(tensor):
+        return list(tensor.shape)
+    return None
+
+
+def _extract_token_id_from_logprob_entry(entry: Any) -> Optional[int]:
+    if isinstance(entry, dict):
+        for key in ("token_id", "idx", "id"):
+            token_id = entry.get(key)
+            if token_id is not None:
+                try:
+                    return int(token_id)
+                except (TypeError, ValueError):
+                    return None
+        return None
+
+    if isinstance(entry, (list, tuple)):
+        for index in (1, 2):
+            if len(entry) <= index:
+                continue
+            try:
+                return int(entry[index])
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _count_sampled_token_mismatches(output_token_logprobs: list, token_ids: list[int]) -> Optional[int]:
+    if not output_token_logprobs:
+        return None
+    mismatch_count = abs(len(output_token_logprobs) - len(token_ids))
+    for entry, token_id in zip(output_token_logprobs, token_ids):
+        logged_token_id = _extract_token_id_from_logprob_entry(entry)
+        if logged_token_id is None:
+            continue
+        if logged_token_id != int(token_id):
+            mismatch_count += 1
+    return mismatch_count
 
 
 def _top_logprobs_to_tensor(top_logprobs: list, topk: int) -> Optional[torch.Tensor]:
@@ -663,6 +705,9 @@ class SGLangHttpServer:
         drafter_sample = None
         if should_collect:
             target_logprobs = None
+            output_top = []
+            output_token_logprobs = output.get("meta_info", {}).get("output_token_logprobs", []) or []
+            sampled_token_mismatch = _count_sampled_token_mismatches(output_token_logprobs, list(token_ids))
             if self.config.drafter.training.use_logits:
                 output_top = output.get("meta_info", {}).get("output_top_logprobs", [])
                 target_logprobs = _response_aligned_top_logprobs_to_tensor(
@@ -680,13 +725,18 @@ class SGLangHttpServer:
                 if h_states is not None:
                     hidden_states_list.append(h_states)
 
+            alignment_sample_index = max(int(self._drafter_collection_samples) - 1, 0)
+            hidden_raw_len = 0
+            hidden_kept_len = 0
             if hidden_states_list:
                 prompt_tensor = torch.as_tensor(prompt_ids, dtype=torch.long).detach().cpu()
                 response_tensor = torch.tensor(token_ids, dtype=torch.long)
                 hidden_states = torch.cat(hidden_states_list, dim=0)
+                hidden_raw_len = int(hidden_states.size(0))
                 max_hidden_tokens = self.config.drafter.training.hidden_state_max_tokens_per_sample
                 if max_hidden_tokens is not None and int(max_hidden_tokens) > 0:
                     hidden_states = hidden_states[-int(max_hidden_tokens):]
+                hidden_kept_len = int(hidden_states.size(0))
                 drafter_sample = {
                     "input_ids": torch.cat([prompt_tensor, response_tensor], dim=0).unsqueeze(0),
                     "prompts": prompt_tensor.unsqueeze(0),
@@ -698,6 +748,43 @@ class SGLangHttpServer:
                 }
             else:
                 logger.warning("[SGLangHttpServer] No valid hidden states returned for drafter sample collection")
+
+            force_alignment_log = (
+                not hidden_states_list
+                or (self.config.drafter.training.use_logits and target_logprobs is None)
+                or (sampled_token_mismatch is not None and sampled_token_mismatch > 0)
+                or (
+                    self.config.drafter.training.use_logits
+                    and output_top
+                    and len(output_top) != len(token_ids)
+                )
+            )
+            if should_log_alignment(
+                collection_global_steps,
+                self.replica_rank,
+                alignment_sample_index,
+                force=force_alignment_log,
+            ):
+                log_alignment_event(
+                    logger,
+                    {
+                        "event": "drafter_align_rollout",
+                        "step": collection_global_steps,
+                        "rank": self.replica_rank,
+                        "sample": alignment_sample_index,
+                        "prompt_len": len(prompt_ids),
+                        "response_len": len(token_ids),
+                        "input_len": len(prompt_ids) + len(token_ids),
+                        "hidden_raw_len": hidden_raw_len,
+                        "hidden_kept_len": hidden_kept_len,
+                        "hidden_max": self.config.drafter.training.hidden_state_max_tokens_per_sample,
+                        "output_top_len": len(output_top),
+                        "output_token_logprob_len": len(output_token_logprobs),
+                        "target_shape": _tensor_shape(target_logprobs),
+                        "sampled_token_mismatch": sampled_token_mismatch,
+                        "finish_reason": finish_reason,
+                    },
+                )
 
         extra_fields = {"global_steps": collection_global_steps}
         if drafter_sample is not None:
