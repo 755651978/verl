@@ -47,7 +47,6 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_visible_devices_keyword
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.utils.profiler import DistProfiler, build_sglang_profiler_args
-from verl.workers.drafter.alignment_debug import log_alignment_event, should_log_alignment
 from verl.workers.drafter.sglang_patch import install_sglang_verl_patches
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
@@ -62,6 +61,139 @@ logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
 visible_devices_keyword = get_visible_devices_keyword()
+
+_ALIGNMENT_DEBUG_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG"
+_ALIGNMENT_DEBUG_EVERY_N_STEPS_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_EVERY_N_STEPS"
+_ALIGNMENT_DEBUG_MAX_SAMPLES_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_MAX_SAMPLES_PER_STEP"
+_ALIGNMENT_DEBUG_TOKEN_WINDOW_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_TOKEN_WINDOW"
+_ALIGNMENT_DEBUG_RANKS_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_RANKS"
+
+
+def _env_flag_enabled(name: str, default: bool = False) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    normalized = raw_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on", "y"}:
+        return True
+    if normalized in {"0", "false", "no", "off", "n"}:
+        return False
+    return default
+
+
+def _env_int(name: str, default: int, minimum: int) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, value)
+
+
+def alignment_debug_enabled() -> bool:
+    return _env_flag_enabled(_ALIGNMENT_DEBUG_ENV, default=False)
+
+
+def alignment_debug_every_n_steps() -> int:
+    return _env_int(_ALIGNMENT_DEBUG_EVERY_N_STEPS_ENV, default=50, minimum=1)
+
+
+def alignment_debug_max_samples_per_step() -> int:
+    return _env_int(_ALIGNMENT_DEBUG_MAX_SAMPLES_ENV, default=2, minimum=1)
+
+
+def alignment_debug_token_window() -> int:
+    return _env_int(_ALIGNMENT_DEBUG_TOKEN_WINDOW_ENV, default=3, minimum=1)
+
+
+def alignment_debug_rank_selected(rank: int | None) -> bool:
+    raw_value = os.getenv(_ALIGNMENT_DEBUG_RANKS_ENV, "0").strip().lower()
+    if raw_value in {"*", "all"}:
+        return True
+    if rank is None:
+        return False
+
+    try:
+        rank_int = int(rank)
+    except (TypeError, ValueError):
+        return False
+
+    for item in raw_value.replace(",", " ").split():
+        if not item:
+            continue
+        if "-" in item:
+            start, end = item.split("-", 1)
+            try:
+                if int(start) <= rank_int <= int(end):
+                    return True
+            except ValueError:
+                continue
+        else:
+            try:
+                if int(item) == rank_int:
+                    return True
+            except ValueError:
+                continue
+    return False
+
+
+def should_log_alignment(
+    step: int | None,
+    rank: int | None,
+    sample_index: int | None = 0,
+    *,
+    force: bool = False,
+) -> bool:
+    if not alignment_debug_enabled() or not alignment_debug_rank_selected(rank):
+        return False
+
+    if force:
+        return True
+
+    if sample_index is not None:
+        try:
+            if int(sample_index) >= alignment_debug_max_samples_per_step():
+                return False
+        except (TypeError, ValueError):
+            return False
+
+    if step is None:
+        return False
+
+    try:
+        step_int = int(step)
+    except (TypeError, ValueError):
+        return False
+    return step_int % alignment_debug_every_n_steps() == 0
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    try:
+        return float(value)
+    except (TypeError, ValueError, OverflowError):
+        return str(value)
+
+
+def log_alignment_event(logger: logging.Logger, payload: dict[str, Any], level: int = logging.INFO) -> None:
+    if not alignment_debug_enabled():
+        return
+    logger.log(
+        level,
+        "DRAFTER_ALIGNMENT %s",
+        json.dumps(_json_safe(payload), ensure_ascii=True, sort_keys=True, separators=(",", ":")),
+    )
 
 
 def _tensor_shape(tensor: Any) -> list[int] | None:
