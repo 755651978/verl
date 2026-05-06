@@ -20,12 +20,21 @@ import os
 import re
 import textwrap
 from functools import wraps
-from types import FunctionType
 from typing import Callable
 
 import torch
 import sglang.srt.entrypoints.engine
 from sglang.srt.utils import MultiprocessingSerializer
+
+try:
+    import triton
+    import triton.language as tl
+
+    _HAS_TRITON = True
+except Exception:  # noqa: BLE001
+    _HAS_TRITON = False
+    tl = None
+    triton = None
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -35,13 +44,11 @@ _DRAFT_WEIGHT_LOADER_ENV = "VERL_SGLANG_DRAFT_WEIGHT_LOADER"
 _EAGLE_VERIFY_MODE_ENV = "VERL_SGLANG_NPU_EAGLE_VERIFY_MODE"
 _EAGLE_V1_TARGET_SAMPLING_ENV = "VERL_SGLANG_NPU_EAGLE_V1_TARGET_SAMPLING"
 _EAGLE_V1_VERIFY_MODE_ENV = "VERL_SGLANG_NPU_EAGLE_V1_VERIFY_MODE"
-_EAGLE_V2_VERIFY_MODE_ENV = "VERL_SGLANG_NPU_EAGLE_V2_VERIFY_MODE"
-_EAGLE_V1_STATE_REPAIR_ENV = "VERL_SGLANG_NPU_EAGLE_V1_STATE_REPAIR"
 _EAGLE_FORCE_FP32_SAMPLING_ENV = "VERL_SGLANG_NPU_EAGLE_FORCE_FP32_SAMPLING"
+_EAGLE_LINEAR_TRITON_ENV = "VERL_SGLANG_NPU_EAGLE_LINEAR_TRITON"
 _EAGLE_TOP_K_RENORM_FAST_PATH_ENV = "VERL_SGLANG_NPU_EAGLE_TOP_K_RENORM_FAST_PATH"
 _DISABLE_SGLANG_PATCH_ENV = "VERL_DISABLE_SGLANG_PATCH"
 _SGLANG_PATCHES_ENV = "VERL_SGLANG_PATCHES"
-_DISABLE_DRAFT_CUDA_GRAPH_ENV = "VERL_DISABLE_SGLANG_DRAFT_CUDA_GRAPH"
 
 _target_weight_loader: str | None = os.environ.get(_TARGET_WEIGHT_LOADER_ENV)
 _draft_weight_loader: str | None = os.environ.get(_DRAFT_WEIGHT_LOADER_ENV)
@@ -49,12 +56,6 @@ _ORIGINAL_SGLANG_RUN_SCHEDULER_PROCESS = sglang.srt.entrypoints.engine.run_sched
 _ORIGINAL_SGLANG_DIRECT_RUN_SCHEDULER_PROCESS = None
 _SGLANG_EAGLE_UPDATE_PATCHED = False
 _SGLANG_NPU_EAGLE_SAMPLING_PATCHED = False
-_SGLANG_NPU_EAGLE_GREEDY_PATCHED = False
-_SGLANG_NPU_EAGLE_V1_BATCH_OPS_PATCHED = False
-_SGLANG_DRAFT_CUDA_GRAPH_PATCHED = False
-_SGLANG_DRAFT_WORKER_MODEL_RUNNER_PATCHED = False
-_SGLANG_NPU_ASCEND_LOW_LEVEL_PATCHED = False
-_SGLANG_TRANSFORMERS_EAGLE3_CAPTURE_PATCHED = False
 _SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED = False
 _SGLANG_SCHEDULER_PROCESS_PATCHED = False
 _SCHEDULER_PROCESS_PATCH_ATTR = "_verl_patched_scheduler_process"
@@ -70,37 +71,8 @@ _SGLANG_PATCH_ALIASES = {
     "weight_routing": "eagle_update_weights",
     "route_weights": "eagle_update_weights",
     "target_draft_weight_routing": "eagle_update_weights",
-    "draft_cuda_graph": "draft_cuda_graph",
-    "disable_draft_cuda_graph": "draft_cuda_graph",
-    "draft_graph": "draft_cuda_graph",
-    "draft_worker_model_runner": "draft_worker_model_runner",
-    "draft_worker_runner": "draft_worker_model_runner",
-    "draft_routed_experts": "draft_worker_model_runner",
-    "routed_experts_draft": "draft_worker_model_runner",
-    "draft_offloader": "draft_worker_model_runner",
-    "npu_ascend_low_level": "npu_ascend_low_level",
-    "ascend_low_level": "npu_ascend_low_level",
-    "npu_low_level": "npu_ascend_low_level",
-    "npu_rl_numeric_path": "npu_ascend_low_level",
-    "ascend_numeric": "npu_ascend_low_level",
-    "npu_sampler_logits": "npu_ascend_low_level",
-    "sampler_logits": "npu_ascend_low_level",
-    "rotary_rmsnorm": "npu_ascend_low_level",
-    "npu_moe_low_level": "npu_ascend_low_level",
-    "moe_low_level": "npu_ascend_low_level",
-    "routed_experts_deepep": "npu_ascend_low_level",
-    "deterministic_moe": "npu_ascend_low_level",
-    "parallel_state_rank_fallback": "npu_ascend_low_level",
-    "npu_eagle_v1_state_repair": "npu_eagle_v1_state_repair",
-    "v1_state_repair": "npu_eagle_v1_state_repair",
-    "npu_eagle_v1_batch_ops": "npu_eagle_v1_batch_ops",
-    "v1_batch_ops": "npu_eagle_v1_batch_ops",
-    "accept_length": "npu_eagle_v1_batch_ops",
-    "accept_length_batch_ops": "npu_eagle_v1_batch_ops",
     "npu_eagle_target_sampling": "npu_eagle_target_sampling",
     "target_sampling": "npu_eagle_target_sampling",
-    "transformers_eagle3_capture": "transformers_eagle3_capture",
-    "eagle3_capture": "transformers_eagle3_capture",
     "hidden_states_tensor_output": "hidden_states_tensor_output",
     "hidden_states": "hidden_states_tensor_output",
     "hidden_state_tensor_output": "hidden_states_tensor_output",
@@ -287,12 +259,23 @@ def _env_flag_enabled(name: str, default: bool = False) -> bool:
     return default
 
 
-def _sglang_npu_eagle_v1_state_repair_enabled() -> bool:
-    return _env_flag_enabled(_EAGLE_V1_STATE_REPAIR_ENV, default=False)
-
-
 def _sglang_npu_eagle_force_fp32_sampling_enabled() -> bool:
     return _env_flag_enabled(_EAGLE_FORCE_FP32_SAMPLING_ENV, default=False)
+
+
+def _sglang_npu_eagle_linear_triton_enabled() -> bool:
+    return _env_flag_enabled(_EAGLE_LINEAR_TRITON_ENV, default=True)
+
+
+def _triton_ascend_available() -> bool:
+    if not (_HAS_TRITON and _is_sglang_npu_backend()):
+        return False
+    try:
+        properties = triton.runtime.driver.active.utils.get_device_properties(torch.npu.current_device())
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Triton Ascend device properties are unavailable: %s", exc)
+        return False
+    return int(properties.get("num_aicore", -1)) > 0 and int(properties.get("num_vectorcore", -1)) > 0
 
 
 def _sglang_npu_eagle_top_k_renorm_fast_path_enabled() -> bool:
@@ -333,19 +316,7 @@ def _normalize_sglang_npu_eagle_verify_mode(mode: str | None) -> str | None:
     normalized_mode = mode.strip().lower().replace("-", "_")
     if normalized_mode in {"0", "false", "off", "greedy"}:
         return "greedy"
-    if normalized_mode in {
-        "1",
-        "true",
-        "on",
-        "target",
-        "target_only",
-        "fastrl",
-        "fastrl_like",
-        "fast_rl",
-        "fast_rl_like",
-        "vllm",
-        "vllm_like",
-    }:
+    if normalized_mode in {"1", "true", "on", "target", "target_only"}:
         return "target_only"
     return None
 
@@ -368,1058 +339,10 @@ def _sglang_npu_eagle_v1_verify_mode() -> str:
     return _sglang_npu_eagle_verify_mode(_EAGLE_V1_VERIFY_MODE_ENV)
 
 
-def _sglang_npu_eagle_v2_verify_mode() -> str:
-    return _sglang_npu_eagle_verify_mode(_EAGLE_V2_VERIFY_MODE_ENV)
-
-
 def _as_sglang_npu_eagle_sampling_float(tensor: torch.Tensor) -> torch.Tensor:
     if _sglang_npu_eagle_force_fp32_sampling_enabled() and tensor.is_floating_point():
         return tensor.to(dtype=torch.float32)
     return tensor
-
-
-def _eagle_v1_accepted_tail_indices(accept_length_cpu, device: torch.device) -> torch.Tensor | None:
-    if not accept_length_cpu:
-        return None
-    lengths = torch.tensor(
-        [int(accept_len) + 1 for accept_len in accept_length_cpu],
-        dtype=torch.long,
-        device=device,
-    )
-    if lengths.numel() == 0:
-        return None
-    return torch.cumsum(lengths, dim=0) - 1
-
-
-def _trim_eagle_v1_draft_input_to_request_tails(draft_input) -> None:
-    """Keep only per-request tail state after v1 draft-extend over accepted spans."""
-    verified_id = getattr(draft_input, "verified_id", None)
-    if not torch.is_tensor(verified_id):
-        return
-
-    batch_size = int(verified_id.numel())
-    if batch_size == 0:
-        return
-
-    accept_length_cpu = getattr(draft_input, "accept_length_cpu", None)
-    tail_indices = _eagle_v1_accepted_tail_indices(accept_length_cpu, verified_id.device)
-    if tail_indices is None:
-        return
-
-    total_accepted = int(tail_indices[-1].item()) + 1
-    if total_accepted == batch_size:
-        return
-
-    for attr_name in ("topk_p", "topk_index", "hidden_states"):
-        value = getattr(draft_input, attr_name, None)
-        if not torch.is_tensor(value) or value.shape[0] == batch_size:
-            continue
-        if value.shape[0] < total_accepted:
-            logger.warning(
-                "[SGLangEagleV1StatePatch] skip trimming %s: rows=%s expected_at_least=%s",
-                attr_name,
-                value.shape[0],
-                total_accepted,
-            )
-            continue
-        setattr(
-            draft_input,
-            attr_name,
-            value.index_select(0, tail_indices.to(value.device)).contiguous(),
-        )
-
-
-def _trim_eagle_v1_tensor_to_request_tails(value, tail_indices: torch.Tensor, total_accepted: int):
-    if not torch.is_tensor(value) or value.shape[0] == tail_indices.numel():
-        return value
-    if value.shape[0] < total_accepted:
-        return value
-    return value.index_select(0, tail_indices.to(value.device)).contiguous()
-
-
-def _repair_eagle_v1_post_draft_extend_state(batch) -> None:
-    draft_input = getattr(batch, "spec_info", None)
-    _trim_eagle_v1_draft_input_to_request_tails(draft_input)
-
-    verified_id = getattr(draft_input, "verified_id", None)
-    if torch.is_tensor(verified_id) and verified_id.numel() > 0:
-        batch.input_ids = verified_id
-
-    seq_lens = getattr(batch, "seq_lens", None)
-    if torch.is_tensor(seq_lens):
-        batch.seq_lens_sum = int(seq_lens.sum().item())
-
-
-def _normalize_eagle_v1_generation_result_to_request_tails(result) -> None:
-    """Expose v1 speculative decode results to the scheduler as one row per request."""
-    next_token_ids = getattr(result, "next_token_ids", None)
-    if not torch.is_tensor(next_token_ids):
-        return
-
-    tail_indices = _eagle_v1_accepted_tail_indices(
-        getattr(result, "accept_length_per_req_cpu", None),
-        next_token_ids.device,
-    )
-    if tail_indices is None:
-        return
-
-    total_accepted = int(tail_indices[-1].item()) + 1
-    result.next_token_ids = _trim_eagle_v1_tensor_to_request_tails(
-        next_token_ids,
-        tail_indices,
-        total_accepted,
-    )
-
-    logits_output = getattr(result, "logits_output", None)
-    if logits_output is None:
-        return
-    for attr_name in ("next_token_logits", "hidden_states"):
-        value = getattr(logits_output, attr_name, None)
-        trimmed_value = _trim_eagle_v1_tensor_to_request_tails(
-            value,
-            tail_indices,
-            total_accepted,
-        )
-        if trimmed_value is not value:
-            setattr(logits_output, attr_name, trimmed_value)
-
-
-def _eagle_v1_future_indices_rows(spec_info) -> int | None:
-    future_indices = getattr(spec_info, "future_indices", None)
-    indices = getattr(future_indices, "indices", None)
-    if torch.is_tensor(indices):
-        return int(indices.numel())
-    if indices is not None:
-        return len(indices)
-    return None
-
-
-def _eagle_v1_spec_rows(spec_info) -> int:
-    future_rows = _eagle_v1_future_indices_rows(spec_info)
-    if future_rows is not None:
-        return future_rows
-    for attr_name in ("verified_id", "topk_p", "hidden_states"):
-        value = getattr(spec_info, attr_name, None)
-        if torch.is_tensor(value):
-            return int(value.shape[0])
-    accept_length_cpu = getattr(spec_info, "accept_length_cpu", None)
-    if accept_length_cpu is not None:
-        return len(accept_length_cpu)
-    return 0
-
-
-def _eagle_v1_resize_accept_length_tensor(value, rows: int, *, dtype=None, device=None):
-    if rows <= 0:
-        rows = 0
-    value = value.reshape(-1)
-    if dtype is not None or device is not None:
-        value = value.to(
-            dtype=dtype if dtype is not None else value.dtype,
-            device=device if device is not None else value.device,
-        )
-    if value.numel() >= rows:
-        return value[:rows].contiguous()
-    padding = torch.zeros(rows - value.numel(), dtype=value.dtype, device=value.device)
-    return torch.cat([value, padding], dim=0)
-
-
-def _eagle_v1_resize_accept_length_cpu(value, rows: int) -> list[int]:
-    if rows <= 0:
-        return []
-    values = [] if value is None else [int(item) for item in value]
-    if len(values) >= rows:
-        return values[:rows]
-    return values + [0] * (rows - len(values))
-
-
-def _eagle_v1_index_list(new_indices) -> list[int]:
-    if torch.is_tensor(new_indices):
-        return [int(item) for item in new_indices.detach().cpu().tolist()]
-    return [int(item) for item in new_indices]
-
-
-def _filter_eagle_v1_accept_length(
-    spec_info,
-    new_indices,
-    has_been_filtered: bool,
-    *,
-    force_index_select: bool = False,
-) -> None:
-    accept_length = getattr(spec_info, "accept_length", None)
-    accept_length_cpu = getattr(spec_info, "accept_length_cpu", None)
-    new_size = len(new_indices)
-    should_index_select = force_index_select or not has_been_filtered
-
-    if torch.is_tensor(accept_length):
-        if should_index_select:
-            index = torch.as_tensor(new_indices, dtype=torch.long, device=accept_length.device)
-            rows = int(index.max().item()) + 1 if index.numel() > 0 else 0
-            source = _eagle_v1_resize_accept_length_tensor(accept_length, rows)
-            filtered = source[index]
-        else:
-            filtered = _eagle_v1_resize_accept_length_tensor(accept_length, new_size)
-        setattr(spec_info, "accept_length", filtered)
-        setattr(spec_info, "accept_length_cpu", filtered.detach().cpu().tolist())
-        return
-
-    if accept_length_cpu is None:
-        return
-    if should_index_select:
-        index_list = _eagle_v1_index_list(new_indices)
-        rows = max(index_list) + 1 if index_list else 0
-        source_cpu = _eagle_v1_resize_accept_length_cpu(accept_length_cpu, rows)
-        filtered_cpu = [source_cpu[index] for index in index_list]
-    else:
-        filtered_cpu = _eagle_v1_resize_accept_length_cpu(accept_length_cpu, new_size)
-    setattr(spec_info, "accept_length_cpu", filtered_cpu)
-
-
-def _merge_eagle_v1_accept_length(
-    spec_info,
-    old_accept_length,
-    old_accept_length_cpu,
-    old_rows: int,
-    other,
-) -> None:
-    other_rows = _eagle_v1_spec_rows(other)
-    other_accept_length = getattr(other, "accept_length", None)
-    other_accept_length_cpu = getattr(other, "accept_length_cpu", None)
-
-    if torch.is_tensor(old_accept_length) or torch.is_tensor(other_accept_length):
-        if torch.is_tensor(old_accept_length):
-            left = _eagle_v1_resize_accept_length_tensor(old_accept_length, old_rows)
-            dtype = left.dtype
-            device = left.device
-        else:
-            dtype = other_accept_length.dtype
-            device = other_accept_length.device
-            left = torch.zeros(old_rows, dtype=dtype, device=device)
-
-        if torch.is_tensor(other_accept_length):
-            right = _eagle_v1_resize_accept_length_tensor(other_accept_length, other_rows, dtype=dtype, device=device)
-        else:
-            right = torch.zeros(other_rows, dtype=dtype, device=device)
-
-        merged = torch.cat([left, right], dim=0)
-        setattr(spec_info, "accept_length", merged)
-        setattr(spec_info, "accept_length_cpu", merged.detach().cpu().tolist())
-        return
-
-    if old_accept_length_cpu is None and other_accept_length_cpu is None:
-        return
-
-    left_cpu = _eagle_v1_resize_accept_length_cpu(old_accept_length_cpu, old_rows)
-    right_cpu = _eagle_v1_resize_accept_length_cpu(other_accept_length_cpu, other_rows)
-    setattr(spec_info, "accept_length_cpu", left_cpu + right_cpu)
-
-
-def _make_eagle_v1_filter_batch_accept_length_patch(original_filter_batch):
-    @wraps(original_filter_batch)
-    def patched_filter_batch(self, new_indices, has_been_filtered: bool = True):
-        has_future_indices = getattr(self, "future_indices", None) is not None
-        result = original_filter_batch(self, new_indices, has_been_filtered)
-        _filter_eagle_v1_accept_length(
-            self,
-            new_indices,
-            has_been_filtered,
-            force_index_select=has_future_indices,
-        )
-        return result
-
-    patched_filter_batch._verl_patched_npu_eagle_v1_accept_length = True
-    return patched_filter_batch
-
-
-def _make_eagle_v1_merge_batch_accept_length_patch(original_merge_batch):
-    @wraps(original_merge_batch)
-    def patched_merge_batch(self, spec_info):
-        has_future_indices = getattr(self, "future_indices", None) is not None
-        old_hidden_states = getattr(self, "hidden_states", None)
-        other_hidden_states = getattr(spec_info, "hidden_states", None)
-        old_accept_length = getattr(self, "accept_length", None)
-        old_accept_length_cpu = getattr(self, "accept_length_cpu", None)
-        old_rows = _eagle_v1_spec_rows(self) if has_future_indices or old_hidden_states is not None else 0
-
-        result = original_merge_batch(self, spec_info)
-        if not has_future_indices and old_hidden_states is not None and other_hidden_states is None:
-            return result
-
-        _merge_eagle_v1_accept_length(
-            self,
-            old_accept_length,
-            old_accept_length_cpu,
-            old_rows,
-            spec_info,
-        )
-        return result
-
-    patched_merge_batch._verl_patched_npu_eagle_v1_accept_length = True
-    return patched_merge_batch
-
-
-def patch_sglang_npu_eagle_v1_batch_ops() -> None:
-    """Keep v1 accept-length metadata aligned when SGLang filters or merges batches."""
-    global _SGLANG_NPU_EAGLE_V1_BATCH_OPS_PATCHED
-    if _SGLANG_NPU_EAGLE_V1_BATCH_OPS_PATCHED or not _is_sglang_npu_backend():
-        return
-
-    try:
-        eagle_info = importlib.import_module("sglang.srt.speculative.eagle_info")
-        eagle_draft_input_cls = getattr(eagle_info, "EagleDraftInput", None)
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Skip SGLang EAGLE v1 batch-op patch: %s", exc)
-        return
-
-    if eagle_draft_input_cls is None:
-        return
-
-    patched_targets = []
-    original_filter_batch = getattr(eagle_draft_input_cls, "filter_batch", None)
-    if original_filter_batch is not None and not getattr(
-        original_filter_batch,
-        "_verl_patched_npu_eagle_v1_accept_length",
-        False,
-    ):
-        eagle_draft_input_cls.filter_batch = _make_eagle_v1_filter_batch_accept_length_patch(original_filter_batch)
-        patched_targets.append("EagleDraftInput.filter_batch")
-
-    original_merge_batch = getattr(eagle_draft_input_cls, "merge_batch", None)
-    if original_merge_batch is not None and not getattr(
-        original_merge_batch,
-        "_verl_patched_npu_eagle_v1_accept_length",
-        False,
-    ):
-        eagle_draft_input_cls.merge_batch = _make_eagle_v1_merge_batch_accept_length_patch(original_merge_batch)
-        patched_targets.append("EagleDraftInput.merge_batch")
-
-    if patched_targets:
-        _SGLANG_NPU_EAGLE_V1_BATCH_OPS_PATCHED = True
-        logger.warning("Patched SGLang NPU EAGLE v1 batch ops for %s", ", ".join(patched_targets))
-
-
-def _is_draft_worker_init_call(original_init, args, kwargs) -> bool:
-    try:
-        bound = inspect.signature(original_init).bind_partial(None, *args, **kwargs)
-    except TypeError:
-        return bool(kwargs.get("is_draft_worker", False))
-    return bool(bound.arguments.get("is_draft_worker", False))
-
-
-def _draft_cuda_graph_disabled_for_worker(worker) -> bool:
-    server_args = getattr(worker, "server_args", None)
-    return bool(getattr(server_args, "disable_draft_cuda_graph", False)) or _env_flag_enabled(
-        _DISABLE_DRAFT_CUDA_GRAPH_ENV,
-        default=False,
-    )
-
-
-def _zero_draft_cuda_graph_buffer_owner(owner) -> None:
-    for attr_name in ("topk_p", "topk_index", "hidden_states", "req_pool_indices"):
-        value = getattr(owner, attr_name, None)
-        if torch.is_tensor(value):
-            value.zero_()
-
-
-def _zero_draft_cuda_graph_padding_buffers(runner) -> None:
-    _zero_draft_cuda_graph_buffer_owner(runner)
-    for container_name in ("buffers", "cuda_graph_buffers", "input_buffers"):
-        container = getattr(runner, container_name, None)
-        if container is None:
-            continue
-        if isinstance(container, dict):
-            for key, value in container.items():
-                if key in {"topk_p", "topk_index", "hidden_states", "req_pool_indices"} and torch.is_tensor(value):
-                    value.zero_()
-                else:
-                    _zero_draft_cuda_graph_buffer_owner(value)
-            continue
-        values = container
-        if not isinstance(values, (list, tuple, set)):
-            values = [values]
-        for owner in values:
-            _zero_draft_cuda_graph_buffer_owner(owner)
-
-
-def _draft_cuda_graph_vocab_size(runner):
-    model_runner = getattr(runner, "model_runner", None)
-    model_config = getattr(model_runner, "model_config", None)
-    return getattr(model_config, "vocab_size", None)
-
-
-def _clamp_draft_cuda_graph_inputs(runner, forward_batch):
-    spec_info = getattr(forward_batch, "spec_info", None)
-    if spec_info is None:
-        return None
-
-    backup = []
-    topk_p = getattr(spec_info, "topk_p", None)
-    if torch.is_tensor(topk_p):
-        backup.append(("topk_p", topk_p))
-        spec_info.topk_p = topk_p.clamp(0, 1)
-
-    topk_index = getattr(spec_info, "topk_index", None)
-    if torch.is_tensor(topk_index):
-        backup.append(("topk_index", topk_index))
-        vocab_size = _draft_cuda_graph_vocab_size(runner)
-        if vocab_size is None:
-            spec_info.topk_index = topk_index.clamp_min(0)
-        else:
-            spec_info.topk_index = topk_index.clamp(0, int(vocab_size) - 1)
-
-    return (spec_info, backup) if backup else None
-
-
-def _restore_draft_cuda_graph_inputs(backup_state) -> None:
-    if backup_state is None:
-        return
-    spec_info, backup = backup_state
-    for attr_name, value in backup:
-        setattr(spec_info, attr_name, value)
-
-
-def _make_draft_cuda_graph_replay_patch(original_replay):
-    @wraps(original_replay)
-    def patched_replay(self, forward_batch, *args, **kwargs):
-        _zero_draft_cuda_graph_padding_buffers(self)
-        backup_state = _clamp_draft_cuda_graph_inputs(self, forward_batch)
-        try:
-            return original_replay(self, forward_batch, *args, **kwargs)
-        finally:
-            _restore_draft_cuda_graph_inputs(backup_state)
-
-    patched_replay._verl_patched_draft_cuda_graph_replay = True
-    return patched_replay
-
-
-def _make_draft_cuda_graph_init_patch(original_init_cuda_graphs):
-    @wraps(original_init_cuda_graphs)
-    def patched_init_cuda_graphs(self, *args, **kwargs):
-        if _draft_cuda_graph_disabled_for_worker(self):
-            self.cuda_graph_runner = None
-            self.cuda_graph_runner_for_draft_extend = None
-            return None
-        return original_init_cuda_graphs(self, *args, **kwargs)
-
-    patched_init_cuda_graphs._verl_patched_draft_cuda_graph_init = True
-    return patched_init_cuda_graphs
-
-
-def patch_sglang_draft_cuda_graph() -> None:
-    """Apply slime's draft graph fixes: disable hook, padding cleanup, and top-k clamp."""
-    global _SGLANG_DRAFT_CUDA_GRAPH_PATCHED
-    if _SGLANG_DRAFT_CUDA_GRAPH_PATCHED:
-        return
-
-    patched_targets = []
-    try:
-        module = importlib.import_module("sglang.srt.speculative.eagle_draft_cuda_graph_runner")
-        runner_cls = getattr(module, "EAGLEDraftCudaGraphRunner", None)
-        original_replay = getattr(runner_cls, "replay", None) if runner_cls is not None else None
-        if original_replay is not None and not getattr(
-            original_replay,
-            "_verl_patched_draft_cuda_graph_replay",
-            False,
-        ):
-            runner_cls.replay = _make_draft_cuda_graph_replay_patch(original_replay)
-            patched_targets.append("EAGLEDraftCudaGraphRunner.replay")
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Skip SGLang draft cuda graph replay patch: %s", exc)
-
-    for module_name in ("sglang.srt.speculative.eagle_worker", "sglang.srt.speculative.eagle_worker_v2"):
-        try:
-            module = importlib.import_module(module_name)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Skip SGLang draft cuda graph init patch for %s: %s", module_name, exc)
-            continue
-        for class_name, cls in vars(module).items():
-            if not isinstance(cls, type) or not class_name.lower().startswith("eagle"):
-                continue
-            original_init_cuda_graphs = getattr(cls, "init_cuda_graphs", None)
-            if original_init_cuda_graphs is None or getattr(
-                original_init_cuda_graphs,
-                "_verl_patched_draft_cuda_graph_init",
-                False,
-            ):
-                continue
-            cls.init_cuda_graphs = _make_draft_cuda_graph_init_patch(original_init_cuda_graphs)
-            patched_targets.append(f"{module_name}.{class_name}.init_cuda_graphs")
-
-    if patched_targets:
-        _SGLANG_DRAFT_CUDA_GRAPH_PATCHED = True
-        logger.warning("Patched SGLang draft cuda graph for %s", ", ".join(patched_targets))
-
-
-class _NoopRoutedExpertsCapturer:
-    def on_forward_end(self, *args, **kwargs):
-        return None
-
-
-def _make_model_runner_init_no_draft_offloader_patch(original_init):
-    @wraps(original_init)
-    def patched_model_runner_init(self, *args, **kwargs):
-        if not _is_draft_worker_init_call(original_init, args, kwargs):
-            return original_init(self, *args, **kwargs)
-
-        original_set_offloader = original_init.__globals__.get("set_offloader")
-        if original_set_offloader is None:
-            return original_init(self, *args, **kwargs)
-
-        def noop_set_offloader(*_args, **_kwargs):
-            return None
-
-        original_init.__globals__["set_offloader"] = noop_set_offloader
-        try:
-            return original_init(self, *args, **kwargs)
-        finally:
-            original_init.__globals__["set_offloader"] = original_set_offloader
-
-    patched_model_runner_init._verl_patched_draft_worker_no_offloader = True
-    return patched_model_runner_init
-
-
-def _make_init_routed_experts_skip_draft_patch(original_init_routed_experts):
-    @wraps(original_init_routed_experts)
-    def patched_init_routed_experts(self, *args, **kwargs):
-        if getattr(self, "is_draft_worker", False):
-            return None
-        return original_init_routed_experts(self, *args, **kwargs)
-
-    patched_init_routed_experts._verl_patched_skip_draft_routed_experts = True
-    return patched_init_routed_experts
-
-
-def _make_model_runner_forward_routed_experts_patch(original_forward):
-    try:
-        source = inspect.getsource(original_forward)
-    except (OSError, TypeError):
-        return None
-
-    source = textwrap.dedent(source)
-    old_block = """    # Copy cached routing experts' buffers back to CPU cache
-    get_global_experts_capturer().on_forward_end(
-        forward_batch=forward_batch,
-        can_run_graph=output.can_run_graph,
-        cuda_graph_batch=getattr(self.graph_runner, "bs", None),
-    )
-"""
-    new_block = """    if not self.is_draft_worker:
-        # In speculative decoding, num_tokens_per_bs > 1, so pass the
-        # actual graph token count instead of the request batch size.
-        cuda_graph_num_tokens = None
-        if getattr(self.graph_runner, "bs", None):
-            cuda_graph_num_tokens = self.graph_runner.bs * self.graph_runner.num_tokens_per_bs
-        get_global_experts_capturer().on_forward_end(
-            forward_batch=forward_batch,
-            can_run_graph=output.can_run_graph,
-            cuda_graph_batch=cuda_graph_num_tokens,
-        )
-"""
-    patched_source = source.replace(old_block, new_block)
-    if patched_source == source:
-        return None
-
-    namespace = {}
-    exec(  # noqa: S102
-        "from __future__ import annotations\n" + patched_source,
-        original_forward.__globals__,
-        namespace,
-    )
-    patched_forward = namespace[original_forward.__name__]
-    patched_forward = wraps(original_forward)(patched_forward)
-    patched_forward._verl_patched_draft_worker_routed_experts_forward = True
-    return patched_forward
-
-
-def _make_model_runner_forward_routed_experts_fallback(original_forward):
-    @wraps(original_forward)
-    def patched_forward(self, *args, **kwargs):
-        if not getattr(self, "is_draft_worker", False):
-            return original_forward(self, *args, **kwargs)
-
-        globals_dict = original_forward.__globals__
-        get_capturer = globals_dict.get("get_global_experts_capturer")
-        set_capturer = globals_dict.get("set_global_experts_capturer")
-        if get_capturer is None or set_capturer is None:
-            return original_forward(self, *args, **kwargs)
-
-        original_capturer = get_capturer()
-        set_capturer(_NoopRoutedExpertsCapturer())
-        try:
-            return original_forward(self, *args, **kwargs)
-        finally:
-            set_capturer(original_capturer)
-
-    patched_forward._verl_patched_draft_worker_routed_experts_forward = True
-    return patched_forward
-
-
-def patch_sglang_draft_worker_model_runner() -> None:
-    """Apply slime's draft-worker ModelRunner guards for offloader and routed experts."""
-    global _SGLANG_DRAFT_WORKER_MODEL_RUNNER_PATCHED
-    if _SGLANG_DRAFT_WORKER_MODEL_RUNNER_PATCHED:
-        return
-
-    try:
-        module = importlib.import_module("sglang.srt.model_executor.model_runner")
-        model_runner_cls = getattr(module, "ModelRunner", None)
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Skip SGLang draft worker ModelRunner patch: %s", exc)
-        return
-
-    if model_runner_cls is None:
-        return
-
-    patched_targets = []
-    original_init = getattr(model_runner_cls, "__init__", None)
-    if original_init is not None and not getattr(original_init, "_verl_patched_draft_worker_no_offloader", False):
-        model_runner_cls.__init__ = _make_model_runner_init_no_draft_offloader_patch(original_init)
-        patched_targets.append("ModelRunner.__init__")
-
-    original_init_routed_experts = getattr(model_runner_cls, "init_routed_experts_capturer", None)
-    if original_init_routed_experts is not None and not getattr(
-        original_init_routed_experts,
-        "_verl_patched_skip_draft_routed_experts",
-        False,
-    ):
-        model_runner_cls.init_routed_experts_capturer = _make_init_routed_experts_skip_draft_patch(
-            original_init_routed_experts
-        )
-        patched_targets.append("ModelRunner.init_routed_experts_capturer")
-
-    original_forward = getattr(model_runner_cls, "forward", None)
-    if original_forward is not None and not getattr(
-        original_forward,
-        "_verl_patched_draft_worker_routed_experts_forward",
-        False,
-    ):
-        patched_forward = _make_model_runner_forward_routed_experts_patch(original_forward)
-        if patched_forward is None:
-            patched_forward = _make_model_runner_forward_routed_experts_fallback(original_forward)
-        model_runner_cls.forward = patched_forward
-        patched_targets.append("ModelRunner.forward")
-
-    if patched_targets:
-        _SGLANG_DRAFT_WORKER_MODEL_RUNNER_PATCHED = True
-        logger.warning("Patched SGLang draft worker ModelRunner for %s", ", ".join(patched_targets))
-
-
-def _sglang_rl_on_policy_target_enabled(globals_dict: dict | None = None) -> bool:
-    get_server_args = None if globals_dict is None else globals_dict.get("get_global_server_args")
-    if get_server_args is None:
-        try:
-            server_args_module = importlib.import_module("sglang.srt.server_args")
-            get_server_args = getattr(server_args_module, "get_global_server_args", None)
-        except Exception:  # noqa: BLE001
-            get_server_args = None
-    if get_server_args is None:
-        return False
-
-    try:
-        server_args = get_server_args()
-    except Exception:  # noqa: BLE001
-        return False
-    return getattr(server_args, "rl_on_policy_target", None) is not None
-
-
-def _compile_sglang_source_rewrite(
-    original_func,
-    patch_attr: str,
-    replacements: tuple[tuple[str, str], ...] = (),
-    regex_replacements: tuple[tuple[str, str], ...] = (),
-    extra_globals: dict | None = None,
-):
-    try:
-        source = inspect.getsource(original_func)
-    except (OSError, TypeError):
-        return None
-
-    source = textwrap.dedent(source)
-    patched_source = source
-    for old, new in replacements:
-        patched_source = patched_source.replace(old, new)
-    for pattern, replacement in regex_replacements:
-        patched_source = re.sub(pattern, replacement, patched_source, flags=re.MULTILINE | re.DOTALL)
-
-    if patched_source == source:
-        return None
-
-    globals_dict = original_func.__globals__
-    if extra_globals:
-        globals_dict.update(extra_globals)
-    namespace = {}
-    exec(  # noqa: S102
-        "from __future__ import annotations\n" + patched_source,
-        globals_dict,
-        namespace,
-    )
-    patched_func = namespace[original_func.__name__]
-    patched_func = wraps(original_func)(patched_func)
-    setattr(patched_func, patch_attr, True)
-    return patched_func
-
-
-def _make_sglang_logits_processor_npu_rl_patch(original_compute_lm_head):
-    old_block = """            elif get_global_server_args().rl_on_policy_target is not None:
-                # Due to tie-weight, we may not be able to change lm_head's weight dtype
-                logits = torch.matmul(
-                    hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
-                )
-            else:
-                logits = torch.matmul(
-                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
-                )
-"""
-    new_block = """            else:
-                logits = torch.matmul(
-                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
-                )
-"""
-    return _compile_sglang_source_rewrite(
-        original_compute_lm_head,
-        "_verl_patched_npu_rl_logits_processor",
-        replacements=((old_block, new_block),),
-    )
-
-
-def _make_sglang_sampler_npu_rl_patch(original_forward):
-    return _compile_sglang_source_rewrite(
-        original_forward,
-        "_verl_patched_npu_rl_sampler",
-        regex_replacements=(
-            (
-                r"logits_div_temperature = \(\s*"
-                r"logits\.bfloat16\(\)\.div\(sampling_info\.temperatures\)\.bfloat16\(\)\s*\)",
-                "logits_div_temperature = logits.div(sampling_info.temperatures)",
-            ),
-        ),
-    )
-
-
-def _make_sglang_rmsnorm_init_npu_rl_patch(original_init):
-    @wraps(original_init)
-    def patched_init(self, *args, **kwargs):
-        if _is_sglang_npu_backend() and _sglang_rl_on_policy_target_enabled(original_init.__globals__):
-            # slime-ascend keeps the residual path in the incoming activation dtype
-            # on NPU instead of forcing an fp32 residual through override_orig_dtype.
-            kwargs.pop("override_orig_dtype", None)
-        return original_init(self, *args, **kwargs)
-
-    patched_init._verl_patched_npu_rl_rmsnorm_init = True
-    return patched_init
-
-
-def _make_sglang_rmsnorm_native_npu_rl_patch(original_forward_native):
-    old_block = """            if self.fp32_residual:
-                residual = x.clone()
-            else:
-                residual = x.to(orig_dtype)
-"""
-    new_block = """            residual = x.to(orig_dtype)
-"""
-    return _compile_sglang_source_rewrite(
-        original_forward_native,
-        "_verl_patched_npu_rl_rmsnorm_native",
-        replacements=((old_block, new_block),),
-    )
-
-
-def _make_sglang_rotary_no_compile_npu_rl_patch(original_init):
-    @wraps(original_init)
-    def patched_init(self, *args, **kwargs):
-        if not (_is_sglang_npu_backend() and _sglang_rl_on_policy_target_enabled(original_init.__globals__)):
-            return original_init(self, *args, **kwargs)
-
-        torch_module = original_init.__globals__.get("torch")
-        original_compile = getattr(torch_module, "compile", None)
-        if torch_module is None or original_compile is None:
-            return original_init(self, *args, **kwargs)
-
-        def identity_compile(*compile_args, **compile_kwargs):
-            del compile_kwargs
-            if compile_args and callable(compile_args[0]):
-                return compile_args[0]
-
-            def decorator(func):
-                return func
-
-            return decorator
-
-        torch_module.compile = identity_compile
-        try:
-            return original_init(self, *args, **kwargs)
-        finally:
-            torch_module.compile = original_compile
-
-    patched_init._verl_patched_npu_rl_rotary_no_compile = True
-    return patched_init
-
-
-def _make_sglang_parallel_rank_fallback_patch(original_get_tp_rank):
-    @wraps(original_get_tp_rank)
-    def patched_get_tensor_model_parallel_rank(*args, **kwargs):
-        try:
-            return original_get_tp_rank(*args, **kwargs)
-        except Exception:  # noqa: BLE001
-            return 0
-
-    patched_get_tensor_model_parallel_rank._verl_patched_npu_tp_rank_fallback = True
-    return patched_get_tensor_model_parallel_rank
-
-
-def _make_sglang_fused_moe_deterministic_patch(original_fused_experts_impl):
-    try:
-        server_args_module = importlib.import_module("sglang.srt.server_args")
-        get_global_server_args = getattr(server_args_module, "get_global_server_args")
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Skip SGLang deterministic MoE rewrite: %s", exc)
-        return None
-
-    return _compile_sglang_source_rewrite(
-        original_fused_experts_impl,
-        "_verl_patched_npu_deterministic_moe",
-        replacements=(
-            (
-                "if tokens_in_chunk <= 32:",
-                "if not get_global_server_args().enable_deterministic_inference and tokens_in_chunk <= 32:",
-            ),
-        ),
-        extra_globals={"get_global_server_args": get_global_server_args},
-    )
-
-
-def _is_sglang_deepep_moe_backend() -> bool:
-    try:
-        moe_module = importlib.import_module("sglang.srt.layers.moe")
-        get_moe_a2a_backend = getattr(moe_module, "get_moe_a2a_backend", None)
-        if get_moe_a2a_backend is None:
-            return False
-        backend = get_moe_a2a_backend()
-        return bool(getattr(backend, "is_deepep", lambda: False)())
-    except Exception:  # noqa: BLE001
-        return False
-
-
-def _ensure_sglang_deepep_routed_experts_gather_buffer(capturer):
-    if not _is_sglang_deepep_moe_backend():
-        return None
-
-    device_cache = getattr(capturer, "device_cache", None)
-    device_buffer = getattr(device_cache, "buffer", None)
-    if device_buffer is None or device_buffer.dim() < 3:
-        return None
-
-    try:
-        dp_attention = importlib.import_module("sglang.srt.layers.dp_attention")
-        is_dp_attention_enabled = getattr(dp_attention, "is_dp_attention_enabled")
-        get_attention_tp_size = getattr(dp_attention, "get_attention_tp_size")
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Skip DeepEP routed experts gather buffer: %s", exc)
-        return None
-
-    attn_tp_size = get_attention_tp_size() if is_dp_attention_enabled() else 1
-    expected_shape = (device_buffer.shape[0] * attn_tp_size, device_buffer.shape[2])
-    gather_buffer = getattr(capturer, "gather_buffer", None)
-    if gather_buffer is not None and tuple(gather_buffer.shape) == expected_shape:
-        return gather_buffer
-
-    capturer.gather_buffer = torch.empty(
-        expected_shape,
-        dtype=torch.int32,
-        device=device_buffer.device,
-    )
-    return capturer.gather_buffer
-
-
-def _make_sglang_routed_experts_init_deepep_patch(original_init):
-    @wraps(original_init)
-    def patched_init(self, *args, **kwargs):
-        result = original_init(self, *args, **kwargs)
-        _ensure_sglang_deepep_routed_experts_gather_buffer(self)
-        return result
-
-    patched_init._verl_patched_npu_deepep_routed_experts_init = True
-    return patched_init
-
-
-def _make_sglang_routed_experts_capture_deepep_patch(original_capture):
-    @wraps(original_capture)
-    def patched_capture(self, layer_id: int, topk_ids: torch.Tensor):
-        if _is_sglang_deepep_moe_backend():
-            try:
-                dp_attention = importlib.import_module("sglang.srt.layers.dp_attention")
-                get_attention_tp_size = getattr(dp_attention, "get_attention_tp_size")
-                attn_tp_all_gather_into_tensor = getattr(dp_attention, "attn_tp_all_gather_into_tensor")
-                local_topk_ids = topk_ids
-                gather_buffer = _ensure_sglang_deepep_routed_experts_gather_buffer(self)
-                if gather_buffer is not None:
-                    topk_ids = gather_buffer[: local_topk_ids.size(0) * get_attention_tp_size()]
-                    attn_tp_all_gather_into_tensor(topk_ids, local_topk_ids)
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("Skip DeepEP routed experts capture gather: %s", exc)
-        return original_capture(self, layer_id, topk_ids)
-
-    patched_capture._verl_patched_npu_deepep_routed_experts_capture = True
-    return patched_capture
-
-
-def _make_sglang_routed_experts_sync_deepep_patch(original_sync):
-    try:
-        moe_module = importlib.import_module("sglang.srt.layers.moe")
-        get_moe_a2a_backend = getattr(moe_module, "get_moe_a2a_backend")
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Skip DeepEP routed experts sync rewrite: %s", exc)
-        return None
-
-    return _compile_sglang_source_rewrite(
-        original_sync,
-        "_verl_patched_npu_deepep_routed_experts_sync",
-        replacements=(
-            (
-                "if is_dp_attention_enabled():",
-                "if is_dp_attention_enabled() and not get_moe_a2a_backend().is_deepep():",
-            ),
-        ),
-        extra_globals={"get_moe_a2a_backend": get_moe_a2a_backend},
-    )
-
-
-def patch_sglang_npu_ascend_low_level() -> None:
-    """Apply slime-ascend's NPU low-level fixes that can affect speculative rollout numerics."""
-    global _SGLANG_NPU_ASCEND_LOW_LEVEL_PATCHED
-    if _SGLANG_NPU_ASCEND_LOW_LEVEL_PATCHED or not _is_sglang_npu_backend():
-        return
-
-    patched_targets = []
-
-    try:
-        logits_module = importlib.import_module("sglang.srt.layers.logits_processor")
-        logits_processor_cls = getattr(logits_module, "LogitsProcessor", None)
-        original_compute_lm_head = (
-            getattr(logits_processor_cls, "_compute_lm_head", None) if logits_processor_cls is not None else None
-        )
-        if original_compute_lm_head is not None and not getattr(
-            original_compute_lm_head,
-            "_verl_patched_npu_rl_logits_processor",
-            False,
-        ):
-            patched_compute_lm_head = _make_sglang_logits_processor_npu_rl_patch(original_compute_lm_head)
-            if patched_compute_lm_head is not None:
-                logits_processor_cls._compute_lm_head = patched_compute_lm_head
-                patched_targets.append("LogitsProcessor._compute_lm_head")
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Skip SGLang NPU logits processor patch: %s", exc)
-
-    try:
-        sampler_module = importlib.import_module("sglang.srt.layers.sampler")
-        sampler_cls = getattr(sampler_module, "Sampler", None)
-        original_forward = getattr(sampler_cls, "forward", None) if sampler_cls is not None else None
-        if original_forward is not None and not getattr(original_forward, "_verl_patched_npu_rl_sampler", False):
-            patched_forward = _make_sglang_sampler_npu_rl_patch(original_forward)
-            if patched_forward is not None:
-                sampler_cls.forward = patched_forward
-                patched_targets.append("Sampler.forward")
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Skip SGLang NPU sampler patch: %s", exc)
-
-    try:
-        rotary_module = importlib.import_module("sglang.srt.layers.rotary_embedding")
-        rotary_cls = getattr(rotary_module, "RotaryEmbedding", None)
-        original_init = getattr(rotary_cls, "__init__", None) if rotary_cls is not None else None
-        if original_init is not None and not getattr(original_init, "_verl_patched_npu_rl_rotary_no_compile", False):
-            rotary_cls.__init__ = _make_sglang_rotary_no_compile_npu_rl_patch(original_init)
-            patched_targets.append("RotaryEmbedding.__init__")
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Skip SGLang NPU rotary patch: %s", exc)
-
-    try:
-        layernorm_module = importlib.import_module("sglang.srt.layers.layernorm")
-        rmsnorm_cls = getattr(layernorm_module, "RMSNorm", None)
-        original_init = getattr(rmsnorm_cls, "__init__", None) if rmsnorm_cls is not None else None
-        if original_init is not None and not getattr(original_init, "_verl_patched_npu_rl_rmsnorm_init", False):
-            rmsnorm_cls.__init__ = _make_sglang_rmsnorm_init_npu_rl_patch(original_init)
-            patched_targets.append("RMSNorm.__init__")
-
-        original_forward_native = getattr(rmsnorm_cls, "forward_native", None) if rmsnorm_cls is not None else None
-        if original_forward_native is not None and not getattr(
-            original_forward_native,
-            "_verl_patched_npu_rl_rmsnorm_native",
-            False,
-        ):
-            patched_forward_native = _make_sglang_rmsnorm_native_npu_rl_patch(original_forward_native)
-            if patched_forward_native is not None:
-                rmsnorm_cls.forward_native = patched_forward_native
-                patched_targets.append("RMSNorm.forward_native")
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Skip SGLang NPU RMSNorm patch: %s", exc)
-
-    try:
-        parallel_state_module = importlib.import_module("sglang.srt.distributed.parallel_state")
-        original_get_tp_rank = getattr(parallel_state_module, "get_tensor_model_parallel_rank", None)
-        if original_get_tp_rank is not None and not getattr(
-            original_get_tp_rank,
-            "_verl_patched_npu_tp_rank_fallback",
-            False,
-        ):
-            parallel_state_module.get_tensor_model_parallel_rank = _make_sglang_parallel_rank_fallback_patch(
-                original_get_tp_rank
-            )
-            patched_targets.append("parallel_state.get_tensor_model_parallel_rank")
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Skip SGLang NPU TP-rank fallback patch: %s", exc)
-
-    try:
-        fused_moe_module = importlib.import_module("sglang.srt.layers.moe.fused_moe_triton.fused_moe")
-        original_fused_experts_impl = getattr(fused_moe_module, "fused_experts_impl", None)
-        if original_fused_experts_impl is not None and not getattr(
-            original_fused_experts_impl,
-            "_verl_patched_npu_deterministic_moe",
-            False,
-        ):
-            patched_fused_experts_impl = _make_sglang_fused_moe_deterministic_patch(original_fused_experts_impl)
-            if patched_fused_experts_impl is not None:
-                fused_moe_module.fused_experts_impl = patched_fused_experts_impl
-                patched_targets.append("fused_moe.fused_experts_impl")
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Skip SGLang deterministic MoE patch: %s", exc)
-
-    try:
-        routed_module = importlib.import_module("sglang.srt.layers.moe.routed_experts_capturer")
-        capturer_cls = getattr(routed_module, "_RoutedExpertsCapturerReal", None)
-        if capturer_cls is not None:
-            original_init = getattr(capturer_cls, "__init__", None)
-            if original_init is not None and not getattr(
-                original_init,
-                "_verl_patched_npu_deepep_routed_experts_init",
-                False,
-            ):
-                capturer_cls.__init__ = _make_sglang_routed_experts_init_deepep_patch(original_init)
-                patched_targets.append("_RoutedExpertsCapturerReal.__init__")
-
-            original_sync = getattr(capturer_cls, "_sync_fwd_experts_buffer_DtoH", None)
-            if original_sync is not None and not getattr(
-                original_sync,
-                "_verl_patched_npu_deepep_routed_experts_sync",
-                False,
-            ):
-                patched_sync = _make_sglang_routed_experts_sync_deepep_patch(original_sync)
-                if patched_sync is not None:
-                    capturer_cls._sync_fwd_experts_buffer_DtoH = patched_sync
-                    patched_targets.append("_RoutedExpertsCapturerReal._sync_fwd_experts_buffer_DtoH")
-
-            original_capture = getattr(capturer_cls, "capture", None)
-            if original_capture is not None and not getattr(
-                original_capture,
-                "_verl_patched_npu_deepep_routed_experts_capture",
-                False,
-            ):
-                capturer_cls.capture = _make_sglang_routed_experts_capture_deepep_patch(original_capture)
-                patched_targets.append("_RoutedExpertsCapturerReal.capture")
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Skip SGLang DeepEP routed experts patch: %s", exc)
-
-    if patched_targets:
-        _SGLANG_NPU_ASCEND_LOW_LEVEL_PATCHED = True
-        logger.warning("Patched SGLang NPU/Ascend low-level paths for %s", ", ".join(patched_targets))
 
 
 def _renorm_probs_by_top_k_top_p(
@@ -1544,7 +467,227 @@ def _sample_from_probs_with_coin(probs: torch.Tensor, coin: torch.Tensor) -> tor
     return samples[0] if squeeze_output else samples
 
 
-def _try_sglang_tree_speculative_sampling_kernel(
+_tree_speculative_sampling_target_only_linear_triton_kernel = None
+if triton is not None:
+
+    @triton.jit(do_not_specialize=["threshold_single", "threshold_acc"])
+    def _tree_speculative_sampling_target_only_linear_triton_kernel(
+        predicts_ptr,
+        accept_index_ptr,
+        accept_token_num_ptr,
+        candidates_ptr,
+        retrive_index_ptr,
+        retrive_next_token_ptr,
+        uniform_samples_ptr,
+        uniform_samples_for_final_sampling_ptr,
+        target_probs_ptr,
+        threshold_single,
+        threshold_acc,
+        NUM_DRAFT_TOKENS: tl.constexpr,
+        NUM_SPECULATIVE_TOKENS: tl.constexpr,
+        VOCAB_SIZE: tl.constexpr,
+        SUB_BLOCK: tl.constexpr,
+        NUM_VOCAB_BLOCKS: tl.constexpr,
+        SPEC_BLOCK: tl.constexpr,
+    ):
+        req_idx = tl.program_id(0)
+        row_base = req_idx * NUM_DRAFT_TOKENS
+        accept_index_base = req_idx * NUM_SPECULATIVE_TOKENS
+
+        spec_offsets = tl.arange(0, SPEC_BLOCK)
+        tl.store(
+            accept_index_ptr + accept_index_base + spec_offsets,
+            -1,
+            mask=spec_offsets < NUM_SPECULATIVE_TOKENS,
+        )
+        tl.store(accept_token_num_ptr + req_idx, 0)
+
+        threshold_acc = tl.maximum(threshold_acc, 1.0e-9)
+        cur_prob_idx = 0
+        accepted_count = 0
+        active = True
+        residual_token_id = -1
+        residual_token_prob = 0.0
+
+        last_accepted_retrive_idx = tl.load(retrive_index_ptr + row_base)
+        tl.store(accept_index_ptr + accept_index_base, last_accepted_retrive_idx)
+        coin = tl.load(uniform_samples_ptr + row_base).to(tl.float32)
+
+        for _ in range(1, NUM_SPECULATIVE_TOKENS):
+            next_idx = tl.load(retrive_next_token_ptr + row_base + cur_prob_idx)
+            valid = active & (next_idx >= 0)
+            safe_next_idx = tl.maximum(next_idx, 0)
+            draft_token_id = tl.load(candidates_ptr + row_base + safe_next_idx).to(tl.int64)
+            target_prob_single = tl.load(
+                target_probs_ptr + (row_base + cur_prob_idx) * VOCAB_SIZE + draft_token_id,
+                mask=valid,
+                other=0.0,
+            ).to(tl.float32)
+            accepted = valid & (
+                (coin <= (target_prob_single / threshold_acc)) | (target_prob_single >= threshold_single)
+            )
+
+            if accepted:
+                accepted_retrive_idx = tl.load(retrive_index_ptr + row_base + safe_next_idx)
+                tl.store(predicts_ptr + last_accepted_retrive_idx, draft_token_id)
+                accepted_count += 1
+                tl.store(
+                    accept_index_ptr + accept_index_base + accepted_count,
+                    accepted_retrive_idx,
+                    mask=accepted_count < NUM_SPECULATIVE_TOKENS,
+                )
+                cur_prob_idx = safe_next_idx
+                last_accepted_retrive_idx = accepted_retrive_idx
+                coin = tl.load(uniform_samples_ptr + row_base + cur_prob_idx).to(tl.float32)
+                residual_token_id = -1
+                residual_token_prob = 0.0
+            else:
+                if valid:
+                    residual_token_id = draft_token_id
+                    residual_token_prob = target_prob_single
+                active = False
+
+        tl.store(accept_token_num_ptr + req_idx, accepted_count)
+
+        final_row_base = (row_base + cur_prob_idx) * VOCAB_SIZE
+        need_residual = (accepted_count != (NUM_SPECULATIVE_TOKENS - 1)) & (residual_token_id >= 0)
+        total = 0.0
+        vocab_offsets = tl.arange(0, SUB_BLOCK)
+        for block_idx in range(NUM_VOCAB_BLOCKS):
+            token_offsets = block_idx * SUB_BLOCK + vocab_offsets
+            mask = token_offsets < VOCAB_SIZE
+            probs = tl.load(target_probs_ptr + final_row_base + token_offsets, mask=mask, other=0.0).to(tl.float32)
+            if need_residual:
+                probs = tl.where(
+                    token_offsets == residual_token_id,
+                    tl.maximum(probs - residual_token_prob, 0.0),
+                    probs,
+                )
+            total += tl.sum(probs, axis=0)
+
+        final_coin = tl.load(uniform_samples_for_final_sampling_ptr + req_idx).to(tl.float32)
+        final_token_id = VOCAB_SIZE - 1
+        if total <= 0.0:
+            final_token_id = tl.minimum((final_coin * VOCAB_SIZE).to(tl.int64), VOCAB_SIZE - 1)
+        else:
+            threshold = final_coin * total
+            cumulative = 0.0
+            found = False
+            for block_idx in range(NUM_VOCAB_BLOCKS):
+                token_offsets = block_idx * SUB_BLOCK + vocab_offsets
+                mask = token_offsets < VOCAB_SIZE
+                probs = tl.load(target_probs_ptr + final_row_base + token_offsets, mask=mask, other=0.0).to(tl.float32)
+                if need_residual:
+                    probs = tl.where(
+                        token_offsets == residual_token_id,
+                        tl.maximum(probs - residual_token_prob, 0.0),
+                        probs,
+                    )
+                cumulative_probs = tl.cumsum(probs, 0) + cumulative
+                hits = (cumulative_probs > threshold) & mask
+                hit_values = hits.to(tl.int32)
+                has_hit = tl.max(hit_values, axis=0) > 0
+                if has_hit & (~found):
+                    final_token_id = block_idx * SUB_BLOCK + tl.argmax(hit_values, axis=0)
+                    found = True
+                cumulative += tl.sum(probs, axis=0)
+
+        tl.store(predicts_ptr + last_accepted_retrive_idx, final_token_id)
+
+
+def _triton_next_power_of_2(value: int) -> int:
+    return 1 << (max(int(value), 1) - 1).bit_length()
+
+
+def _try_tree_speculative_sampling_target_only_linear_triton(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    uniform_samples: torch.Tensor,
+    uniform_samples_for_final_sampling: torch.Tensor,
+    target_probs: torch.Tensor,
+    threshold_single: float,
+    threshold_acc: float,
+) -> bool:
+    if not (_sglang_npu_eagle_linear_triton_enabled() and _triton_ascend_available()):
+        return False
+    if _tree_speculative_sampling_target_only_linear_triton_kernel is None:
+        return False
+    if target_probs.device.type != "npu":
+        return False
+    if target_probs.ndim != 3 or candidates.ndim != 2:
+        return False
+    if not all(
+        tensor.is_contiguous()
+        for tensor in (
+            predicts,
+            accept_index,
+            accept_token_num,
+            candidates,
+            retrive_index,
+            retrive_next_token,
+            uniform_samples,
+            uniform_samples_for_final_sampling,
+            target_probs,
+        )
+    ):
+        return False
+
+    batch_size, num_draft_tokens = candidates.shape
+    num_speculative_tokens = accept_index.shape[1]
+    vocab_size = target_probs.shape[-1]
+    if (
+        batch_size == 0
+        or num_draft_tokens == 0
+        or num_speculative_tokens == 0
+        or target_probs.shape[:2] != candidates.shape
+        or uniform_samples.shape != candidates.shape
+    ):
+        return False
+
+    target_probs_for_sampling = _as_sglang_npu_eagle_sampling_float(target_probs)
+    uniform_samples_for_sampling = _as_sglang_npu_eagle_sampling_float(uniform_samples)
+    final_uniform_samples_for_sampling = _as_sglang_npu_eagle_sampling_float(
+        uniform_samples_for_final_sampling
+    )
+    if not (
+        target_probs_for_sampling.is_contiguous()
+        and uniform_samples_for_sampling.is_contiguous()
+        and final_uniform_samples_for_sampling.is_contiguous()
+    ):
+        return False
+
+    sub_block = 4096
+    try:
+        _tree_speculative_sampling_target_only_linear_triton_kernel[(batch_size,)](
+            predicts,
+            accept_index,
+            accept_token_num,
+            candidates,
+            retrive_index,
+            retrive_next_token,
+            uniform_samples_for_sampling,
+            final_uniform_samples_for_sampling,
+            target_probs_for_sampling,
+            float(threshold_single),
+            max(float(threshold_acc), 1.0e-9),
+            NUM_DRAFT_TOKENS=int(num_draft_tokens),
+            NUM_SPECULATIVE_TOKENS=int(num_speculative_tokens),
+            VOCAB_SIZE=int(vocab_size),
+            SUB_BLOCK=sub_block,
+            NUM_VOCAB_BLOCKS=(int(vocab_size) + sub_block - 1) // sub_block,
+            SPEC_BLOCK=_triton_next_power_of_2(num_speculative_tokens),
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("SGLang NPU EAGLE linear target-only Triton kernel failed: %s", exc)
+        return False
+
+
+def _tree_speculative_sampling_target_only_linear_torch(
     predicts: torch.Tensor,
     accept_index: torch.Tensor,
     accept_token_num: torch.Tensor,
@@ -1556,56 +699,12 @@ def _try_sglang_tree_speculative_sampling_kernel(
     uniform_samples_for_final_sampling: torch.Tensor,
     target_probs: torch.Tensor,
     draft_probs: torch.Tensor,
-    threshold_single: float,
-    threshold_acc: float,
-    deterministic: bool,
-) -> bool:
-    if target_probs.device.type != "cuda" or draft_probs.shape != target_probs.shape:
-        return False
-
-    try:
-        from sgl_kernel import tree_speculative_sampling_target_only
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("SGLang tree speculative CUDA kernel is unavailable: %s", exc)
-        return False
-
-    try:
-        tree_speculative_sampling_target_only(
-            predicts=predicts,
-            accept_index=accept_index,
-            accept_token_num=accept_token_num,
-            candidates=candidates,
-            retrive_index=retrive_index,
-            retrive_next_token=retrive_next_token,
-            retrive_next_sibling=retrive_next_sibling,
-            uniform_samples=uniform_samples,
-            uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
-            target_probs=target_probs,
-            draft_probs=draft_probs,
-            threshold_single=threshold_single,
-            threshold_acc=threshold_acc,
-            deterministic=deterministic,
-        )
-        return True
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("SGLang tree speculative CUDA kernel failed; falling back to torch path: %s", exc)
-        return False
-
-
-def _tree_speculative_sampling_target_only_linear_torch(
-    predicts: torch.Tensor,
-    accept_index: torch.Tensor,
-    accept_token_num: torch.Tensor,
-    candidates: torch.Tensor,
-    retrive_index: torch.Tensor,
-    retrive_next_token: torch.Tensor,
-    uniform_samples: torch.Tensor,
-    uniform_samples_for_final_sampling: torch.Tensor,
-    target_probs: torch.Tensor,
-    threshold_single: float,
-    threshold_acc: float,
+    threshold_single: float = 1.0,
+    threshold_acc: float = 1.0,
+    deterministic: bool = True,
 ) -> None:
-    """Fast path for linear EAGLE trees without siblings."""
+    del draft_probs, deterministic, retrive_next_sibling
+
     batch_size, _ = candidates.shape
     num_speculative_tokens = accept_index.shape[1]
     target_probs_for_sampling = _as_sglang_npu_eagle_sampling_float(target_probs)
@@ -1721,6 +820,8 @@ def _tree_speculative_sampling_target_only_vectorized_torch(
     threshold_single: float,
     threshold_acc: float,
 ) -> None:
+    del draft_probs
+
     batch_size, num_draft_tokens = candidates.shape
     num_speculative_tokens = accept_index.shape[1]
     target_probs_for_sampling = _as_sglang_npu_eagle_sampling_float(target_probs)
@@ -1851,27 +952,9 @@ def _tree_speculative_sampling_target_only_torch(
     threshold_acc: float = 1.0,
     deterministic: bool = True,
 ) -> None:
-    if _try_sglang_tree_speculative_sampling_kernel(
-        predicts=predicts,
-        accept_index=accept_index,
-        accept_token_num=accept_token_num,
-        candidates=candidates,
-        retrive_index=retrive_index,
-        retrive_next_token=retrive_next_token,
-        retrive_next_sibling=retrive_next_sibling,
-        uniform_samples=uniform_samples,
-        uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
-        target_probs=target_probs,
-        draft_probs=draft_probs,
-        threshold_single=threshold_single,
-        threshold_acc=threshold_acc,
-        deterministic=deterministic,
-    ):
-        return
-
     # Linear EAGLE trees (for example spec_topk=1) can skip sibling scanning.
     if not bool(torch.any(retrive_next_sibling >= 0).item()):
-        _tree_speculative_sampling_target_only_linear_torch(
+        if _try_tree_speculative_sampling_target_only_linear_triton(
             predicts=predicts,
             accept_index=accept_index,
             accept_token_num=accept_token_num,
@@ -1883,6 +966,23 @@ def _tree_speculative_sampling_target_only_torch(
             target_probs=target_probs,
             threshold_single=threshold_single,
             threshold_acc=threshold_acc,
+        ):
+            return
+        _tree_speculative_sampling_target_only_linear_torch(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates,
+            retrive_index=retrive_index,
+            retrive_next_token=retrive_next_token,
+            retrive_next_sibling=retrive_next_sibling,
+            uniform_samples=uniform_samples,
+            uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
+            target_probs=target_probs,
+            draft_probs=draft_probs,
+            threshold_single=threshold_single,
+            threshold_acc=threshold_acc,
+            deterministic=deterministic,
         )
         return
 
@@ -1903,74 +1003,8 @@ def _tree_speculative_sampling_target_only_torch(
     )
 
 
-def _make_eagle_v1_draft_extend_state_patch(original_forward_draft_extend_after_decode):
-    @wraps(original_forward_draft_extend_after_decode)
-    def patched_forward_draft_extend_after_decode(self, batch):
-        result = original_forward_draft_extend_after_decode(self, batch)
-        _repair_eagle_v1_post_draft_extend_state(batch)
-        return result
-
-    patched_forward_draft_extend_after_decode._verl_patched_npu_eagle_v1_state_repair = True
-    return patched_forward_draft_extend_after_decode
-
-
-def _make_eagle_v1_generation_result_state_patch(original_forward_batch_generation):
-    @wraps(original_forward_batch_generation)
-    def patched_forward_batch_generation(self, batch):
-        result = original_forward_batch_generation(self, batch)
-        _normalize_eagle_v1_generation_result_to_request_tails(result)
-        return result
-
-    patched_forward_batch_generation._verl_patched_npu_eagle_v1_result_state_repair = True
-    return patched_forward_batch_generation
-
-
-def _make_sglang_eagle_v2_sample_patch(original_sample, verify_mode: str):
-    del verify_mode
-    tree_sampling_func = _tree_speculative_sampling_target_only_torch
-    patched_sample = _compile_sglang_source_rewrite(
-        original_sample,
-        "_verl_patched_npu_eagle_sampling",
-        replacements=(),
-        extra_globals={
-            "_is_npu": False,
-            "top_k_renorm_prob": _top_k_renorm_prob_torch,
-            "top_p_renorm_prob": _top_p_renorm_prob_torch,
-            "tree_speculative_sampling_target_only": tree_sampling_func,
-        },
-    )
-    if patched_sample is not None:
-        return patched_sample
-
-    sample_globals = dict(original_sample.__globals__)
-    sample_globals["_is_npu"] = False
-    sample_globals["top_k_renorm_prob"] = _top_k_renorm_prob_torch
-    sample_globals["top_p_renorm_prob"] = _top_p_renorm_prob_torch
-    sample_globals["tree_speculative_sampling_target_only"] = tree_sampling_func
-    try:
-        eagle_utils = importlib.import_module("sglang.srt.speculative.eagle_utils")
-        sample_globals["verify_tree_greedy_func"] = getattr(
-            eagle_utils,
-            "verify_tree_greedy_func",
-            sample_globals.get("verify_tree_greedy_func"),
-        )
-    except Exception:  # noqa: BLE001
-        pass
-    sample = FunctionType(
-        original_sample.__code__,
-        sample_globals,
-        original_sample.__name__,
-        original_sample.__defaults__,
-        original_sample.__closure__,
-    )
-    sample.__kwdefaults__ = getattr(original_sample, "__kwdefaults__", None)
-    sample.__annotations__ = getattr(original_sample, "__annotations__", {}).copy()
-    sample._verl_patched_npu_eagle_sampling = True
-    return sample
-
-
 def patch_sglang_npu_eagle_target_sampling() -> None:
-    """Patch SGLang NPU EAGLE verification to use target-only sampling."""
+    """Patch SGLang NPU EAGLE v1 verification to use target-only sampling."""
     global _SGLANG_NPU_EAGLE_SAMPLING_PATCHED
     if _SGLANG_NPU_EAGLE_SAMPLING_PATCHED or not _is_sglang_npu_backend():
         return
@@ -1994,372 +1028,9 @@ def patch_sglang_npu_eagle_target_sampling() -> None:
             _EAGLE_V1_VERIFY_MODE_ENV,
         )
 
-    v2_verify_mode = _sglang_npu_eagle_v2_verify_mode()
-    if v2_verify_mode != "greedy":
-        try:
-            eagle_info_v2 = importlib.import_module("sglang.srt.speculative.eagle_info_v2")
-            mixin = getattr(eagle_info_v2, "EagleVerifyInputV2Mixin", None)
-            original_sample = getattr(mixin, "sample", None)
-            if original_sample is not None and not getattr(original_sample, "_verl_patched_npu_eagle_sampling", False):
-                patched_sample = _make_sglang_eagle_v2_sample_patch(original_sample, v2_verify_mode)
-                if patched_sample is not None:
-                    mixin.sample = patched_sample
-                    patched_targets.append("sglang.srt.speculative.eagle_info_v2(target_only)")
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Skip SGLang EAGLE v2 target sampling patch: %s", exc)
-    else:
-        logger.info(
-            "Skip SGLang EAGLE v2 target sampling patch. Set %s=target_only to enable it.",
-            _EAGLE_V2_VERIFY_MODE_ENV,
-        )
-
     if patched_targets:
         _SGLANG_NPU_EAGLE_SAMPLING_PATCHED = True
         logger.warning("Patched SGLang NPU EAGLE sampling for %s", ", ".join(patched_targets))
-
-
-def patch_sglang_npu_eagle_v1_greedy_path() -> None:
-    """Patch SGLang NPU EAGLE v1 multi-round state advancement."""
-    global _SGLANG_NPU_EAGLE_GREEDY_PATCHED
-    if _SGLANG_NPU_EAGLE_GREEDY_PATCHED or not _is_sglang_npu_backend():
-        return
-    if not _sglang_npu_eagle_v1_state_repair_enabled():
-        logger.info(
-            "Skip SGLang NPU EAGLE v1 state repair. Set %s=1 to enable it.",
-            _EAGLE_V1_STATE_REPAIR_ENV,
-        )
-        return
-
-    patched_targets = []
-    try:
-        eagle_worker = importlib.import_module("sglang.srt.speculative.eagle_worker")
-        eagle_worker_cls = getattr(eagle_worker, "EAGLEWorker", None)
-        original_draft_extend = (
-            getattr(eagle_worker_cls, "forward_draft_extend_after_decode", None)
-            if eagle_worker_cls is not None
-            else None
-        )
-        if original_draft_extend is not None and not getattr(
-            original_draft_extend,
-            "_verl_patched_npu_eagle_v1_state_repair",
-            False,
-        ):
-            eagle_worker_cls.forward_draft_extend_after_decode = _make_eagle_v1_draft_extend_state_patch(
-                original_draft_extend
-            )
-            patched_targets.append(
-                "sglang.srt.speculative.eagle_worker.EAGLEWorker.forward_draft_extend_after_decode"
-            )
-
-        original_generation = (
-            getattr(eagle_worker_cls, "forward_batch_generation", None)
-            if eagle_worker_cls is not None
-            else None
-        )
-        if original_generation is not None and not getattr(
-            original_generation,
-            "_verl_patched_npu_eagle_v1_result_state_repair",
-            False,
-        ):
-            eagle_worker_cls.forward_batch_generation = _make_eagle_v1_generation_result_state_patch(
-                original_generation
-            )
-            patched_targets.append(
-                "sglang.srt.speculative.eagle_worker.EAGLEWorker.forward_batch_generation"
-            )
-
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Skip SGLang EAGLE v1 worker state patch: %s", exc)
-
-    if patched_targets:
-        _SGLANG_NPU_EAGLE_GREEDY_PATCHED = True
-        logger.warning(
-            "Patched SGLang NPU EAGLE v1 state advancement for %s",
-            ", ".join(patched_targets),
-        )
-
-
-def _extract_hf_hidden_states(outputs):
-    if hasattr(outputs, "hidden_states"):
-        return outputs.hidden_states
-
-    if not isinstance(outputs, (tuple, list)):
-        return None
-
-    for item in outputs[1:]:
-        if not isinstance(item, (tuple, list)) or len(item) == 0:
-            continue
-        first = item[0]
-        if torch.is_tensor(first) and first.dim() >= 3:
-            return item
-
-    return None
-
-
-def _normalize_eagle3_capture_layers(layer_ids, num_layers: int) -> list[int]:
-    if layer_ids is None:
-        capture_layers = [2, num_layers // 2, num_layers - 3]
-    else:
-        # Match SGLang native Llama semantics: layer id i captures the output
-        # of layer i, which is hidden_states[i + 1] in HF output_hidden_states.
-        capture_layers = [int(layer_id) + 1 for layer_id in layer_ids]
-
-    return [layer_id for layer_id in capture_layers if 0 <= layer_id <= num_layers]
-
-
-def _call_sglang_forward_with_supported_kwargs(original_forward, self, *args, **kwargs):
-    try:
-        parameters = inspect.signature(original_forward).parameters
-    except (TypeError, ValueError):
-        return original_forward(self, *args, **kwargs)
-
-    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()):
-        supported_kwargs = kwargs
-    else:
-        supported_kwargs = {key: value for key, value in kwargs.items() if key in parameters}
-    return original_forward(self, *args, **supported_kwargs)
-
-
-def _call_module_with_supported_kwargs(module: torch.nn.Module, **kwargs):
-    try:
-        parameters = inspect.signature(module.forward).parameters
-    except (TypeError, ValueError):
-        return module(**kwargs)
-
-    if not any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()):
-        kwargs = {key: value for key, value in kwargs.items() if key in parameters}
-    return module(**kwargs)
-
-
-def _format_transformers_position_ids(model_obj, positions):
-    if hasattr(model_obj, "_format_position_ids"):
-        return model_obj._format_position_ids(positions)
-
-    model_config = getattr(model_obj, "model_config", None)
-    if getattr(model_config, "uses_mrope", False):
-        return positions[:, None]
-    return positions[None, ...]
-
-
-def _set_transformers_eagle3_capture_layers(self, layer_ids=None):
-    pp_group = getattr(self, "pp_group", None)
-    if pp_group is not None and not getattr(pp_group, "is_last_rank", True):
-        return
-
-    text_config = getattr(self, "text_config", getattr(self, "config", None))
-    num_layers = int(getattr(text_config, "num_hidden_layers", 0) or 0)
-    self.capture_aux_hidden_states = True
-    self._verl_eagle3_capture_layer_ids = _normalize_eagle3_capture_layers(layer_ids, num_layers)
-
-
-def _run_transformers_hf_backbone_with_aux_hidden_states(
-    model_obj,
-    input_ids,
-    input_embeds,
-    positions,
-    forward_batch=None,
-    extra_kwargs: dict | None = None,
-):
-    hf_input_ids = None if input_ids is None else input_ids[None, ...]
-    hf_input_embeds = None
-    if input_embeds is not None:
-        hf_input_embeds = input_embeds[None, ...]
-        hf_input_ids = None
-
-    embed_scale = getattr(model_obj, "embed_scale", None)
-    if embed_scale is not None and hf_input_ids is not None and hf_input_embeds is None:
-        hf_input_embeds = model_obj.model.get_input_embeddings()(hf_input_ids) * embed_scale
-        hf_input_ids = None
-
-    model_kwargs = {
-        "input_ids": hf_input_ids,
-        "inputs_embeds": hf_input_embeds,
-        "use_cache": False,
-        "position_ids": _format_transformers_position_ids(model_obj, positions),
-        "return_dict": False,
-        "output_hidden_states": True,
-    }
-    if forward_batch is not None:
-        model_kwargs["forward_batch"] = forward_batch
-    if hasattr(model_obj, "attention_instances"):
-        model_kwargs["attention_instances"] = model_obj.attention_instances
-    if extra_kwargs:
-        model_kwargs.update(extra_kwargs)
-
-    outputs = _call_module_with_supported_kwargs(model_obj.model, **model_kwargs)
-    hidden_states = outputs[0][0, ...]
-
-    all_hidden_states = _extract_hf_hidden_states(outputs)
-    aux_hidden_states = []
-    if all_hidden_states is not None:
-        for layer_id in getattr(model_obj, "_verl_eagle3_capture_layer_ids", []):
-            if layer_id >= len(all_hidden_states):
-                continue
-            aux_hidden = all_hidden_states[layer_id]
-            if torch.is_tensor(aux_hidden):
-                aux_hidden_states.append(aux_hidden[0, ...] if aux_hidden.dim() >= 3 else aux_hidden)
-
-    model_obj._verl_last_aux_hidden_states = aux_hidden_states or None
-    return hidden_states
-
-
-def _call_sglang_logits_processor(logits_processor, input_ids, hidden_states, lm_head, forward_batch, aux_hidden_states):
-    try:
-        signature = inspect.signature(logits_processor.forward)
-    except (AttributeError, TypeError, ValueError):
-        try:
-            signature = inspect.signature(logits_processor)
-        except (TypeError, ValueError):
-            signature = None
-
-    accepts_aux_hidden_states = False
-    if signature is not None:
-        parameters = signature.parameters
-        accepts_aux_hidden_states = (
-            "aux_hidden_states" in parameters
-            or any(param.kind == inspect.Parameter.VAR_POSITIONAL for param in parameters.values())
-            or sum(
-                param.kind
-                in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-                for param in parameters.values()
-            )
-            >= 5
-        )
-
-    if accepts_aux_hidden_states:
-        return logits_processor(input_ids, hidden_states, lm_head, forward_batch, aux_hidden_states)
-    return logits_processor(input_ids, hidden_states, lm_head, forward_batch)
-
-
-def _patch_sglang_transformers_base(transformers_base) -> bool:
-    original_run_hf_backbone = getattr(transformers_base, "_run_hf_backbone", None)
-    original_forward = getattr(transformers_base, "forward", None)
-    if original_run_hf_backbone is None or original_forward is None:
-        return False
-
-    if getattr(original_forward, "_verl_patched_transformers_eagle3_capture", False):
-        return True
-
-    if not hasattr(transformers_base, "set_eagle3_layers_to_capture"):
-        transformers_base.set_eagle3_layers_to_capture = _set_transformers_eagle3_capture_layers
-
-    def patched_run_hf_backbone(self, input_ids, input_embeds, positions, forward_batch, **kwargs):
-        if getattr(self, "capture_aux_hidden_states", False):
-            return _run_transformers_hf_backbone_with_aux_hidden_states(
-                self,
-                input_ids=input_ids,
-                input_embeds=input_embeds,
-                positions=positions,
-                forward_batch=forward_batch,
-                extra_kwargs=kwargs,
-            )
-
-        self._verl_last_aux_hidden_states = None
-        return original_run_hf_backbone(self, input_ids, input_embeds, positions, forward_batch, **kwargs)
-
-    @torch.no_grad()
-    def patched_forward(
-        self,
-        input_ids,
-        positions,
-        forward_batch,
-        pp_proxy_tensors=None,
-        input_embeds=None,
-        get_embedding=False,
-        **kwargs,
-    ):
-        if not getattr(self, "capture_aux_hidden_states", False):
-            return _call_sglang_forward_with_supported_kwargs(
-                original_forward,
-                self,
-                input_ids,
-                positions,
-                forward_batch,
-                pp_proxy_tensors=pp_proxy_tensors,
-                input_embeds=input_embeds,
-                get_embedding=get_embedding,
-                **kwargs,
-            )
-
-        runtime_input_ids = input_ids
-        runtime_input_embeds = input_embeds
-        pp_group = getattr(self, "pp_group", None)
-        is_first_rank = getattr(pp_group, "is_first_rank", True)
-        is_last_rank = getattr(pp_group, "is_last_rank", True)
-        if not is_first_rank:
-            assert pp_proxy_tensors is not None
-            runtime_input_ids = None
-            runtime_input_embeds = pp_proxy_tensors["hidden_states"]
-
-        hidden_states = self._forward_hidden_states(
-            input_ids=runtime_input_ids,
-            positions=positions,
-            forward_batch=forward_batch,
-            input_embeds=runtime_input_embeds,
-        )
-
-        if not is_last_rank:
-            from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
-
-            return PPProxyTensors({"hidden_states": hidden_states, "residual": hidden_states})
-
-        if get_embedding:
-            assert self.pooler is not None, "pooling is not enabled for this model class"
-            return self.pooler(hidden_states, forward_batch)
-
-        assert self.logits_processor is not None and self.lm_head is not None
-        return _call_sglang_logits_processor(
-            self.logits_processor,
-            input_ids,
-            hidden_states,
-            self.lm_head,
-            forward_batch,
-            getattr(self, "_verl_last_aux_hidden_states", None),
-        )
-
-    patched_run_hf_backbone._verl_patched_transformers_eagle3_capture = True
-    patched_forward._verl_patched_transformers_eagle3_capture = True
-    transformers_base._run_hf_backbone = patched_run_hf_backbone
-    transformers_base.forward = patched_forward
-    return True
-
-
-def _patch_transformers_module(module_name: str) -> list[str]:
-    try:
-        transformers_module = importlib.import_module(module_name)
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Skip SGLang Transformers EAGLE3 capture patch for %s: %s", module_name, exc)
-        return []
-
-    patched_classes = []
-    transformers_base = getattr(transformers_module, "TransformersBase", None)
-    for class_name, cls in vars(transformers_module).items():
-        if not isinstance(cls, type) or not class_name.startswith("Transformers"):
-            continue
-        if transformers_base is not None and not issubclass(cls, transformers_base):
-            continue
-
-        if _patch_sglang_transformers_base(cls):
-            patched_classes.append(f"{module_name}.{class_name}")
-            continue
-
-        if not hasattr(cls, "set_eagle3_layers_to_capture"):
-            cls.set_eagle3_layers_to_capture = _set_transformers_eagle3_capture_layers
-            patched_classes.append(f"{module_name}.{class_name}")
-
-    return patched_classes
-
-
-def patch_sglang_transformers_eagle3_capture() -> None:
-    """Add EAGLE3 aux hidden-state capture to SGLang's Transformers fallback backend."""
-    global _SGLANG_TRANSFORMERS_EAGLE3_CAPTURE_PATCHED
-    if _SGLANG_TRANSFORMERS_EAGLE3_CAPTURE_PATCHED:
-        return
-
-    patched_classes = _patch_transformers_module("sglang.srt.models.transformers")
-    if patched_classes:
-        _SGLANG_TRANSFORMERS_EAGLE3_CAPTURE_PATCHED = True
-        logger.info("Patched Transformers EAGLE3 capture for %s", ", ".join(patched_classes))
 
 
 def _make_sglang_hidden_states_tensor_output_patch(original_method):
@@ -2435,13 +1106,7 @@ def patch_sglang_hidden_states_tensor_output() -> None:
 
 def _apply_selected_sglang_patches() -> bool:
     patchers = (
-        ("draft_worker_model_runner", patch_sglang_draft_worker_model_runner),
-        ("npu_ascend_low_level", patch_sglang_npu_ascend_low_level),
-        ("draft_cuda_graph", patch_sglang_draft_cuda_graph),
-        ("transformers_eagle3_capture", patch_sglang_transformers_eagle3_capture),
         ("eagle_update_weights", patch_sglang_eagle_update_weights_from_tensor),
-        ("npu_eagle_v1_state_repair", patch_sglang_npu_eagle_v1_greedy_path),
-        ("npu_eagle_v1_batch_ops", patch_sglang_npu_eagle_v1_batch_ops),
         ("npu_eagle_target_sampling", patch_sglang_npu_eagle_target_sampling),
         ("hidden_states_tensor_output", patch_sglang_hidden_states_tensor_output),
     )
@@ -2523,6 +1188,7 @@ def patch_sglang_scheduler_process_entrypoints() -> None:
     if patched_entrypoints:
         _SGLANG_SCHEDULER_PROCESS_PATCHED = True
         logger.info("Patched SGLang scheduler entrypoints for %s", ", ".join(patched_entrypoints))
+
 
 def install_sglang_verl_patches(
     set_envs_and_config: Callable | None = None,
