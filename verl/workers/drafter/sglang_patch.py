@@ -1033,6 +1033,31 @@ def patch_sglang_npu_eagle_target_sampling() -> None:
         logger.warning("Patched SGLang NPU EAGLE sampling for %s", ", ".join(patched_targets))
 
 
+def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: int, hidden_state_offset: int) -> int:
+    hidden_states = getattr(logits_output, "hidden_states", None)
+    if hidden_states is None:
+        return hidden_state_offset
+
+    accept_lengths = getattr(result, "accept_length_per_req_cpu", None)
+    if accept_lengths is not None and req_index < len(accept_lengths) and torch.is_tensor(hidden_states):
+        rows = max(int(accept_lengths[req_index]) + 1, 1)
+        expected_rows = sum(max(int(accept_len) + 1, 1) for accept_len in accept_lengths)
+        end = hidden_state_offset + rows
+        has_expected_rows = int(hidden_states.shape[0]) >= expected_rows and end <= int(hidden_states.shape[0])
+        if hidden_states.dim() >= 2 and has_expected_rows:
+            if getattr(req, "return_hidden_states", False):
+                req.hidden_states.append(hidden_states[hidden_state_offset:end].detach().to("cpu", copy=True))
+            return end
+
+    if not getattr(req, "return_hidden_states", False):
+        return hidden_state_offset
+    if torch.is_tensor(hidden_states):
+        req.hidden_states.append(hidden_states[req_index].detach().to("cpu", copy=True))
+    else:
+        req.hidden_states.append(hidden_states[req_index])
+    return hidden_state_offset
+
+
 def _make_sglang_hidden_states_tensor_output_patch(original_method):
     """Patch SGLang output processors to keep hidden-state chunks as CPU tensors.
 
@@ -1053,13 +1078,35 @@ def _make_sglang_hidden_states_tensor_output_patch(original_method):
         '.detach().to("cpu", copy=True)',
         source,
     )
+    if original_method.__name__ == "process_batch_result_decode":
+        loop_line = "        for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):\n"
+        old_hidden_block = """            if req.return_hidden_states and logits_output.hidden_states is not None:
+                req.hidden_states.append(
+                    logits_output.hidden_states[i].detach().to("cpu", copy=True)
+                )
+"""
+        new_hidden_block = """            hidden_state_offset = _append_sglang_decode_hidden_states(
+                req,
+                logits_output,
+                result,
+                i,
+                hidden_state_offset,
+            )
+"""
+        if loop_line in patched_source and old_hidden_block in patched_source:
+            patched_source = patched_source.replace(loop_line, "        hidden_state_offset = 0\n\n" + loop_line)
+            patched_source = patched_source.replace(old_hidden_block, new_hidden_block)
+        elif old_hidden_block in patched_source:
+            return None
     if patched_source == source:
         return None
 
+    globals_dict = original_method.__globals__
+    globals_dict["_append_sglang_decode_hidden_states"] = _append_sglang_decode_hidden_states
     namespace = {}
     exec(  # noqa: S102
         "from __future__ import annotations\n" + patched_source,
-        original_method.__globals__,
+        globals_dict,
         namespace,
     )
     patched_method = namespace[original_method.__name__]

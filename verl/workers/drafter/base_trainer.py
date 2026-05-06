@@ -721,14 +721,23 @@ class DrafterBaseTrainer:
         if feature_seq_length <= 0:
             return
 
-        # SGLang may return hidden states only for the generated suffix instead
-        # of the full prompt+response sequence. Align shorter feature tensors to
-        # the sequence tail; otherwise response tokens can be truncated away and
-        # the derived loss mask becomes all zeros.
-        feature_start = max(0, input_seq_length - feature_seq_length)
-        feature_end = feature_start + feature_seq_length
-        hidden_start = max(0, hidden_seq_length - feature_seq_length)
-        hidden_end = hidden_start + feature_seq_length
+        # SGLang can expose two hidden-state layouts here:
+        # 1. legacy suffix-only rows, which need tail alignment to keep response
+        #    tokens trainable;
+        # 2. next-token rows for every original position except the final token,
+        #    which should stay head-aligned with input_ids/target_logprobs.
+        if hidden_seq_length == max(input_seq_length - 1, 0):
+            feature_start = 0
+            feature_end = input_seq_length
+            hidden_start = 0
+            hidden_end = hidden_seq_length
+        else:
+            feature_start = max(0, input_seq_length - feature_seq_length)
+            feature_end = feature_start + feature_seq_length
+            hidden_start = max(0, hidden_seq_length - feature_seq_length)
+            hidden_end = hidden_start + feature_seq_length
+        input_feature_length = feature_end - feature_start
+        hidden_feature_length = hidden_end - hidden_start
         
         model_config = getattr(self, "model_config", None)
         pad_id = int(getattr(model_config, "pad_token_id", self.pad_token_id) or self.pad_token_id)
@@ -759,7 +768,7 @@ class DrafterBaseTrainer:
                 "input_ids": cpu_input_ids[i, feature_start:feature_end],
                 "hidden_states": cpu_h_states[i, hidden_start:hidden_end, :],
                 "loss_mask": full_loss_mask[feature_start:feature_end],
-                "position_ids": torch.arange(feature_seq_length, dtype=torch.long),
+                "position_ids": torch.arange(input_feature_length, dtype=torch.long),
                 "target_logprobs": target_logprobs_item,
                 "responses": cpu_responses[i] if cpu_responses is not None else None,
                 "prompts": cpu_prompts[i] if cpu_prompts is not None else None,
@@ -798,7 +807,7 @@ class DrafterBaseTrainer:
                             "input_len": input_seq_length,
                             "hidden_len": hidden_seq_length,
                             "hidden_raw_len": hidden_seq_length,
-                            "hidden_kept_len": feature_seq_length,
+                            "hidden_kept_len": hidden_feature_length,
                             "feature_start": feature_start,
                             "feature_end": feature_end,
                             "hidden_start": hidden_start,
