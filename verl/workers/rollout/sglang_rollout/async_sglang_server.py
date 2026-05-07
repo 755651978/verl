@@ -878,8 +878,9 @@ class SGLangHttpServer:
                         f"hidden_raw_len={hidden_raw_len}, expected_min_rows={expected_hidden_rows}, "
                         f"prompt_len={len(prompt_ids)}, output_len={len(token_ids)}, "
                         f"finish_reason={finish_reason}. "
+                        "This usually means SGLang appended only one hidden row per EAGLE verify iteration. "
                         "Enable the verl SGLang hidden_states_tensor_output patch and verify that the "
-                        "scheduler subprocess logs the hidden-state patch installation."
+                        "scheduler subprocess logs: 'SGLang hidden-state tensor output patch active'."
                     )
                 max_hidden_tokens = self.config.drafter.training.hidden_state_max_tokens_per_sample
                 if max_hidden_tokens is not None and int(max_hidden_tokens) > 0:

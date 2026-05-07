@@ -1331,6 +1331,7 @@ def patch_sglang_hidden_states_tensor_output() -> None:
         return
 
     patched_methods = []
+    active_methods = []
     for method_name in ("process_batch_result_prefill", "process_batch_result_decode"):
         original_method = getattr(processor_cls, method_name, None)
         if original_method is None or getattr(
@@ -1338,6 +1339,8 @@ def patch_sglang_hidden_states_tensor_output() -> None:
             "_verl_patched_hidden_states_tensor_output",
             False,
         ):
+            if original_method is not None:
+                active_methods.append(method_name)
             continue
 
         patched_method = _make_sglang_hidden_states_tensor_output_patch(original_method)
@@ -1347,10 +1350,23 @@ def patch_sglang_hidden_states_tensor_output() -> None:
 
         setattr(processor_cls, method_name, patched_method)
         patched_methods.append(method_name)
+        active_methods.append(method_name)
 
-    if patched_methods:
+    required_methods = {"process_batch_result_prefill", "process_batch_result_decode"}
+    missing_methods = sorted(required_methods.difference(active_methods))
+    if missing_methods:
+        raise RuntimeError(
+            "Failed to install required SGLang hidden-state tensor output patch methods: "
+            f"{', '.join(missing_methods)}. EAGLE drafter training requires full hidden states."
+        )
+
+    if active_methods:
         _SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED = True
-        logger.info("Patched SGLang hidden-state tensor output for %s", ", ".join(patched_methods))
+        logger.warning(
+            "SGLang hidden-state tensor output patch active for %s%s",
+            ", ".join(active_methods),
+            f" (newly patched: {', '.join(patched_methods)})" if patched_methods else "",
+        )
 
 
 def _apply_selected_sglang_patches() -> bool:
@@ -1379,6 +1395,7 @@ def _apply_sglang_child_process_patches() -> None:
         logger.warning("Skip all verl SGLang patches because %s=1.", _DISABLE_SGLANG_PATCH_ENV)
         return
 
+    logger.warning("Applying verl SGLang patches in scheduler subprocess.")
     _apply_selected_sglang_patches()
 
 
@@ -1436,7 +1453,7 @@ def patch_sglang_scheduler_process_entrypoints() -> None:
 
     if patched_entrypoints:
         _SGLANG_SCHEDULER_PROCESS_PATCHED = True
-        logger.info("Patched SGLang scheduler entrypoints for %s", ", ".join(patched_entrypoints))
+        logger.warning("Patched SGLang scheduler entrypoints for %s", ", ".join(patched_entrypoints))
 
 
 def install_sglang_verl_patches(
