@@ -971,6 +971,9 @@ class DrafterWorker(Worker):
                 "prompts": sample["prompts"],
                 "responses": sample["responses"],
             }
+            for key in ("hidden_position_start", "hidden_position_end"):
+                if key in sample:
+                    batch[key] = sample[key]
             self._store_rollout_sample(
                 batch=batch,
                 hidden_states=sample["hidden_states"],

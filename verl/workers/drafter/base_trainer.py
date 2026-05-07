@@ -178,6 +178,26 @@ def _tensor_shape(tensor: Optional[torch.Tensor]) -> list[int] | None:
     return None
 
 
+def _batch_item_int(value: Any, index: int = 0) -> int | None:
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        if value.numel() == 0:
+            return None
+        flat = value.detach().view(-1).cpu()
+        index = min(max(int(index), 0), flat.numel() - 1)
+        return int(flat[index].item())
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return None
+        index = min(max(int(index), 0), len(value) - 1)
+        value = value[index]
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _tensor_sum_int(tensor: torch.Tensor) -> int:
     return int(tensor.detach().float().sum().cpu().item())
 
@@ -717,31 +737,30 @@ class DrafterBaseTrainer:
 
         input_seq_length = cpu_input_ids.size(1)
         hidden_seq_length = cpu_h_states.size(1)
-        feature_seq_length = min(input_seq_length, hidden_seq_length)
-        if feature_seq_length <= 0:
+        if min(input_seq_length, hidden_seq_length) <= 0:
             return
 
-        # SGLang can expose two hidden-state layouts here:
-        # 1. legacy suffix-only rows, which need tail alignment to keep response
-        #    tokens trainable;
-        # 2. next-token rows for every original position except the final token,
-        #    which should stay head-aligned with input_ids/target_logprobs.
-        if hidden_seq_length == max(input_seq_length - 1, 0):
-            feature_start = 0
-            feature_end = input_seq_length
-            hidden_start = 0
-            hidden_end = hidden_seq_length
-        else:
-            feature_start = max(0, input_seq_length - feature_seq_length)
-            feature_end = feature_start + feature_seq_length
-            hidden_start = max(0, hidden_seq_length - feature_seq_length)
-            hidden_end = hidden_start + feature_seq_length
-        input_feature_length = feature_end - feature_start
-        hidden_feature_length = hidden_end - hidden_start
-        
         model_config = getattr(self, "model_config", None)
         pad_id = int(getattr(model_config, "pad_token_id", self.pad_token_id) or self.pad_token_id)
         for i in range(batch_size):
+            expected_hidden_rows = max(input_seq_length - 1, 0)
+            hidden_position_start = _batch_item_int(batch.get("hidden_position_start"), i)
+            if hidden_position_start is None:
+                hidden_position_start = max(expected_hidden_rows - hidden_seq_length, 0)
+            # Hidden rows are next-token features for original positions. If
+            # prefix cache reused leading prompt tokens, the first returned
+            # hidden row starts after that reused prefix; keep the remaining
+            # rows head-aligned from that original position onward.
+            feature_start = min(max(hidden_position_start, 0), input_seq_length)
+            hidden_start = 0
+            hidden_feature_length = min(hidden_seq_length, max(input_seq_length - feature_start - 1, 0))
+            hidden_end = hidden_feature_length
+            feature_end = feature_start + hidden_feature_length + 1
+
+            input_feature_length = feature_end - feature_start
+            if input_feature_length <= 0 or hidden_feature_length <= 0:
+                continue
+
             full_loss_mask = torch.zeros(input_seq_length, dtype=torch.float32)
             if cpu_prompts is not None and cpu_responses is not None:
                 prompt_len = min(cpu_prompts[i].numel(), input_seq_length)
@@ -757,6 +776,8 @@ class DrafterBaseTrainer:
                 full_loss_mask[:] = 1.0
 
             target_logprobs_item = None
+            target_start = None
+            target_end = None
             if cpu_target_logprobs is not None:
                 # target_logprobs are next-token targets for original positions
                 # [1..T-1], so original target position p lives at index p - 1.
@@ -776,6 +797,7 @@ class DrafterBaseTrainer:
                 "_verl_feature_end": feature_end,
                 "_verl_hidden_start": hidden_start,
                 "_verl_hidden_end": hidden_end,
+                "_verl_hidden_position_start": hidden_position_start,
                 "_verl_target_start": target_start if cpu_target_logprobs is not None else None,
                 "_verl_target_end": target_end if cpu_target_logprobs is not None else None,
                 "_verl_prompt_len": prompt_len if cpu_prompts is not None else None,
@@ -812,6 +834,7 @@ class DrafterBaseTrainer:
                             "feature_end": feature_end,
                             "hidden_start": hidden_start,
                             "hidden_end": hidden_end,
+                            "hidden_position_start": hidden_position_start,
                             "target_start": target_start if cpu_target_logprobs is not None else None,
                             "target_end": target_end if cpu_target_logprobs is not None else None,
                             "prompt_len": prompt_len if cpu_prompts is not None else None,
@@ -1048,7 +1071,13 @@ class DrafterBaseTrainer:
 
             if self.backend.model_type == "eagle3" and use_logits:
                 target_logprobs_item = preprocessed_lists["target_logprobs"][item_idx]
-                train_seq_len = min(seq_len - 1, target_logprobs_item.size(0))
+                train_seq_len = min(
+                    ids.size(0),
+                    h_states.size(0),
+                    max(item_loss_mask.size(0) - 1, 0),
+                    item_position_ids.size(0),
+                    target_logprobs_item.size(0),
+                )
             elif self.backend.model_type == "eagle3":
                 last_h_states = preprocessed_lists["last_h_states"][item_idx]
                 train_seq_len = min(seq_len - 1, last_h_states.size(0) - 1)
@@ -1103,6 +1132,7 @@ class DrafterBaseTrainer:
                             "feature_end": source_item.get("_verl_feature_end"),
                             "hidden_start": source_item.get("_verl_hidden_start"),
                             "hidden_end": source_item.get("_verl_hidden_end"),
+                            "hidden_position_start": source_item.get("_verl_hidden_position_start"),
                             "target_start": source_item.get("_verl_target_start"),
                             "target_end": source_item.get("_verl_target_end"),
                             "loss_after_shift": int(item_loss_mask[1 : 1 + train_seq_len].detach().float().sum().cpu().item()),

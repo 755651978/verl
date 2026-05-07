@@ -88,6 +88,7 @@ class DrafterTrainingConfig(BaseConfig):
     collection_sample_rate: float = 1.0
     max_collect_samples_per_step_per_replica: Optional[int] = None
     max_collect_tokens_per_step_per_replica: Optional[int] = None
+    hidden_state_front_tokens_per_sample: Optional[int] = 2000
     hidden_state_max_tokens_per_sample: Optional[int] = None
     max_seq_len: int = 8192
     max_epoch: int = 10
@@ -123,6 +124,8 @@ class DrafterTrainingConfig(BaseConfig):
             raise ValueError("`max_collect_tokens_per_step_per_replica` must be non-negative or null.")
         if self.hidden_state_max_tokens_per_sample is not None and self.hidden_state_max_tokens_per_sample < 0:
             raise ValueError("`hidden_state_max_tokens_per_sample` must be non-negative or null.")
+        if self.hidden_state_front_tokens_per_sample is not None and self.hidden_state_front_tokens_per_sample < 0:
+            raise ValueError("`hidden_state_front_tokens_per_sample` must be non-negative or null.")
 
 
 @dataclass

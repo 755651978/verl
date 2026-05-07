@@ -206,6 +206,47 @@ def _expected_full_hidden_rows(prompt_len: int, output_len: int) -> int:
     return max(int(prompt_len) + int(output_len) - 1, 0)
 
 
+def _positive_int_or_none(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _select_drafter_hidden_state_window(
+    hidden_states: torch.Tensor,
+    *,
+    expected_hidden_rows: int,
+    front_tokens: Optional[int],
+    tail_tokens: Optional[int],
+) -> tuple[torch.Tensor, int, int, str, int]:
+    hidden_raw_len = int(hidden_states.size(0))
+    prefix_cache_rows = max(int(expected_hidden_rows) - hidden_raw_len, 0)
+    crop_start = 0
+    crop_end = hidden_raw_len
+    crop_mode = "all"
+
+    if front_tokens is not None and hidden_raw_len > front_tokens:
+        crop_end = front_tokens
+        crop_mode = "front"
+    elif tail_tokens is not None and hidden_raw_len > tail_tokens:
+        crop_start = hidden_raw_len - tail_tokens
+        crop_mode = "tail"
+
+    hidden_position_start = prefix_cache_rows + crop_start
+    hidden_position_end = prefix_cache_rows + crop_end
+    return (
+        hidden_states[crop_start:crop_end],
+        hidden_position_start,
+        hidden_position_end,
+        crop_mode,
+        prefix_cache_rows,
+    )
+
+
 def _extract_token_id_from_logprob_entry(entry: Any) -> Optional[int]:
     if isinstance(entry, dict):
         for key in ("token_id", "idx", "id"):
@@ -864,6 +905,10 @@ class SGLangHttpServer:
             alignment_sample_index = max(int(self._drafter_collection_samples) - 1, 0)
             hidden_raw_len = 0
             hidden_kept_len = 0
+            hidden_position_start = 0
+            hidden_position_end = 0
+            hidden_prefix_cache_rows = 0
+            hidden_crop_mode = "none"
             expected_hidden_rows = _expected_full_hidden_rows(len(prompt_ids), len(token_ids))
             hidden_complete = False
             if hidden_states_list:
@@ -872,25 +917,33 @@ class SGLangHttpServer:
                 hidden_states = torch.cat(hidden_states_list, dim=0)
                 hidden_raw_len = int(hidden_states.size(0))
                 hidden_complete = hidden_raw_len >= expected_hidden_rows
-                if not hidden_complete:
-                    raise RuntimeError(
-                        "SGLang did not return full hidden states for EAGLE drafter training: "
-                        f"hidden_raw_len={hidden_raw_len}, expected_min_rows={expected_hidden_rows}, "
-                        f"prompt_len={len(prompt_ids)}, output_len={len(token_ids)}, "
-                        f"finish_reason={finish_reason}. "
-                        "This usually means SGLang appended only one hidden row per EAGLE verify iteration. "
-                        "Enable the verl SGLang hidden_states_tensor_output patch and verify that the "
-                        "scheduler subprocess logs: 'SGLang hidden-state tensor output patch active'."
-                    )
-                max_hidden_tokens = self.config.drafter.training.hidden_state_max_tokens_per_sample
-                if max_hidden_tokens is not None and int(max_hidden_tokens) > 0:
-                    hidden_states = hidden_states[-int(max_hidden_tokens):]
+                training_cfg = self.config.drafter.training
+                front_hidden_tokens = _positive_int_or_none(
+                    getattr(training_cfg, "hidden_state_front_tokens_per_sample", 2000)
+                )
+                max_hidden_tokens = _positive_int_or_none(
+                    getattr(training_cfg, "hidden_state_max_tokens_per_sample", None)
+                )
+                (
+                    hidden_states,
+                    hidden_position_start,
+                    hidden_position_end,
+                    hidden_crop_mode,
+                    hidden_prefix_cache_rows,
+                ) = _select_drafter_hidden_state_window(
+                    hidden_states,
+                    expected_hidden_rows=expected_hidden_rows,
+                    front_tokens=front_hidden_tokens,
+                    tail_tokens=max_hidden_tokens,
+                )
                 hidden_kept_len = int(hidden_states.size(0))
                 drafter_sample = {
                     "input_ids": torch.cat([prompt_tensor, response_tensor], dim=0).unsqueeze(0),
                     "prompts": prompt_tensor.unsqueeze(0),
                     "responses": response_tensor.unsqueeze(0),
                     "hidden_states": hidden_states.unsqueeze(0).cpu(),
+                    "hidden_position_start": hidden_position_start,
+                    "hidden_position_end": hidden_position_end,
                     "target_logprobs": target_logprobs.unsqueeze(0).cpu() if target_logprobs is not None else None,
                     "global_step": collection_global_steps,
                     "replica_rank": self.replica_rank,
@@ -907,6 +960,7 @@ class SGLangHttpServer:
                     and output_top
                     and len(output_top) != len(token_ids)
                 )
+                or not hidden_complete
             )
             if should_log_alignment(
                 collection_global_steps,
@@ -928,7 +982,20 @@ class SGLangHttpServer:
                         "hidden_raw_len": hidden_raw_len,
                         "hidden_kept_len": hidden_kept_len,
                         "hidden_complete": hidden_complete,
-                        "hidden_max": self.config.drafter.training.hidden_state_max_tokens_per_sample,
+                        "hidden_prefix_cache_rows": hidden_prefix_cache_rows,
+                        "hidden_position_start": hidden_position_start,
+                        "hidden_position_end": hidden_position_end,
+                        "hidden_crop_mode": hidden_crop_mode,
+                        "hidden_front_max": getattr(
+                            self.config.drafter.training,
+                            "hidden_state_front_tokens_per_sample",
+                            2000,
+                        ),
+                        "hidden_max": getattr(
+                            self.config.drafter.training,
+                            "hidden_state_max_tokens_per_sample",
+                            None,
+                        ),
                         "output_top_len": len(output_top),
                         "output_token_logprob_len": len(output_token_logprobs),
                         "target_shape": _tensor_shape(target_logprobs),

@@ -283,7 +283,8 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
         针对单条数据：裁剪窗口、生成Mask、确保维度对齐
         """
         res = {'ids':[], 'h_states':[], 'masks': [], 'position_ids': [], 'last_h_states': [], 'target_logprobs': []}
-        max_window = 512
+        max_front_tokens = self.config.rollout.drafter.training.get("hidden_state_front_tokens_per_sample", 2000)
+        max_front_tokens = int(max_front_tokens) if max_front_tokens is not None else None
         pad_id = int(getattr(model_config, "pad_token_id", 0) or 0)
         h_dim = getattr(model_config, "target_hidden_size", model_config.hidden_size)
         use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))
@@ -337,20 +338,13 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
             else:
                 item_position_ids = item_position_ids.to(device, dtype=torch.long, non_blocking=True)
             
-            # Select window around response tokens
-            nonzero = torch.nonzero(item_loss_mask)
-
-            if nonzero.numel() > 0:
-                # 获取 Response 的起止点
-                r_start, r_end = nonzero[0, 0], nonzero[-1, 0] + 1
-                # 尽量让窗口覆盖 Response 区域
-                start_max = max(0, full_len - max_window)
-                start = torch.clamp(r_start - (max_window // 2), min=0, max=start_max).item()
-                end = min(start + max_window, full_len)
+            start = 0
+            if max_front_tokens is not None and max_front_tokens > 0:
+                # Keep front-aligned next-token rows. Add one input token so
+                # N hidden rows can still predict N following token targets.
+                end = min(full_len, max_front_tokens + 1)
             else:
-                start = max(0, full_len - max_window)
                 end = full_len
-
             res['ids'].append(ids[start:end])
             res['h_states'].append(h_states[start:end])
             res['position_ids'].append(item_position_ids[start:end])
