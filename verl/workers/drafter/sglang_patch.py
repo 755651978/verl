@@ -1274,11 +1274,6 @@ def _make_sglang_hidden_states_tensor_output_patch(original_method):
     )
     if original_method.__name__ == "process_batch_result_decode":
         loop_line = "        for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):\n"
-        old_hidden_block = """            if req.return_hidden_states and logits_output.hidden_states is not None:
-                req.hidden_states.append(
-                    logits_output.hidden_states[i].detach().to("cpu", copy=True)
-                )
-"""
         new_hidden_block = """            hidden_state_offset = _append_sglang_decode_hidden_states(
                 req,
                 logits_output,
@@ -1287,10 +1282,22 @@ def _make_sglang_hidden_states_tensor_output_patch(original_method):
                 hidden_state_offset,
             )
 """
-        if loop_line in patched_source and old_hidden_block in patched_source:
+        hidden_block_pattern = re.compile(
+            r"(?ms)^[ \t]+if req\.return_hidden_states and logits_output\.hidden_states is not None:\r?\n"
+            r"[ \t]+req\.hidden_states\.append\(\r?\n"
+            r".*?"
+            r"^[ \t]+\)\r?\n"
+        )
+        patched_source, hidden_block_count = hidden_block_pattern.subn(new_hidden_block, patched_source, count=1)
+        if loop_line in patched_source and hidden_block_count > 0:
             patched_source = patched_source.replace(loop_line, "        hidden_state_offset = 0\n\n" + loop_line)
-            patched_source = patched_source.replace(old_hidden_block, new_hidden_block)
-        elif old_hidden_block in patched_source:
+        elif hidden_block_count > 0:
+            return None
+        else:
+            logger.warning(
+                "Skip SGLang decode hidden-state full-output patch for %s: hidden append block not found.",
+                original_method.__name__,
+            )
             return None
     if patched_source == source:
         return None

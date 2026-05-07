@@ -202,6 +202,10 @@ def _tensor_shape(tensor: Any) -> list[int] | None:
     return None
 
 
+def _expected_full_hidden_rows(prompt_len: int, output_len: int) -> int:
+    return max(int(prompt_len) + int(output_len) - 1, 0)
+
+
 def _extract_token_id_from_logprob_entry(entry: Any) -> Optional[int]:
     if isinstance(entry, dict):
         for key in ("token_id", "idx", "id"):
@@ -860,11 +864,23 @@ class SGLangHttpServer:
             alignment_sample_index = max(int(self._drafter_collection_samples) - 1, 0)
             hidden_raw_len = 0
             hidden_kept_len = 0
+            expected_hidden_rows = _expected_full_hidden_rows(len(prompt_ids), len(token_ids))
+            hidden_complete = False
             if hidden_states_list:
                 prompt_tensor = torch.as_tensor(prompt_ids, dtype=torch.long).detach().cpu()
                 response_tensor = torch.tensor(token_ids, dtype=torch.long)
                 hidden_states = torch.cat(hidden_states_list, dim=0)
                 hidden_raw_len = int(hidden_states.size(0))
+                hidden_complete = hidden_raw_len >= expected_hidden_rows
+                if not hidden_complete:
+                    raise RuntimeError(
+                        "SGLang did not return full hidden states for EAGLE drafter training: "
+                        f"hidden_raw_len={hidden_raw_len}, expected_min_rows={expected_hidden_rows}, "
+                        f"prompt_len={len(prompt_ids)}, output_len={len(token_ids)}, "
+                        f"finish_reason={finish_reason}. "
+                        "Enable the verl SGLang hidden_states_tensor_output patch and verify that the "
+                        "scheduler subprocess logs the hidden-state patch installation."
+                    )
                 max_hidden_tokens = self.config.drafter.training.hidden_state_max_tokens_per_sample
                 if max_hidden_tokens is not None and int(max_hidden_tokens) > 0:
                     hidden_states = hidden_states[-int(max_hidden_tokens):]
@@ -907,8 +923,10 @@ class SGLangHttpServer:
                         "prompt_len": len(prompt_ids),
                         "response_len": len(token_ids),
                         "input_len": len(prompt_ids) + len(token_ids),
+                        "hidden_expected_min": expected_hidden_rows,
                         "hidden_raw_len": hidden_raw_len,
                         "hidden_kept_len": hidden_kept_len,
+                        "hidden_complete": hidden_complete,
                         "hidden_max": self.config.drafter.training.hidden_state_max_tokens_per_sample,
                         "output_top_len": len(output_top),
                         "output_token_logprob_len": len(output_token_logprobs),
