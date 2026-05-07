@@ -827,13 +827,16 @@ class SGLangHttpServer:
         )
         if front_hidden_tokens is not None:
             hidden_capture_max_rows = front_hidden_tokens
+        budget_hidden_rows = estimated_hidden_rows
+        if hidden_capture_max_rows is not None:
+            budget_hidden_rows = min(budget_hidden_rows, int(hidden_capture_max_rows))
         if (
             self.config.drafter.enable
             and self.config.drafter.enable_drafter_training
             and self.config.drafter.training.collect_hidden_states_from_sgl
             and collect_this_step
             and not skip_drafter_collection
-            and self._reserve_drafter_collection_budget(request_id, collection_global_steps, estimated_hidden_rows)
+            and self._reserve_drafter_collection_budget(request_id, collection_global_steps, budget_hidden_rows)
         ):
             should_collect = True
             request.update({"return_hidden_states": True})
