@@ -1252,6 +1252,67 @@ def patch_sglang_eagle_verify_hidden_states_full() -> None:
         logger.info("Patched SGLang EAGLE verify full hidden states for %s", ", ".join(patched_targets))
 
 
+_SGLANG_HIDDEN_STATES_LIST_OUTPUT_PATTERN = re.compile(
+    r"\.cpu\(\)\s*\.clone\(\)\s*\.tolist\(\)",
+)
+_SGLANG_DECODE_REQUEST_LOOP_PATTERN = re.compile(
+    r"(?ms)^(?P<indent>[ \t]+)for i, \(req, next_token_id\) in enumerate\(\s*"
+    r"zip\(batch\.reqs,\s*next_token_ids\)\s*\):\r?\n",
+)
+_SGLANG_DECODE_HIDDEN_STATES_APPEND_PATTERN = re.compile(
+    r"(?ms)^(?P<indent>[ \t]+)if\s*(?:\(\s*)?req\.return_hidden_states\s+"
+    r"and\s+logits_output\.hidden_states\s+is\s+not\s+None\s*(?:\))?\s*:\r?\n"
+    r"(?P=indent)[ \t]+req\.hidden_states\.append\(\r?\n"
+    r".*?"
+    r"^(?P=indent)[ \t]+\)\r?\n",
+)
+
+
+def _replace_sglang_hidden_states_list_output(source: str) -> tuple[str, int]:
+    return _SGLANG_HIDDEN_STATES_LIST_OUTPUT_PATTERN.subn(
+        '.detach().to("cpu", copy=True)',
+        source,
+    )
+
+
+def _render_sglang_decode_hidden_states_append(match: re.Match) -> str:
+    indent = match.group("indent")
+    return (
+        f"{indent}hidden_state_offset = _append_sglang_decode_hidden_states(\n"
+        f"{indent}    req,\n"
+        f"{indent}    logits_output,\n"
+        f"{indent}    result,\n"
+        f"{indent}    i,\n"
+        f"{indent}    hidden_state_offset,\n"
+        f"{indent})\n"
+    )
+
+
+def _insert_sglang_decode_hidden_state_offset(source: str) -> str | None:
+    if re.search(r"(?m)^[ \t]+hidden_state_offset = 0\s*$", source):
+        return source
+
+    patched_source, loop_count = _SGLANG_DECODE_REQUEST_LOOP_PATTERN.subn(
+        lambda match: f"{match.group('indent')}hidden_state_offset = 0\n\n{match.group(0)}",
+        source,
+        count=1,
+    )
+    if loop_count <= 0:
+        return None
+    return patched_source
+
+
+def _patch_sglang_decode_hidden_states_source(source: str) -> str | None:
+    patched_source, hidden_block_count = _SGLANG_DECODE_HIDDEN_STATES_APPEND_PATTERN.subn(
+        _render_sglang_decode_hidden_states_append,
+        source,
+        count=1,
+    )
+    if hidden_block_count <= 0:
+        return None
+    return _insert_sglang_decode_hidden_state_offset(patched_source)
+
+
 def _make_sglang_hidden_states_tensor_output_patch(original_method):
     """Patch SGLang output processors to keep hidden-state chunks as CPU tensors.
 
@@ -1267,38 +1328,19 @@ def _make_sglang_hidden_states_tensor_output_patch(original_method):
         return None
 
     source = textwrap.dedent(source)
-    patched_source = re.sub(
-        r"\.cpu\(\)\s*\.clone\(\)\s*\.tolist\(\)",
-        '.detach().to("cpu", copy=True)',
-        source,
-    )
+    patched_source, conversion_count = _replace_sglang_hidden_states_list_output(source)
     if original_method.__name__ == "process_batch_result_decode":
-        loop_line = "        for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):\n"
-        new_hidden_block = """            hidden_state_offset = _append_sglang_decode_hidden_states(
-                req,
-                logits_output,
-                result,
-                i,
-                hidden_state_offset,
-            )
-"""
-        hidden_block_pattern = re.compile(
-            r"(?ms)^[ \t]+if req\.return_hidden_states and logits_output\.hidden_states is not None:\r?\n"
-            r"[ \t]+req\.hidden_states\.append\(\r?\n"
-            r".*?"
-            r"^[ \t]+\)\r?\n"
-        )
-        patched_source, hidden_block_count = hidden_block_pattern.subn(new_hidden_block, patched_source, count=1)
-        if loop_line in patched_source and hidden_block_count > 0:
-            patched_source = patched_source.replace(loop_line, "        hidden_state_offset = 0\n\n" + loop_line)
-        elif hidden_block_count > 0:
-            return None
-        else:
+        patched_decode_source = _patch_sglang_decode_hidden_states_source(patched_source)
+        if patched_decode_source is None:
             logger.warning(
                 "Skip SGLang decode hidden-state full-output patch for %s: hidden append block not found.",
                 original_method.__name__,
             )
             return None
+        patched_source = patched_decode_source
+    elif conversion_count <= 0:
+        return None
+
     if patched_source == source:
         return None
 
