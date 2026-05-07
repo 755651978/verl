@@ -283,8 +283,6 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
         针对单条数据：裁剪窗口、生成Mask、确保维度对齐
         """
         res = {'ids':[], 'h_states':[], 'masks': [], 'position_ids': [], 'last_h_states': [], 'target_logprobs': []}
-        max_front_tokens = self.config.rollout.drafter.training.get("hidden_state_front_tokens_per_sample", 2000)
-        max_front_tokens = int(max_front_tokens) if max_front_tokens is not None else None
         pad_id = int(getattr(model_config, "pad_token_id", 0) or 0)
         h_dim = getattr(model_config, "target_hidden_size", model_config.hidden_size)
         use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))
@@ -339,12 +337,7 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
                 item_position_ids = item_position_ids.to(device, dtype=torch.long, non_blocking=True)
             
             start = 0
-            if max_front_tokens is not None and max_front_tokens > 0:
-                # Keep front-aligned next-token rows. Add one input token so
-                # N hidden rows can still predict N following token targets.
-                end = min(full_len, max_front_tokens + 1)
-            else:
-                end = full_len
+            end = full_len
             res['ids'].append(ids[start:end])
             res['h_states'].append(h_states[start:end])
             res['position_ids'].append(item_position_ids[start:end])
