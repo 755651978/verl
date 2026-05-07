@@ -20,7 +20,7 @@ import os
 import re
 import textwrap
 from functools import wraps
-from typing import Callable
+from typing import Any, Callable
 
 import torch
 import sglang.srt.entrypoints.engine
@@ -78,6 +78,11 @@ _SGLANG_PATCH_ALIASES = {
     "hidden_states": "hidden_states_tensor_output",
     "hidden_state_tensor_output": "hidden_states_tensor_output",
 }
+_VERL_DRAFTER_HIDDEN_WINDOW_PARAM = "_verl_drafter_hidden_state_window"
+_VERL_HIDDEN_STATE_FRONT_TOKENS_PARAM = "_verl_hidden_state_front_tokens_per_sample"
+_VERL_HIDDEN_STATE_MAX_ROWS_PARAM = "_verl_hidden_state_max_rows"
+_VERL_HIDDEN_STATE_PROMPT_LEN_PARAM = "_verl_prompt_len"
+_VERL_HIDDEN_STATE_METADATA_MARKER = "__verl_hidden_state_metadata__"
 
 
 def configure_sglang_eagle_weight_update_patch(
@@ -1034,8 +1039,182 @@ def patch_sglang_npu_eagle_target_sampling() -> None:
         logger.warning("Patched SGLang NPU EAGLE sampling for %s", ", ".join(patched_targets))
 
 
-def _append_sglang_hidden_state_chunk_with_budget(req, chunk) -> None:
+def _is_torch_tensor(value: Any) -> bool:
+    is_tensor = getattr(torch, "is_tensor", None)
+    return bool(callable(is_tensor) and is_tensor(value))
+
+
+def _positive_int_or_none(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _int_or_none(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _custom_flag_enabled(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "on", "yes", "y"}
+    return bool(value)
+
+
+def _sglang_req_custom_params(req) -> dict[str, Any]:
+    sampling_params = getattr(req, "sampling_params", None)
+    custom_params = getattr(sampling_params, "custom_params", None)
+    return custom_params if isinstance(custom_params, dict) else {}
+
+
+def _sglang_hidden_chunk_rows(chunk) -> int:
+    if _is_torch_tensor(chunk):
+        if chunk.dim() <= 1:
+            return 1
+        return int(chunk.shape[0])
+    try:
+        return len(chunk)
+    except TypeError:
+        return 1
+
+
+def _slice_sglang_hidden_chunk(chunk, start: int, end: int):
+    if start <= 0 and end >= _sglang_hidden_chunk_rows(chunk):
+        return chunk
+    return chunk[start:end]
+
+
+def _to_cpu_sglang_hidden_chunk(chunk):
+    if _is_torch_tensor(chunk):
+        return chunk.detach().to("cpu", copy=True)
+    return chunk
+
+
+def _sglang_req_prompt_len(req) -> int:
+    custom_prompt_len = _int_or_none(_sglang_req_custom_params(req).get(_VERL_HIDDEN_STATE_PROMPT_LEN_PARAM))
+    if custom_prompt_len is not None:
+        return max(custom_prompt_len, 0)
+    try:
+        return len(getattr(req, "origin_input_ids", []) or [])
+    except TypeError:
+        return 0
+
+
+def _sglang_req_hidden_prefix_cache_rows(req) -> int:
+    value = _int_or_none(getattr(req, "_verl_hidden_prefix_cache_rows", None))
+    if value is not None:
+        return max(value, 0)
+    custom_value = _int_or_none(_sglang_req_custom_params(req).get("prefix_cache_rows"))
+    if custom_value is not None:
+        return max(custom_value, 0)
+    return 0
+
+
+def _sglang_hidden_window_config(req) -> dict[str, int] | None:
+    custom_params = _sglang_req_custom_params(req)
+    if not _custom_flag_enabled(custom_params.get(_VERL_DRAFTER_HIDDEN_WINDOW_PARAM, False)):
+        return None
+
+    front_tokens = _positive_int_or_none(custom_params.get(_VERL_HIDDEN_STATE_FRONT_TOKENS_PARAM))
+    if front_tokens is None:
+        front_tokens = _positive_int_or_none(custom_params.get(_VERL_HIDDEN_STATE_MAX_ROWS_PARAM))
+    if front_tokens is None:
+        front_tokens = _positive_int_or_none(getattr(req, "_verl_hidden_state_max_rows", None))
+    if front_tokens is None:
+        return None
+
+    prompt_len = _sglang_req_prompt_len(req)
+    prefix_cache_rows = _sglang_req_hidden_prefix_cache_rows(req)
+    window_start = max(prefix_cache_rows, max(prompt_len - 1, 0))
+    return {
+        "prompt_len": prompt_len,
+        "prefix_cache_rows": prefix_cache_rows,
+        "window_start": window_start,
+        "window_end": window_start + front_tokens,
+    }
+
+
+def _append_sglang_hidden_chunk_payload(req, chunk, metadata: dict[str, int] | None = None) -> int:
+    appended = _to_cpu_sglang_hidden_chunk(chunk)
+    appended_rows = _sglang_hidden_chunk_rows(appended)
+    if metadata is None:
+        req.hidden_states.append(appended)
+    else:
+        req.hidden_states.append(
+            {
+                _VERL_HIDDEN_STATE_METADATA_MARKER: True,
+                "hidden_states": appended,
+                **metadata,
+            }
+        )
+    return appended_rows
+
+
+def _append_sglang_hidden_state_chunk_with_budget(
+    req,
+    chunk,
+    *,
+    position_start: int | None = None,
+    prefix_cache_rows: int | None = None,
+) -> None:
     if not getattr(req, "return_hidden_states", False):
+        return
+
+    if prefix_cache_rows is not None:
+        setattr(req, "_verl_hidden_prefix_cache_rows", max(int(prefix_cache_rows), 0))
+
+    chunk_rows = _sglang_hidden_chunk_rows(chunk)
+    if chunk_rows <= 0:
+        return
+
+    if position_start is None:
+        position_start = _int_or_none(getattr(req, "_verl_hidden_next_position", None))
+        if position_start is None:
+            position_start = _sglang_req_hidden_prefix_cache_rows(req)
+    position_start = max(int(position_start), 0)
+    position_end = position_start + chunk_rows
+    setattr(req, "_verl_hidden_next_position", position_end)
+
+    window_config = _sglang_hidden_window_config(req)
+    if window_config is not None:
+        if getattr(req, "_verl_hidden_state_window_done", False):
+            return
+        window_start = window_config["window_start"]
+        window_end = window_config["window_end"]
+        clipped_start = max(position_start, window_start)
+        clipped_end = min(position_end, window_end)
+        if clipped_start >= clipped_end:
+            if position_end >= window_end:
+                setattr(req, "_verl_hidden_state_window_done", True)
+            return
+
+        local_start = clipped_start - position_start
+        local_end = clipped_end - position_start
+        clipped_chunk = _slice_sglang_hidden_chunk(chunk, local_start, local_end)
+        _append_sglang_hidden_chunk_payload(
+            req,
+            clipped_chunk,
+            {
+                "position_start": clipped_start,
+                "position_end": clipped_end,
+                "prefix_cache_rows": window_config["prefix_cache_rows"],
+                "window_start": window_start,
+                "window_end": window_end,
+            },
+        )
+        if clipped_end >= window_end:
+            setattr(req, "_verl_hidden_state_window_done", True)
+        return
+
+    if getattr(req, "_verl_hidden_state_budget_done", False):
         return
 
     max_rows = getattr(req, "_verl_hidden_state_max_rows", None)
@@ -1049,32 +1228,47 @@ def _append_sglang_hidden_state_chunk_with_budget(req, chunk) -> None:
     if max_rows is not None and max_rows > 0:
         remaining_rows = max_rows - collected_rows
         if remaining_rows <= 0:
-            req.return_hidden_states = False
+            setattr(req, "_verl_hidden_state_budget_done", True)
             return
-        if torch.is_tensor(chunk) and chunk.dim() > 0 and int(chunk.shape[0]) > remaining_rows:
+        if _is_torch_tensor(chunk) and chunk.dim() > 0 and int(chunk.shape[0]) > remaining_rows:
             chunk = chunk[:remaining_rows]
-        elif not torch.is_tensor(chunk):
+        elif not _is_torch_tensor(chunk):
             try:
                 if len(chunk) > remaining_rows:
                     chunk = chunk[:remaining_rows]
             except TypeError:
                 pass
 
-    if torch.is_tensor(chunk):
-        appended = chunk.detach().to("cpu", copy=True)
-        req.hidden_states.append(appended)
-        appended_rows = int(appended.shape[0]) if appended.dim() > 0 else 1
-    else:
-        req.hidden_states.append(chunk)
-        try:
-            appended_rows = len(chunk)
-        except TypeError:
-            appended_rows = 1
-
+    appended_rows = _append_sglang_hidden_chunk_payload(req, chunk)
     collected_rows += appended_rows
     setattr(req, "_verl_hidden_state_rows", collected_rows)
     if max_rows is not None and max_rows > 0 and collected_rows >= max_rows:
-        req.return_hidden_states = False
+        setattr(req, "_verl_hidden_state_budget_done", True)
+
+
+def _append_sglang_prefill_hidden_states(req, logits_output, hidden_state_offset: int, extend_input_len: int) -> int:
+    hidden_states = getattr(logits_output, "hidden_states", None)
+    if hidden_states is None:
+        return hidden_state_offset
+
+    try:
+        rows = max(int(extend_input_len), 0)
+    except (TypeError, ValueError):
+        rows = len(getattr(req, "origin_input_ids", []) or [])
+    if rows <= 0:
+        return hidden_state_offset
+
+    prompt_len = len(getattr(req, "origin_input_ids", []) or [])
+    prefix_cache_rows = max(prompt_len - rows, 0)
+    end = hidden_state_offset + rows
+    chunk = hidden_states[hidden_state_offset:end]
+    _append_sglang_hidden_state_chunk_with_budget(
+        req,
+        chunk,
+        position_start=prefix_cache_rows,
+        prefix_cache_rows=prefix_cache_rows,
+    )
+    return end
 
 
 def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: int, hidden_state_offset: int) -> int:
@@ -1083,12 +1277,22 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
         return hidden_state_offset
 
     accept_lengths = getattr(result, "accept_length_per_req_cpu", None)
-    if accept_lengths is not None and req_index < len(accept_lengths) and torch.is_tensor(hidden_states):
+    if accept_lengths is not None and req_index < len(accept_lengths) and _is_torch_tensor(hidden_states):
         rows = max(int(accept_lengths[req_index]) + 1, 1)
+        position_start = max(
+            len(getattr(req, "origin_input_ids", []) or [])
+            + len(getattr(req, "output_ids", []) or [])
+            - rows,
+            0,
+        )
 
         if hidden_states.dim() == 3 and req_index < int(hidden_states.shape[0]):
             if int(hidden_states.shape[1]) >= rows:
-                _append_sglang_hidden_state_chunk_with_budget(req, hidden_states[req_index, :rows])
+                _append_sglang_hidden_state_chunk_with_budget(
+                    req,
+                    hidden_states[req_index, :rows],
+                    position_start=position_start,
+                )
                 return hidden_state_offset + rows
             if getattr(req, "return_hidden_states", False):
                 raise RuntimeError(
@@ -1100,7 +1304,11 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
         end = hidden_state_offset + rows
         has_expected_rows = int(hidden_states.shape[0]) >= expected_rows and end <= int(hidden_states.shape[0])
         if hidden_states.dim() >= 2 and has_expected_rows:
-            _append_sglang_hidden_state_chunk_with_budget(req, hidden_states[hidden_state_offset:end])
+            _append_sglang_hidden_state_chunk_with_budget(
+                req,
+                hidden_states[hidden_state_offset:end],
+                position_start=position_start,
+            )
             return end
 
         if getattr(req, "return_hidden_states", False):
@@ -1112,10 +1320,22 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
 
     if not getattr(req, "return_hidden_states", False):
         return hidden_state_offset
-    if torch.is_tensor(hidden_states):
-        _append_sglang_hidden_state_chunk_with_budget(req, hidden_states[req_index])
+    position_start = max(
+        len(getattr(req, "origin_input_ids", []) or []) + len(getattr(req, "output_ids", []) or []) - 2,
+        0,
+    )
+    if _is_torch_tensor(hidden_states):
+        _append_sglang_hidden_state_chunk_with_budget(
+            req,
+            hidden_states[req_index],
+            position_start=position_start,
+        )
     else:
-        _append_sglang_hidden_state_chunk_with_budget(req, hidden_states[req_index])
+        _append_sglang_hidden_state_chunk_with_budget(
+            req,
+            hidden_states[req_index],
+            position_start=position_start,
+        )
     return hidden_state_offset
 
 
@@ -1307,6 +1527,14 @@ _SGLANG_DECODE_HIDDEN_STATES_APPEND_PATTERN = re.compile(
     r".*?"
     r"^(?P=indent)[ \t]+\)\r?\n",
 )
+_SGLANG_PREFILL_HIDDEN_STATES_APPEND_PATTERN = re.compile(
+    r"(?ms)^(?P<indent>[ \t]+)if\s*(?:\(\s*)?req\.return_hidden_states\s+"
+    r"and\s+logits_output\.hidden_states\s+is\s+not\s+None\s*(?:\))?\s*:\r?\n"
+    r"(?P=indent)[ \t]+req\.hidden_states\.append\(\r?\n"
+    r".*?"
+    r"(?:\.detach\(\)\.to\(\"cpu\",\s*copy=True\)|\.cpu\(\)\s*\.clone\(\)\s*\.tolist\(\))\r?\n"
+    r"(?P=indent)[ \t]+\)\r?\n",
+)
 
 
 def _replace_sglang_hidden_states_list_output(source: str) -> tuple[str, int]:
@@ -1325,6 +1553,22 @@ def _render_sglang_decode_hidden_states_append(match: re.Match) -> str:
         f"{indent}    result,\n"
         f"{indent}    i,\n"
         f"{indent}    hidden_state_offset,\n"
+        f"{indent})\n"
+    )
+
+
+def _render_sglang_prefill_hidden_states_append(match: re.Match) -> str:
+    indent = match.group("indent")
+    return (
+        f"{indent}hidden_state_offset = _append_sglang_prefill_hidden_states(\n"
+        f"{indent}    req,\n"
+        f"{indent}    logits_output,\n"
+        f"{indent}    hidden_state_offset,\n"
+        f"{indent}    (\n"
+        f"{indent}        extend_input_len_per_req[i]\n"
+        f"{indent}        if extend_input_len_per_req is not None\n"
+        f"{indent}        else len(req.origin_input_ids)\n"
+        f"{indent}    ),\n"
         f"{indent})\n"
     )
 
@@ -1354,6 +1598,17 @@ def _patch_sglang_decode_hidden_states_source(source: str) -> str | None:
     return _insert_sglang_decode_hidden_state_offset(patched_source)
 
 
+def _patch_sglang_prefill_hidden_states_source(source: str) -> str | None:
+    patched_source, hidden_block_count = _SGLANG_PREFILL_HIDDEN_STATES_APPEND_PATTERN.subn(
+        _render_sglang_prefill_hidden_states_append,
+        source,
+        count=1,
+    )
+    if hidden_block_count <= 0:
+        return None
+    return patched_source
+
+
 def _make_sglang_hidden_states_tensor_output_patch(original_method):
     """Patch SGLang output processors to keep hidden-state chunks as CPU tensors.
 
@@ -1370,7 +1625,16 @@ def _make_sglang_hidden_states_tensor_output_patch(original_method):
 
     source = textwrap.dedent(source)
     patched_source, conversion_count = _replace_sglang_hidden_states_list_output(source)
-    if original_method.__name__ == "process_batch_result_decode":
+    if original_method.__name__ == "process_batch_result_prefill":
+        patched_prefill_source = _patch_sglang_prefill_hidden_states_source(patched_source)
+        if patched_prefill_source is None:
+            logger.warning(
+                "Skip SGLang prefill hidden-state window patch for %s: hidden append block not found.",
+                original_method.__name__,
+            )
+            return None
+        patched_source = patched_prefill_source
+    elif original_method.__name__ == "process_batch_result_decode":
         patched_decode_source = _patch_sglang_decode_hidden_states_source(patched_source)
         if patched_decode_source is None:
             logger.warning(
@@ -1386,6 +1650,7 @@ def _make_sglang_hidden_states_tensor_output_patch(original_method):
         return None
 
     globals_dict = original_method.__globals__
+    globals_dict["_append_sglang_prefill_hidden_states"] = _append_sglang_prefill_hidden_states
     globals_dict["_append_sglang_decode_hidden_states"] = _append_sglang_decode_hidden_states
     namespace = {}
     exec(  # noqa: S102

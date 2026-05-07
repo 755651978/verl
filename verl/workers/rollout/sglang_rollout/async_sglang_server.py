@@ -67,6 +67,9 @@ _ALIGNMENT_DEBUG_EVERY_N_STEPS_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_EVERY_N_STEPS
 _ALIGNMENT_DEBUG_MAX_SAMPLES_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_MAX_SAMPLES_PER_STEP"
 _ALIGNMENT_DEBUG_TOKEN_WINDOW_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_TOKEN_WINDOW"
 _ALIGNMENT_DEBUG_RANKS_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_RANKS"
+_VERL_DRAFTER_HIDDEN_WINDOW_PARAM = "_verl_drafter_hidden_state_window"
+_VERL_HIDDEN_STATE_FRONT_TOKENS_PARAM = "_verl_hidden_state_front_tokens_per_sample"
+_VERL_HIDDEN_STATE_PROMPT_LEN_PARAM = "_verl_prompt_len"
 
 
 def _env_flag_enabled(name: str, default: bool = False) -> bool:
@@ -220,6 +223,7 @@ def _select_drafter_hidden_state_window(
     hidden_states: torch.Tensor,
     *,
     expected_hidden_rows: int,
+    prompt_len: int,
     front_tokens: Optional[int],
     tail_tokens: Optional[int],
 ) -> tuple[torch.Tensor, int, int, str, int]:
@@ -229,8 +233,13 @@ def _select_drafter_hidden_state_window(
     crop_end = hidden_raw_len
     crop_mode = "all"
 
-    if front_tokens is not None and hidden_raw_len > front_tokens:
-        crop_end = front_tokens
+    train_hidden_start = max(prefix_cache_rows, max(int(prompt_len) - 1, 0))
+    if train_hidden_start > prefix_cache_rows:
+        crop_start = min(train_hidden_start - prefix_cache_rows, hidden_raw_len)
+        crop_mode = "front"
+
+    if front_tokens is not None and max(hidden_raw_len - crop_start, 0) > front_tokens:
+        crop_end = crop_start + front_tokens
         crop_mode = "front"
     elif tail_tokens is not None and hidden_raw_len > tail_tokens:
         crop_start = hidden_raw_len - tail_tokens
@@ -334,9 +343,49 @@ def _response_aligned_top_logprobs_to_tensor(
     return _top_logprobs_to_tensor(prompt_target_padding + output_top_logprobs, topk)
 
 
-def _hidden_state_chunk_to_tensor(hidden_state_chunk: Any) -> Optional[torch.Tensor]:
+def _hidden_state_metadata_from_chunk(hidden_state_chunk: Any) -> dict[str, int]:
+    if not isinstance(hidden_state_chunk, dict):
+        return {}
+
+    metadata = {}
+    for source_key, target_key in (
+        ("position_start", "position_start"),
+        ("position_end", "position_end"),
+        ("hidden_position_start", "position_start"),
+        ("hidden_position_end", "position_end"),
+        ("prefix_cache_rows", "prefix_cache_rows"),
+        ("window_start", "window_start"),
+        ("window_end", "window_end"),
+    ):
+        if source_key not in hidden_state_chunk:
+            continue
+        value = _positive_int_or_none(hidden_state_chunk.get(source_key))
+        if value is not None or hidden_state_chunk.get(source_key) == 0:
+            metadata[target_key] = int(hidden_state_chunk[source_key])
+    return metadata
+
+
+def _hidden_state_chunk_payload(hidden_state_chunk: Any) -> tuple[Any, dict[str, int]]:
+    if not isinstance(hidden_state_chunk, dict):
+        return hidden_state_chunk, {}
+
+    payload = None
+    for key in ("hidden_states", "tensor", "data"):
+        if key in hidden_state_chunk:
+            payload = hidden_state_chunk[key]
+            break
+    return payload, _hidden_state_metadata_from_chunk(hidden_state_chunk)
+
+
+def _hidden_state_chunk_to_tensor_and_metadata(
+    hidden_state_chunk: Any,
+) -> tuple[Optional[torch.Tensor], dict[str, int]]:
     if hidden_state_chunk is None:
-        return None
+        return None, {}
+
+    hidden_state_chunk, metadata = _hidden_state_chunk_payload(hidden_state_chunk)
+    if hidden_state_chunk is None:
+        return None, metadata
 
     if torch.is_tensor(hidden_state_chunk):
         h_states = hidden_state_chunk.detach().to(device="cpu", dtype=torch.bfloat16)
@@ -352,24 +401,34 @@ def _hidden_state_chunk_to_tensor(hidden_state_chunk: Any) -> Optional[torch.Ten
             deserialized = MultiprocessingSerializer.deserialize(serialized_chunk)
         except Exception:  # noqa: BLE001
             logger.warning("Failed to deserialize hidden-state chunk from bytes; skipping this chunk")
-            return None
-        return _hidden_state_chunk_to_tensor(deserialized)
+            return None, metadata
+        tensor, nested_metadata = _hidden_state_chunk_to_tensor_and_metadata(deserialized)
+        return tensor, {**metadata, **nested_metadata}
     else:
         h_states = torch.tensor(hidden_state_chunk, dtype=torch.bfloat16)
 
     if h_states.numel() == 0:
-        return None
+        return None, metadata
     if h_states.dim() == 1:
         h_states = h_states.unsqueeze(0)
     elif h_states.dim() == 3:
         h_states = h_states.squeeze(0)
-    return h_states.contiguous()
+    return h_states.contiguous(), metadata
+
+
+def _hidden_state_chunk_to_tensor(hidden_state_chunk: Any) -> Optional[torch.Tensor]:
+    tensor, _ = _hidden_state_chunk_to_tensor_and_metadata(hidden_state_chunk)
+    return tensor
 
 
 def _iter_hidden_state_chunks(hidden_states_data: Any):
     if hidden_states_data is None:
         return []
-    if torch.is_tensor(hidden_states_data) or isinstance(hidden_states_data, (bytes, bytearray, memoryview, str)):
+    if (
+        torch.is_tensor(hidden_states_data)
+        or isinstance(hidden_states_data, dict)
+        or isinstance(hidden_states_data, (bytes, bytearray, memoryview, str))
+    ):
         return [hidden_states_data]
     return hidden_states_data
 
@@ -816,7 +875,6 @@ class SGLangHttpServer:
 
         # return hidden states
         should_collect = False
-        hidden_capture_max_rows = None
         collection_global_steps = request_global_steps if request_global_steps is not None else self.global_steps
         collect_interval = max(1, int(self.config.drafter.training.collect_interval_steps))
         collect_this_step = collection_global_steps is None or (collection_global_steps % collect_interval == 0)
@@ -825,21 +883,27 @@ class SGLangHttpServer:
         front_hidden_tokens = _positive_int_or_none(
             getattr(training_cfg, "hidden_state_front_tokens_per_sample", 2000)
         )
-        if front_hidden_tokens is not None:
-            hidden_capture_max_rows = front_hidden_tokens
-        budget_hidden_rows = estimated_hidden_rows
-        if hidden_capture_max_rows is not None:
-            budget_hidden_rows = min(budget_hidden_rows, int(hidden_capture_max_rows))
         if (
             self.config.drafter.enable
             and self.config.drafter.enable_drafter_training
             and self.config.drafter.training.collect_hidden_states_from_sgl
             and collect_this_step
             and not skip_drafter_collection
-            and self._reserve_drafter_collection_budget(request_id, collection_global_steps, budget_hidden_rows)
+            and self._reserve_drafter_collection_budget(request_id, collection_global_steps, estimated_hidden_rows)
         ):
             should_collect = True
             request.update({"return_hidden_states": True})
+            custom_params = sampling_params.get("custom_params")
+            custom_params = dict(custom_params) if isinstance(custom_params, dict) else {}
+            custom_params.update(
+                {
+                    _VERL_DRAFTER_HIDDEN_WINDOW_PARAM: True,
+                    _VERL_HIDDEN_STATE_PROMPT_LEN_PARAM: len(prompt_ids),
+                }
+            )
+            if front_hidden_tokens is not None:
+                custom_params[_VERL_HIDDEN_STATE_FRONT_TOKENS_PARAM] = int(front_hidden_tokens)
+            sampling_params["custom_params"] = custom_params
             if self.config.drafter.training.use_logits:
                 request.update({"return_logprob": True})
                 request.update({"top_logprobs_num": self.config.drafter.training.logits_topk})
@@ -849,9 +913,6 @@ class SGLangHttpServer:
         # Add lora request
         if self.model_config.lora_rank > 0:
             generate_request.lora_path = SGLANG_LORA_NAME
-
-        if should_collect and hidden_capture_max_rows is not None:
-            setattr(generate_request, "_verl_hidden_state_max_rows", int(hidden_capture_max_rows))
 
         output = await self.tokenizer_manager.generate_request(generate_request, None).__anext__()
         meta_info = output.get("meta_info", {})
@@ -911,10 +972,13 @@ class SGLangHttpServer:
 
             hidden_states_data = meta_info.pop("hidden_states", [])
             hidden_states_list = []
+            hidden_states_metadata = []
             for hs in _iter_hidden_state_chunks(hidden_states_data):
-                h_states = _hidden_state_chunk_to_tensor(hs)
+                h_states, metadata = _hidden_state_chunk_to_tensor_and_metadata(hs)
                 if h_states is not None:
                     hidden_states_list.append(h_states)
+                    if metadata:
+                        hidden_states_metadata.append(metadata)
             del hidden_states_data
             has_hidden_states = bool(hidden_states_list)
 
@@ -924,6 +988,8 @@ class SGLangHttpServer:
             hidden_position_start = 0
             hidden_position_end = 0
             hidden_prefix_cache_rows = 0
+            hidden_window_start = None
+            hidden_window_end = None
             hidden_crop_mode = "none"
             expected_hidden_rows = _expected_full_hidden_rows(len(prompt_ids), len(token_ids))
             hidden_complete = False
@@ -933,22 +999,23 @@ class SGLangHttpServer:
                 hidden_states = torch.cat(hidden_states_list, dim=0)
                 del hidden_states_list
                 hidden_raw_len = int(hidden_states.size(0))
-                hidden_complete = hidden_raw_len >= expected_hidden_rows
-                max_hidden_tokens = _positive_int_or_none(
-                    getattr(training_cfg, "hidden_state_max_tokens_per_sample", None)
-                )
-                hidden_capture_was_capped = (
-                    hidden_capture_max_rows is not None
-                    and hidden_raw_len >= int(hidden_capture_max_rows)
-                    and hidden_raw_len < expected_hidden_rows
-                )
-                if hidden_capture_was_capped:
-                    hidden_states = hidden_states[: int(hidden_capture_max_rows)]
-                    hidden_position_start = 0
-                    hidden_position_end = int(hidden_states.size(0))
-                    hidden_crop_mode = "front_capture"
-                    hidden_prefix_cache_rows = 0
+                if hidden_states_metadata:
+                    first_metadata = hidden_states_metadata[0]
+                    last_metadata = hidden_states_metadata[-1]
+                    hidden_position_start = int(first_metadata.get("position_start", 0))
+                    hidden_position_end = int(
+                        last_metadata.get("position_end", hidden_position_start + hidden_raw_len)
+                    )
+                    hidden_prefix_cache_rows = int(first_metadata.get("prefix_cache_rows", 0))
+                    hidden_window_start = first_metadata.get("window_start")
+                    hidden_window_end = first_metadata.get("window_end")
+                    hidden_crop_mode = "sglang_window"
+                    hidden_complete = True
                 else:
+                    hidden_complete = hidden_raw_len >= expected_hidden_rows
+                    max_hidden_tokens = _positive_int_or_none(
+                        getattr(training_cfg, "hidden_state_max_tokens_per_sample", None)
+                    )
                     (
                         hidden_states,
                         hidden_position_start,
@@ -958,6 +1025,7 @@ class SGLangHttpServer:
                     ) = _select_drafter_hidden_state_window(
                         hidden_states,
                         expected_hidden_rows=expected_hidden_rows,
+                        prompt_len=len(prompt_ids),
                         front_tokens=front_hidden_tokens,
                         tail_tokens=max_hidden_tokens,
                     )
@@ -969,6 +1037,9 @@ class SGLangHttpServer:
                     "hidden_states": hidden_states.unsqueeze(0).cpu(),
                     "hidden_position_start": hidden_position_start,
                     "hidden_position_end": hidden_position_end,
+                    "hidden_prefix_cache_rows": hidden_prefix_cache_rows,
+                    "hidden_window_start": hidden_window_start,
+                    "hidden_window_end": hidden_window_end,
                     "target_logprobs": target_logprobs.unsqueeze(0).cpu() if target_logprobs is not None else None,
                     "global_step": collection_global_steps,
                     "replica_rank": self.replica_rank,
@@ -1010,6 +1081,8 @@ class SGLangHttpServer:
                         "hidden_prefix_cache_rows": hidden_prefix_cache_rows,
                         "hidden_position_start": hidden_position_start,
                         "hidden_position_end": hidden_position_end,
+                        "hidden_window_start": hidden_window_start,
+                        "hidden_window_end": hidden_window_end,
                         "hidden_crop_mode": hidden_crop_mode,
                         "hidden_front_max": getattr(
                             self.config.drafter.training,
