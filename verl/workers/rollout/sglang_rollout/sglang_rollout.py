@@ -461,27 +461,39 @@ class ServerAdapter(BaseRollout):
             return
 
         update_weights_bucket_bytes = int(self.config.checkpoint_engine.update_weights_bucket_megabytes) << 20
-        async for params_batch in get_named_tensor_buckets(weights.items(), update_weights_bucket_bytes):
-            await _sgl_update_weights_with_route(
-                engine=self._engine,
-                params_batch=params_batch,
-                device_mesh_key="infer_tp",
-                device_mesh=self.device_mesh,
-                disable_draft_model=False,
-                disable_target_model=True,
-                load_format=(
-                    VERL_SGLANG_DRAFT_WEIGHT_LOADER if _supports_sglang_custom_weight_loader() else None
-                ),
-                stage_cpu_tensors_to_device=True,
-                flush_cache=False,
-                abort_all_requests=False,
-            )
+        pause_for_speculative_update = bool(
+            self.config.drafter.enable and not _speculative_weight_sync_guard_disabled()
+        )
+        generation_paused = False
+        try:
+            if self.device_mesh["infer_tp"].get_local_rank() == 0 and pause_for_speculative_update:
+                await self._engine.pause_generation()
+                generation_paused = True
+                await self._engine.flush_cache()
 
-        if self.device_mesh["infer_tp"].get_local_rank() == 0:
-            # Draft-only updates do not invalidate target-model KV/prefix cache.
-            # Each bucket already sets flush_cache=False on update_weights_from_tensor.
-            if global_steps is not None:
-                await self.server_actor.set_global_steps.remote(global_steps)
+            async for params_batch in get_named_tensor_buckets(weights.items(), update_weights_bucket_bytes):
+                await _sgl_update_weights_with_route(
+                    engine=self._engine,
+                    params_batch=params_batch,
+                    device_mesh_key="infer_tp",
+                    device_mesh=self.device_mesh,
+                    disable_draft_model=False,
+                    disable_target_model=True,
+                    load_format=(
+                        VERL_SGLANG_DRAFT_WEIGHT_LOADER if _supports_sglang_custom_weight_loader() else None
+                    ),
+                    stage_cpu_tensors_to_device=True,
+                    flush_cache=False,
+                    abort_all_requests=False,
+                )
+
+            if self.device_mesh["infer_tp"].get_local_rank() == 0:
+                await self._engine.flush_cache()
+                if global_steps is not None:
+                    await self.server_actor.set_global_steps.remote(global_steps)
+        finally:
+            if self.device_mesh["infer_tp"].get_local_rank() == 0 and generation_paused:
+                await self._engine.continue_generation()
 
     def wrap_lora_params(self, peft_config: LoraConfig, weights: Generator[tuple[str, torch.Tensor]]):
         # peft config

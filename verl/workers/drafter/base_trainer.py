@@ -1450,6 +1450,7 @@ class DrafterBaseTrainer:
         self.optimizer.step()
         if self.lr_scheduler is not None:
             self.lr_scheduler.step()
+        self.optimizer.zero_grad(set_to_none=True)
 
         self.training_steps += 1
         if self.training_steps % 10 == 0:
@@ -1523,6 +1524,12 @@ class DrafterBaseTrainer:
                     logger.info(f"[Rank {self.rank}] Final checkpoint save completed")
                 except Exception as e:  # noqa: BLE001
                     logger.warning(f"Final checkpoint save failed: {e}")
+
+        if self.optimizer is not None:
+            try:
+                self.optimizer.zero_grad(set_to_none=True)
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"Failed to clear drafter gradients during cleanup: {e}")
 
         # Clean up distributed resources gracefully
         sp_group = self._get_sp_group()
@@ -1605,6 +1612,8 @@ class DrafterBaseTrainer:
             self.collected_data.clear()
             self.data_buffer.clear()  # Clear the cross-step data buffer
         if device_name != "cpu" and hasattr(self.device_module, "empty_cache"):
+            if hasattr(self.device_module, "synchronize"):
+                self.device_module.synchronize()
             self.device_module.empty_cache()
         self._training_initialized = False
         self._last_ckpt_step = -1

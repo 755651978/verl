@@ -1728,10 +1728,7 @@ class RayPPOTrainer:
                             with marked_timer("save_checkpoint", timing_raw, color="green"):
                                 self._save_checkpoint()
 
-                        # update weights from trainer to rollout
-                        with marked_timer("update_weights", timing_raw, color="red"):
-                            self.checkpoint_manager.update_weights(self.global_steps)
-
+                        drafter_trained = False
                         if self.use_drafter and self.drafter_wg is not None:
                             with marked_timer("train_drafter", timing_raw, color="red"):
                                 drafter_train_refs = self.drafter_wg.train_drafter()
@@ -1740,18 +1737,27 @@ class RayPPOTrainer:
                             drafter_metrics = self._summarize_drafter_train_results(drafter_train_results)
                             metrics.update(drafter_metrics)
                             drafter_trained = bool(drafter_metrics["drafter/trained"])
+                            del drafter_train_results
 
+                        # update weights from trainer to rollout
+                        with marked_timer("update_weights", timing_raw, color="red"):
+                            self.checkpoint_manager.update_weights(self.global_steps)
+
+                        if self.use_drafter and self.drafter_wg is not None:
                             if drafter_trained:
                                 with marked_timer("publish_drafter", timing_raw, color="red"):
                                     metrics["drafter/publish_attempted"] = 1
                                     drafter_weights = self._get_published_drafter_weights()
-                                    if drafter_weights is not None:
-                                        self.actor_rollout_wg.update_draft_weights(
-                                            drafter_weights, global_steps=self.global_steps
-                                        )
-                                        metrics["drafter/published"] = 1
-                                    else:
-                                        metrics["drafter/published"] = 0
+                                    try:
+                                        if drafter_weights is not None:
+                                            self.actor_rollout_wg.update_draft_weights(
+                                                drafter_weights, global_steps=self.global_steps
+                                            )
+                                            metrics["drafter/published"] = 1
+                                        else:
+                                            metrics["drafter/published"] = 0
+                                    finally:
+                                        del drafter_weights
                             else:
                                 metrics["drafter/publish_attempted"] = 0
                                 metrics["drafter/published"] = 0
