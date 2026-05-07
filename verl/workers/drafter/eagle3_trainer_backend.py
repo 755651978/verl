@@ -208,6 +208,12 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
 
         
         # 复用主模型的Embedding和LM_Head
+        reset_rope_buffers = getattr(drafter_module, "reset_rope_buffers", None)
+        if callable(reset_rope_buffers):
+            reset_count = reset_rope_buffers(dtype=torch.float32)
+            if reset_count:
+                logger.info("Reset %s EAGLE3 rotary embedding buffers after checkpoint load", reset_count)
+
         target_model_path = self.config.model.path
             
         drafter_module.load_embedding(target_model_path)

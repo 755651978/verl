@@ -256,6 +256,39 @@ class LlamaRotaryEmbedding(torch.nn.Module):
             dtype=torch.get_default_dtype(),
         )
 
+    def reset_inv_freq(self, device=None, dtype=torch.float32):
+        device = device if device is not None else self.inv_freq.device
+        inv_freq = 1.0 / (
+            self.base ** (torch.arange(0, self.dim, 2, device=device, dtype=torch.float32) / self.dim)
+        )
+
+        if all(
+            getattr(self, attr, None) is not None
+            for attr in ("scaling_factor", "low_freq_factor", "high_freq_factor", "orig_max_position")
+        ):
+            low_freq_wavelen = self.orig_max_position / self.low_freq_factor
+            high_freq_wavelen = self.orig_max_position / self.high_freq_factor
+            wave_len = 2 * math.pi / inv_freq
+            if self.low_freq_factor != self.high_freq_factor:
+                smooth = (self.orig_max_position / wave_len - self.low_freq_factor) / (
+                    self.high_freq_factor - self.low_freq_factor
+                )
+            else:
+                smooth = 0
+            inv_freq = torch.where(
+                wave_len < high_freq_wavelen,
+                inv_freq,
+                torch.where(
+                    wave_len > low_freq_wavelen,
+                    inv_freq / self.scaling_factor,
+                    (1 - smooth) * inv_freq / self.scaling_factor + smooth * inv_freq,
+                ),
+            )
+
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        seq_len = int(getattr(self, "max_seq_len_cached", self.max_position_embeddings + 20))
+        self._set_cos_sin_cache(seq_len=seq_len, device=device, dtype=dtype)
+
     def _set_cos_sin_cache(self, seq_len, device, dtype):
         self.max_seq_len_cached = seq_len
         t = torch.arange(
@@ -1346,6 +1379,16 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         d2t = torch.arange(self.draft_vocab_size, dtype=torch.int64)
         self.register_buffer("t2d", t2d)
         self.register_buffer("d2t", d2t)
+
+    def reset_rope_buffers(self, dtype=torch.float32) -> int:
+        reset_count = 0
+        device = next(self.parameters()).device
+        for module in self.modules():
+            reset_inv_freq = getattr(module, "reset_inv_freq", None)
+            if module is not self and callable(reset_inv_freq):
+                reset_inv_freq(device=device, dtype=dtype)
+                reset_count += 1
+        return reset_count
 
     def forward(
         self,
