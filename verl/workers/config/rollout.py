@@ -84,11 +84,11 @@ class DrafterRolloutConfig(BaseConfig):
 class DrafterTrainingConfig(BaseConfig):
     collect_hidden_states_from_sgl: bool = False
     use_data_buffer: bool = False
-    collect_interval_steps: int = 1
+    collect_interval_steps: int = 10
     collection_sample_rate: float = 1.0
-    max_collect_samples_per_step_per_replica: Optional[int] = None
-    max_collect_tokens_per_step_per_replica: Optional[int] = None
-    hidden_state_front_tokens_per_sample: Optional[int] = 2000
+    max_collect_samples_per_step_per_replica: Optional[int] = 1
+    max_collect_tokens_per_step_per_replica: Optional[int] = 8192
+    hidden_state_front_tokens_per_sample: Optional[int] = 1024
     hidden_state_max_tokens_per_sample: Optional[int] = None
     max_seq_len: int = 8192
     max_epoch: int = 10
@@ -106,7 +106,7 @@ class DrafterTrainingConfig(BaseConfig):
     ttt_length: int = 1
     vocab_mapping_path: Optional[str] = None
     current_max_samples: int = 2000
-    data_buffer_max_size: int = 10000
+    data_buffer_max_size: int = 1024
     hidden_state_clip_value: Optional[float] = 1.0e4
 
     def __post_init__(self):

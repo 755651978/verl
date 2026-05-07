@@ -738,7 +738,7 @@ class SGLangHttpServer:
         self,
         request_id: str,
         collection_global_steps: Optional[int],
-        max_new_tokens: int,
+        estimated_hidden_rows: int,
     ) -> bool:
         self._reset_drafter_collection_budget_if_needed(collection_global_steps)
         if not self._passes_drafter_collection_sampling(request_id, collection_global_steps):
@@ -750,11 +750,11 @@ class SGLangHttpServer:
             return False
 
         max_tokens = training_cfg.max_collect_tokens_per_step_per_replica
-        if max_tokens is not None and self._drafter_collection_tokens + max_new_tokens > int(max_tokens):
+        if max_tokens is not None and self._drafter_collection_tokens + estimated_hidden_rows > int(max_tokens):
             return False
 
         self._drafter_collection_samples += 1
-        self._drafter_collection_tokens += max_new_tokens
+        self._drafter_collection_tokens += estimated_hidden_rows
         return True
 
     async def generate(
@@ -816,16 +816,24 @@ class SGLangHttpServer:
 
         # return hidden states
         should_collect = False
+        hidden_capture_max_rows = None
         collection_global_steps = request_global_steps if request_global_steps is not None else self.global_steps
         collect_interval = max(1, int(self.config.drafter.training.collect_interval_steps))
         collect_this_step = collection_global_steps is None or (collection_global_steps % collect_interval == 0)
+        estimated_hidden_rows = _expected_full_hidden_rows(len(prompt_ids), max_new_tokens)
+        training_cfg = self.config.drafter.training
+        front_hidden_tokens = _positive_int_or_none(
+            getattr(training_cfg, "hidden_state_front_tokens_per_sample", 2000)
+        )
+        if front_hidden_tokens is not None:
+            hidden_capture_max_rows = front_hidden_tokens
         if (
             self.config.drafter.enable
             and self.config.drafter.enable_drafter_training
             and self.config.drafter.training.collect_hidden_states_from_sgl
             and collect_this_step
             and not skip_drafter_collection
-            and self._reserve_drafter_collection_budget(request_id, collection_global_steps, max_new_tokens)
+            and self._reserve_drafter_collection_budget(request_id, collection_global_steps, estimated_hidden_rows)
         ):
             should_collect = True
             request.update({"return_hidden_states": True})
@@ -838,6 +846,9 @@ class SGLangHttpServer:
         # Add lora request
         if self.model_config.lora_rank > 0:
             generate_request.lora_path = SGLANG_LORA_NAME
+
+        if should_collect and hidden_capture_max_rows is not None:
+            setattr(generate_request, "_verl_hidden_state_max_rows", int(hidden_capture_max_rows))
 
         output = await self.tokenizer_manager.generate_request(generate_request, None).__anext__()
         meta_info = output.get("meta_info", {})
@@ -895,12 +906,14 @@ class SGLangHttpServer:
                 if target_logprobs is None:
                     logger.warning("Failed to convert output top_logprobs to tensor; skip target_logprobs collection")
 
-            hidden_states_data = output.get("meta_info", {}).get("hidden_states", [])
+            hidden_states_data = meta_info.pop("hidden_states", [])
             hidden_states_list = []
             for hs in _iter_hidden_state_chunks(hidden_states_data):
                 h_states = _hidden_state_chunk_to_tensor(hs)
                 if h_states is not None:
                     hidden_states_list.append(h_states)
+            del hidden_states_data
+            has_hidden_states = bool(hidden_states_list)
 
             alignment_sample_index = max(int(self._drafter_collection_samples) - 1, 0)
             hidden_raw_len = 0
@@ -911,31 +924,40 @@ class SGLangHttpServer:
             hidden_crop_mode = "none"
             expected_hidden_rows = _expected_full_hidden_rows(len(prompt_ids), len(token_ids))
             hidden_complete = False
-            if hidden_states_list:
+            if has_hidden_states:
                 prompt_tensor = torch.as_tensor(prompt_ids, dtype=torch.long).detach().cpu()
                 response_tensor = torch.tensor(token_ids, dtype=torch.long)
                 hidden_states = torch.cat(hidden_states_list, dim=0)
+                del hidden_states_list
                 hidden_raw_len = int(hidden_states.size(0))
                 hidden_complete = hidden_raw_len >= expected_hidden_rows
-                training_cfg = self.config.drafter.training
-                front_hidden_tokens = _positive_int_or_none(
-                    getattr(training_cfg, "hidden_state_front_tokens_per_sample", 2000)
-                )
                 max_hidden_tokens = _positive_int_or_none(
                     getattr(training_cfg, "hidden_state_max_tokens_per_sample", None)
                 )
-                (
-                    hidden_states,
-                    hidden_position_start,
-                    hidden_position_end,
-                    hidden_crop_mode,
-                    hidden_prefix_cache_rows,
-                ) = _select_drafter_hidden_state_window(
-                    hidden_states,
-                    expected_hidden_rows=expected_hidden_rows,
-                    front_tokens=front_hidden_tokens,
-                    tail_tokens=max_hidden_tokens,
+                hidden_capture_was_capped = (
+                    hidden_capture_max_rows is not None
+                    and hidden_raw_len >= int(hidden_capture_max_rows)
+                    and hidden_raw_len < expected_hidden_rows
                 )
+                if hidden_capture_was_capped:
+                    hidden_states = hidden_states[: int(hidden_capture_max_rows)]
+                    hidden_position_start = 0
+                    hidden_position_end = int(hidden_states.size(0))
+                    hidden_crop_mode = "front_capture"
+                    hidden_prefix_cache_rows = 0
+                else:
+                    (
+                        hidden_states,
+                        hidden_position_start,
+                        hidden_position_end,
+                        hidden_crop_mode,
+                        hidden_prefix_cache_rows,
+                    ) = _select_drafter_hidden_state_window(
+                        hidden_states,
+                        expected_hidden_rows=expected_hidden_rows,
+                        front_tokens=front_hidden_tokens,
+                        tail_tokens=max_hidden_tokens,
+                    )
                 hidden_kept_len = int(hidden_states.size(0))
                 drafter_sample = {
                     "input_ids": torch.cat([prompt_tensor, response_tensor], dim=0).unsqueeze(0),
@@ -952,7 +974,7 @@ class SGLangHttpServer:
                 logger.warning("[SGLangHttpServer] No valid hidden states returned for drafter sample collection")
 
             force_alignment_log = (
-                not hidden_states_list
+                not has_hidden_states
                 or (self.config.drafter.training.use_logits and target_logprobs is None)
                 or (sampled_token_mismatch is not None and sampled_token_mismatch > 0)
                 or (

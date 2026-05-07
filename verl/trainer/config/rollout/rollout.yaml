@@ -462,11 +462,11 @@ drafter:
     _target_: verl.workers.config.DrafterTrainingConfig
     collect_hidden_states_from_sgl: false
     use_data_buffer: false
-    collect_interval_steps: 1
+    collect_interval_steps: 10
     collection_sample_rate: 1.0
-    max_collect_samples_per_step_per_replica: null
-    max_collect_tokens_per_step_per_replica: null
-    hidden_state_front_tokens_per_sample: 2000
+    max_collect_samples_per_step_per_replica: 1
+    max_collect_tokens_per_step_per_replica: 8192
+    hidden_state_front_tokens_per_sample: 1024
     hidden_state_max_tokens_per_sample: null
     max_seq_len: 8192
     max_epoch: 10
@@ -484,7 +484,7 @@ drafter:
     ttt_length: 1
     vocab_mapping_path: null
     current_max_samples: 2000
-    data_buffer_max_size: 10000
+    data_buffer_max_size: 1024
     hidden_state_clip_value: 1.0e4
 
 

@@ -1034,6 +1034,49 @@ def patch_sglang_npu_eagle_target_sampling() -> None:
         logger.warning("Patched SGLang NPU EAGLE sampling for %s", ", ".join(patched_targets))
 
 
+def _append_sglang_hidden_state_chunk_with_budget(req, chunk) -> None:
+    if not getattr(req, "return_hidden_states", False):
+        return
+
+    max_rows = getattr(req, "_verl_hidden_state_max_rows", None)
+    if max_rows is not None:
+        try:
+            max_rows = int(max_rows)
+        except (TypeError, ValueError):
+            max_rows = None
+
+    collected_rows = int(getattr(req, "_verl_hidden_state_rows", 0) or 0)
+    if max_rows is not None and max_rows > 0:
+        remaining_rows = max_rows - collected_rows
+        if remaining_rows <= 0:
+            req.return_hidden_states = False
+            return
+        if torch.is_tensor(chunk) and chunk.dim() > 0 and int(chunk.shape[0]) > remaining_rows:
+            chunk = chunk[:remaining_rows]
+        elif not torch.is_tensor(chunk):
+            try:
+                if len(chunk) > remaining_rows:
+                    chunk = chunk[:remaining_rows]
+            except TypeError:
+                pass
+
+    if torch.is_tensor(chunk):
+        appended = chunk.detach().to("cpu", copy=True)
+        req.hidden_states.append(appended)
+        appended_rows = int(appended.shape[0]) if appended.dim() > 0 else 1
+    else:
+        req.hidden_states.append(chunk)
+        try:
+            appended_rows = len(chunk)
+        except TypeError:
+            appended_rows = 1
+
+    collected_rows += appended_rows
+    setattr(req, "_verl_hidden_state_rows", collected_rows)
+    if max_rows is not None and max_rows > 0 and collected_rows >= max_rows:
+        req.return_hidden_states = False
+
+
 def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: int, hidden_state_offset: int) -> int:
     hidden_states = getattr(logits_output, "hidden_states", None)
     if hidden_states is None:
@@ -1045,8 +1088,7 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
 
         if hidden_states.dim() == 3 and req_index < int(hidden_states.shape[0]):
             if int(hidden_states.shape[1]) >= rows:
-                if getattr(req, "return_hidden_states", False):
-                    req.hidden_states.append(hidden_states[req_index, :rows].detach().to("cpu", copy=True))
+                _append_sglang_hidden_state_chunk_with_budget(req, hidden_states[req_index, :rows])
                 return hidden_state_offset + rows
             if getattr(req, "return_hidden_states", False):
                 raise RuntimeError(
@@ -1058,8 +1100,7 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
         end = hidden_state_offset + rows
         has_expected_rows = int(hidden_states.shape[0]) >= expected_rows and end <= int(hidden_states.shape[0])
         if hidden_states.dim() >= 2 and has_expected_rows:
-            if getattr(req, "return_hidden_states", False):
-                req.hidden_states.append(hidden_states[hidden_state_offset:end].detach().to("cpu", copy=True))
+            _append_sglang_hidden_state_chunk_with_budget(req, hidden_states[hidden_state_offset:end])
             return end
 
         if getattr(req, "return_hidden_states", False):
@@ -1072,9 +1113,9 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
     if not getattr(req, "return_hidden_states", False):
         return hidden_state_offset
     if torch.is_tensor(hidden_states):
-        req.hidden_states.append(hidden_states[req_index].detach().to("cpu", copy=True))
+        _append_sglang_hidden_state_chunk_with_budget(req, hidden_states[req_index])
     else:
-        req.hidden_states.append(hidden_states[req_index])
+        _append_sglang_hidden_state_chunk_with_budget(req, hidden_states[req_index])
     return hidden_state_offset
 
 
