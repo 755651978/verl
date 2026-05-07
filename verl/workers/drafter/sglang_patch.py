@@ -57,6 +57,7 @@ _ORIGINAL_SGLANG_DIRECT_RUN_SCHEDULER_PROCESS = None
 _SGLANG_EAGLE_UPDATE_PATCHED = False
 _SGLANG_NPU_EAGLE_SAMPLING_PATCHED = False
 _SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED = False
+_SGLANG_EAGLE_VERIFY_HIDDEN_STATES_PATCHED = False
 _SGLANG_SCHEDULER_PROCESS_PATCHED = False
 _SCHEDULER_PROCESS_PATCH_ATTR = "_verl_patched_scheduler_process"
 _SGLANG_TOP_K_ALL = 1 << 30
@@ -572,7 +573,7 @@ if triton is not None:
         else:
             threshold = final_coin * total
             cumulative = 0.0
-            found = False
+            found = tl.full((), False, tl.int1)
             for block_idx in range(NUM_VOCAB_BLOCKS):
                 token_offsets = block_idx * SUB_BLOCK + vocab_offsets
                 mask = token_offsets < VOCAB_SIZE
@@ -589,7 +590,7 @@ if triton is not None:
                 has_hit = tl.max(hit_values, axis=0) > 0
                 if has_hit & (~found):
                     final_token_id = block_idx * SUB_BLOCK + tl.argmax(hit_values, axis=0)
-                    found = True
+                found = found | has_hit
                 cumulative += tl.sum(probs, axis=0)
 
         tl.store(predicts_ptr + last_accepted_retrive_idx, final_token_id)
@@ -1041,6 +1042,18 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
     accept_lengths = getattr(result, "accept_length_per_req_cpu", None)
     if accept_lengths is not None and req_index < len(accept_lengths) and torch.is_tensor(hidden_states):
         rows = max(int(accept_lengths[req_index]) + 1, 1)
+
+        if hidden_states.dim() == 3 and req_index < int(hidden_states.shape[0]):
+            if int(hidden_states.shape[1]) >= rows:
+                if getattr(req, "return_hidden_states", False):
+                    req.hidden_states.append(hidden_states[req_index, :rows].detach().to("cpu", copy=True))
+                return hidden_state_offset + rows
+            if getattr(req, "return_hidden_states", False):
+                raise RuntimeError(
+                    "SGLang EAGLE verify hidden states are incomplete for accepted tokens: "
+                    f"shape={tuple(hidden_states.shape)}, req_index={req_index}, required_rows={rows}."
+                )
+
         expected_rows = sum(max(int(accept_len) + 1, 1) for accept_len in accept_lengths)
         end = hidden_state_offset + rows
         has_expected_rows = int(hidden_states.shape[0]) >= expected_rows and end <= int(hidden_states.shape[0])
@@ -1049,6 +1062,13 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
                 req.hidden_states.append(hidden_states[hidden_state_offset:end].detach().to("cpu", copy=True))
             return end
 
+        if getattr(req, "return_hidden_states", False):
+            raise RuntimeError(
+                "SGLang EAGLE verify hidden states are incomplete for accepted tokens: "
+                f"shape={tuple(hidden_states.shape)}, req_index={req_index}, "
+                f"offset={hidden_state_offset}, required_rows={rows}, expected_total_rows={expected_rows}."
+            )
+
     if not getattr(req, "return_hidden_states", False):
         return hidden_state_offset
     if torch.is_tensor(hidden_states):
@@ -1056,6 +1076,180 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
     else:
         req.hidden_states.append(hidden_states[req_index])
     return hidden_state_offset
+
+
+def _sglang_batch_requests_hidden_states(batch) -> bool:
+    return any(bool(getattr(req, "return_hidden_states", False)) for req in getattr(batch, "reqs", []) or [])
+
+
+def _ensure_sglang_eagle_verify_full_hidden_mode(batch, spec_info) -> None:
+    if not _sglang_batch_requests_hidden_states(batch):
+        return
+    try:
+        from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Cannot import SGLang CaptureHiddenMode for EAGLE hidden-state patch: %s", exc)
+        return
+    spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
+
+
+def _sglang_hidden_state_rows(hidden_states) -> int:
+    if not torch.is_tensor(hidden_states):
+        try:
+            return len(hidden_states)
+        except TypeError:
+            return 0
+    if hidden_states.dim() == 0:
+        return 1
+    if hidden_states.dim() >= 3:
+        return int(hidden_states.shape[0]) * int(hidden_states.shape[1])
+    return int(hidden_states.shape[0])
+
+
+def _sglang_eagle_verify_expected_hidden_rows(batch, spec_info) -> int:
+    batch_size = len(getattr(batch, "reqs", []) or [])
+    draft_token_num = int(getattr(spec_info, "draft_token_num", 0) or 0)
+    return batch_size * draft_token_num
+
+
+def _sglang_eagle_verify_hidden_states_incomplete(batch, spec_info, logits_output) -> bool:
+    if not _sglang_batch_requests_hidden_states(batch):
+        return False
+    expected_rows = _sglang_eagle_verify_expected_hidden_rows(batch, spec_info)
+    if expected_rows <= 0:
+        return False
+    hidden_states = getattr(logits_output, "hidden_states", None)
+    return hidden_states is None or _sglang_hidden_state_rows(hidden_states) < expected_rows
+
+
+def _rerun_sglang_eagle_verify_without_graph(worker, model_worker_batch):
+    target_worker = getattr(worker, "target_worker", None)
+    model_runner = getattr(target_worker, "model_runner", None)
+    graph_runner = getattr(model_runner, "graph_runner", None)
+    try:
+        if model_runner is not None:
+            model_runner.graph_runner = None
+        return target_worker.forward_batch_generation(model_worker_batch, is_verify=True)
+    finally:
+        if model_runner is not None:
+            model_runner.graph_runner = graph_runner
+
+
+def _validate_sglang_eagle_verify_hidden_states(batch, spec_info, logits_output) -> None:
+    if not _sglang_eagle_verify_hidden_states_incomplete(batch, spec_info, logits_output):
+        return
+    hidden_states = getattr(logits_output, "hidden_states", None)
+    shape = tuple(hidden_states.shape) if torch.is_tensor(hidden_states) else None
+    expected_rows = _sglang_eagle_verify_expected_hidden_rows(batch, spec_info)
+    actual_rows = _sglang_hidden_state_rows(hidden_states)
+    raise RuntimeError(
+        "SGLang EAGLE verify did not return full hidden states for drafter training: "
+        f"actual_rows={actual_rows}, expected_rows={expected_rows}, shape={shape}. "
+        "This would train on partial/incorrect hidden alignment."
+    )
+
+
+def _make_sglang_eagle_verify_full_hidden_patch(original_method):
+    try:
+        source = inspect.getsource(original_method)
+    except (OSError, TypeError):
+        return None
+
+    source = textwrap.dedent(source)
+    patched_source = source
+
+    old_prepare = "        spec_info.prepare_for_verify(batch, self.page_size)\n"
+    new_prepare = (
+        "        spec_info.prepare_for_verify(batch, self.page_size)\n"
+        "        _ensure_sglang_eagle_verify_full_hidden_mode(batch, spec_info)\n"
+    )
+    if old_prepare in patched_source:
+        patched_source = patched_source.replace(old_prepare, new_prepare, 1)
+    else:
+        return None
+
+    old_forward = """        # Forward
+        batch_result = self.target_worker.forward_batch_generation(
+            model_worker_batch, is_verify=True
+        )
+        logits_output, can_run_cuda_graph = (
+            batch_result.logits_output,
+            batch_result.can_run_cuda_graph,
+        )
+"""
+    new_forward = """        # Forward
+        batch_result = self.target_worker.forward_batch_generation(
+            model_worker_batch, is_verify=True
+        )
+        logits_output, can_run_cuda_graph = (
+            batch_result.logits_output,
+            batch_result.can_run_cuda_graph,
+        )
+        if _sglang_eagle_verify_hidden_states_incomplete(batch, spec_info, logits_output):
+            logger.warning(
+                "SGLang EAGLE verify returned incomplete hidden states; rerunning without graph for full hidden output."
+            )
+            batch_result = _rerun_sglang_eagle_verify_without_graph(self, model_worker_batch)
+            logits_output, can_run_cuda_graph = (
+                batch_result.logits_output,
+                batch_result.can_run_cuda_graph,
+            )
+        _validate_sglang_eagle_verify_hidden_states(batch, spec_info, logits_output)
+"""
+    if old_forward in patched_source:
+        patched_source = patched_source.replace(old_forward, new_forward, 1)
+    else:
+        return None
+
+    globals_dict = original_method.__globals__
+    globals_dict["logger"] = logger
+    globals_dict["_ensure_sglang_eagle_verify_full_hidden_mode"] = _ensure_sglang_eagle_verify_full_hidden_mode
+    globals_dict["_sglang_eagle_verify_hidden_states_incomplete"] = _sglang_eagle_verify_hidden_states_incomplete
+    globals_dict["_rerun_sglang_eagle_verify_without_graph"] = _rerun_sglang_eagle_verify_without_graph
+    globals_dict["_validate_sglang_eagle_verify_hidden_states"] = _validate_sglang_eagle_verify_hidden_states
+    namespace = {}
+    exec(  # noqa: S102
+        "from __future__ import annotations\n" + patched_source,
+        globals_dict,
+        namespace,
+    )
+    patched_method = namespace[original_method.__name__]
+    patched_method = wraps(original_method)(patched_method)
+    patched_method._verl_patched_eagle_verify_full_hidden_states = True
+    return patched_method
+
+
+def patch_sglang_eagle_verify_hidden_states_full() -> None:
+    """Force SGLang EAGLE v1 verify to return full per-token hidden states."""
+    global _SGLANG_EAGLE_VERIFY_HIDDEN_STATES_PATCHED
+    if _SGLANG_EAGLE_VERIFY_HIDDEN_STATES_PATCHED:
+        return
+
+    targets = (
+        ("sglang.srt.speculative.eagle_worker", "EAGLEWorker"),
+        ("sglang.srt.speculative.multi_layer_eagle_worker", "MultiLayerEagleWorker"),
+    )
+    patched_targets = []
+    for module_name, class_name in targets:
+        try:
+            module = importlib.import_module(module_name)
+            worker_cls = getattr(module, class_name)
+            original_method = getattr(worker_cls, "verify", None)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Skip SGLang EAGLE full hidden-state patch for %s.%s: %s", module_name, class_name, exc)
+            continue
+        if original_method is None or getattr(original_method, "_verl_patched_eagle_verify_full_hidden_states", False):
+            continue
+        patched_method = _make_sglang_eagle_verify_full_hidden_patch(original_method)
+        if patched_method is None:
+            logger.debug("Skip SGLang EAGLE full hidden-state patch for %s.%s", module_name, class_name)
+            continue
+        setattr(worker_cls, "verify", patched_method)
+        patched_targets.append(f"{module_name}.{class_name}.verify")
+
+    if patched_targets:
+        _SGLANG_EAGLE_VERIFY_HIDDEN_STATES_PATCHED = True
+        logger.info("Patched SGLang EAGLE verify full hidden states for %s", ", ".join(patched_targets))
 
 
 def _make_sglang_hidden_states_tensor_output_patch(original_method):
@@ -1118,6 +1312,7 @@ def _make_sglang_hidden_states_tensor_output_patch(original_method):
 def patch_sglang_hidden_states_tensor_output() -> None:
     """Return SGLang hidden-state chunks as CPU tensors instead of Python lists."""
     global _SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED
+    patch_sglang_eagle_verify_hidden_states_full()
     if _SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED:
         return
 
