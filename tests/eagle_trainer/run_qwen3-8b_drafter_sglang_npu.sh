@@ -10,7 +10,9 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
 export HCCL_OP_EXPANSION_MOD=AIV
 
-project_name='verl_grpo_example_gsm8k_drafter'
+export VERL_SGLANG_PATCHES=eagle_update_weights,hidden_states_tensor_ouput,npu_eagle_target_sampling
+
+project_name='verl_grpo_example_dapo_drafter'
 exp_name='qwen3_8b_function_rm_drafter'
 
 gen_tp=2
@@ -67,6 +69,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.drafter.rollout.spec_steps=3 \
     actor_rollout_ref.rollout.drafter.rollout.spec_topk=1 \
     actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens=4 \
+    actor_rollout_ref.rollout.drafter.training.collect_interval_steps=10 \
+    actor_rollout_ref.rollout.drafter.training.training_interval_steps=10 \
     actor_rollout_ref.rollout.load_format="auto" \
     actor_rollout_ref.actor.strategy=fsdp2 \
     algorithm.use_kl_in_reward=False \
