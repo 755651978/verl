@@ -209,6 +209,22 @@ def _expected_full_hidden_rows(prompt_len: int, output_len: int) -> int:
     return max(int(prompt_len) + int(output_len) - 1, 0)
 
 
+def _expected_collected_hidden_rows(
+    prompt_len: int,
+    output_len: int,
+    front_tokens: Optional[int],
+    tail_tokens: Optional[int],
+) -> int:
+    expected_full_rows = _expected_full_hidden_rows(prompt_len, output_len)
+    if front_tokens is not None:
+        train_window_start = max(int(prompt_len) - 1, 0)
+        available_train_rows = max(expected_full_rows - train_window_start, 0)
+        return min(available_train_rows, int(front_tokens))
+    if tail_tokens is not None:
+        return min(expected_full_rows, int(tail_tokens))
+    return expected_full_rows
+
+
 def _positive_int_or_none(value: Any) -> Optional[int]:
     if value is None:
         return None
@@ -878,10 +894,18 @@ class SGLangHttpServer:
         collection_global_steps = request_global_steps if request_global_steps is not None else self.global_steps
         collect_interval = max(1, int(self.config.drafter.training.collect_interval_steps))
         collect_this_step = collection_global_steps is None or (collection_global_steps % collect_interval == 0)
-        estimated_hidden_rows = _expected_full_hidden_rows(len(prompt_ids), max_new_tokens)
         training_cfg = self.config.drafter.training
         front_hidden_tokens = _positive_int_or_none(
             getattr(training_cfg, "hidden_state_front_tokens_per_sample", 2000)
+        )
+        max_hidden_tokens = _positive_int_or_none(
+            getattr(training_cfg, "hidden_state_max_tokens_per_sample", None)
+        )
+        estimated_hidden_rows = _expected_collected_hidden_rows(
+            len(prompt_ids),
+            max_new_tokens,
+            front_hidden_tokens,
+            max_hidden_tokens,
         )
         if (
             self.config.drafter.enable
@@ -1013,9 +1037,6 @@ class SGLangHttpServer:
                     hidden_complete = True
                 else:
                     hidden_complete = hidden_raw_len >= expected_hidden_rows
-                    max_hidden_tokens = _positive_int_or_none(
-                        getattr(training_cfg, "hidden_state_max_tokens_per_sample", None)
-                    )
                     (
                         hidden_states,
                         hidden_position_start,

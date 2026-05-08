@@ -991,13 +991,15 @@ class DrafterBaseTrainer:
 
         current_step = int(self.current_rl_step)
 
+        min_items_for_batch = 1
+
         # Determine data source: DataBuffer (cross-step) or collected_data (current step only)
         if self.use_data_buffer and len(self.data_buffer) > 0:
             # Use data from last N RL steps via DataBuffer
             buffer_steps = int(self.config.rollout.drafter.training.get("sample_last_n_steps", buffer_steps))
             available_data = self.data_buffer.get_data_from_last_n_steps(buffer_steps)
             if len(available_data) < effective_batch_size:
-                if 0 < len(available_data) >= min(2, effective_batch_size // 2):
+                if len(available_data) >= min_items_for_batch:
                     items = available_data
                 else:
                     return None
@@ -1012,7 +1014,7 @@ class DrafterBaseTrainer:
                 item for item in self.collected_data if int(item.get("step", current_step)) == current_step
             ]
             if len(current_step_data) < effective_batch_size:
-                if 0 < len(current_step_data) >= min(2, effective_batch_size // 2):
+                if len(current_step_data) >= min_items_for_batch:
                     items = current_step_data
                 else:
                     return None
@@ -1027,10 +1029,10 @@ class DrafterBaseTrainer:
         if len(items) == 0:
             logger.warning(f"[Rank {self.rank}] No items with hidden_states found, cannot prepare batch")
             return None
-        elif len(items) < min(2, effective_batch_size // 2):
+        elif len(items) < min_items_for_batch:
             logger.warning(
                 f"[Rank {self.rank}] Only {len(items)} items with hidden_states found "
-                f"(need at least {min(2, effective_batch_size // 2)}), cannot prepare batch"
+                f"(need at least {min_items_for_batch}), cannot prepare batch"
             )
             return None
 
