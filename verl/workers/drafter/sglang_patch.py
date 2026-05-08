@@ -621,13 +621,12 @@ if triton is not None:
         uniform_samples_ptr,
         uniform_samples_for_final_sampling_ptr,
         target_probs_ptr,
+        vocab_size,
         threshold_single,
         threshold_acc,
         NUM_DRAFT_TOKENS: tl.constexpr,
         NUM_SPECULATIVE_TOKENS: tl.constexpr,
-        VOCAB_SIZE: tl.constexpr,
         SUB_BLOCK: tl.constexpr,
-        NUM_VOCAB_BLOCKS: tl.constexpr,
         SPEC_BLOCK: tl.constexpr,
     ):
         req_idx = tl.program_id(0)
@@ -659,7 +658,7 @@ if triton is not None:
             safe_next_idx = tl.maximum(next_idx, 0)
             draft_token_id = tl.load(candidates_ptr + row_base + safe_next_idx).to(tl.int64)
             target_prob_single = tl.load(
-                target_probs_ptr + (row_base + cur_prob_idx) * VOCAB_SIZE + draft_token_id,
+                target_probs_ptr + (row_base + cur_prob_idx) * vocab_size + draft_token_id,
                 mask=valid,
                 other=0.0,
             ).to(tl.float32)
@@ -689,13 +688,14 @@ if triton is not None:
 
         tl.store(accept_token_num_ptr + req_idx, accepted_count)
 
-        final_row_base = (row_base + cur_prob_idx) * VOCAB_SIZE
+        final_row_base = (row_base + cur_prob_idx) * vocab_size
         need_residual = (accepted_count != (NUM_SPECULATIVE_TOKENS - 1)) & (residual_token_id >= 0)
+        num_vocab_blocks = (vocab_size + SUB_BLOCK - 1) // SUB_BLOCK
         total = 0.0
         vocab_offsets = tl.arange(0, SUB_BLOCK)
-        for block_idx in range(NUM_VOCAB_BLOCKS):
+        for block_idx in range(num_vocab_blocks):
             token_offsets = block_idx * SUB_BLOCK + vocab_offsets
-            mask = token_offsets < VOCAB_SIZE
+            mask = token_offsets < vocab_size
             probs = tl.load(target_probs_ptr + final_row_base + token_offsets, mask=mask, other=0.0).to(tl.float32)
             if need_residual:
                 probs = tl.where(
@@ -706,16 +706,16 @@ if triton is not None:
             total += tl.sum(probs, axis=0)
 
         final_coin = tl.load(uniform_samples_for_final_sampling_ptr + req_idx).to(tl.float32)
-        final_token_id = VOCAB_SIZE - 1
+        final_token_id = vocab_size - 1
         if total <= 0.0:
-            final_token_id = tl.minimum((final_coin * VOCAB_SIZE).to(tl.int64), VOCAB_SIZE - 1)
+            final_token_id = tl.minimum((final_coin * vocab_size).to(tl.int64), (vocab_size - 1).to(tl.int64))
         else:
             threshold = final_coin * total
             cumulative = 0.0
             found = tl.full((), False, tl.int1)
-            for block_idx in range(NUM_VOCAB_BLOCKS):
+            for block_idx in range(num_vocab_blocks):
                 token_offsets = block_idx * SUB_BLOCK + vocab_offsets
-                mask = token_offsets < VOCAB_SIZE
+                mask = token_offsets < vocab_size
                 probs = tl.load(target_probs_ptr + final_row_base + token_offsets, mask=mask, other=0.0).to(tl.float32)
                 if need_residual:
                     probs = tl.where(
@@ -865,13 +865,12 @@ def _try_tree_speculative_sampling_target_only_linear_triton(
             uniform_samples_for_sampling,
             final_uniform_samples_for_sampling,
             target_probs_for_sampling,
+            kernel_meta["vocab_size"],
             float(threshold_single),
             max(float(threshold_acc), 1.0e-9),
             NUM_DRAFT_TOKENS=kernel_meta["num_draft_tokens"],
             NUM_SPECULATIVE_TOKENS=kernel_meta["num_speculative_tokens"],
-            VOCAB_SIZE=kernel_meta["vocab_size"],
             SUB_BLOCK=kernel_meta["sub_block"],
-            NUM_VOCAB_BLOCKS=kernel_meta["num_vocab_blocks"],
             SPEC_BLOCK=kernel_meta["spec_block"],
         )
         return True
