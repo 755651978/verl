@@ -1572,7 +1572,10 @@ _SGLANG_PREFILL_HIDDEN_STATES_APPEND_PATTERN = re.compile(
     r"(?P=indent)[ \t]+\)\r?\n",
 )
 _SGLANG_STREAM_HIDDEN_STATES_PATTERN = re.compile(
-    r"(?m)^(?P<indent>[ \t]+)if\s+req\.return_hidden_states\s*:\r?$",
+    r"(?ms)^(?P<indent>[ \t]+)if\s+req\.return_hidden_states\s*:\r?\n"
+    r"(?P=indent)[ \t]+if\s+output_hidden_states\s+is\s+None\s*:\r?\n"
+    r"(?P=indent)[ \t]+[ \t]+output_hidden_states\s*=\s*\[\]\r?\n"
+    r"(?P=indent)[ \t]+output_hidden_states\.append\(req\.hidden_states\)\r?\n",
 )
 
 
@@ -1614,6 +1617,18 @@ def _render_sglang_prefill_hidden_states_append(match: re.Match) -> str:
     )
 
 
+def _render_sglang_stream_hidden_states(match: re.Match) -> str:
+    indent = match.group("indent")
+    return (
+        f"{indent}if _sglang_req_should_stream_hidden_states(req):\n"
+        f"{indent}    if output_hidden_states is None:\n"
+        f"{indent}        output_hidden_states = [[] for _ in range(len(rids) - 1)]\n"
+        f"{indent}    output_hidden_states.append(req.hidden_states)\n"
+        f"{indent}elif output_hidden_states is not None:\n"
+        f"{indent}    output_hidden_states.append([])\n"
+    )
+
+
 def _insert_sglang_decode_hidden_state_offset(source: str) -> str | None:
     if re.search(r"(?m)^[ \t]+hidden_state_offset = 0\s*$", source):
         return source
@@ -1652,7 +1667,7 @@ def _patch_sglang_prefill_hidden_states_source(source: str) -> str | None:
 
 def _patch_sglang_stream_hidden_states_source(source: str) -> str | None:
     patched_source, hidden_stream_count = _SGLANG_STREAM_HIDDEN_STATES_PATTERN.subn(
-        lambda match: f"{match.group('indent')}if _sglang_req_should_stream_hidden_states(req):",
+        _render_sglang_stream_hidden_states,
         source,
         count=1,
     )
