@@ -83,6 +83,7 @@ _VERL_HIDDEN_STATE_FRONT_TOKENS_PARAM = "_verl_hidden_state_front_tokens_per_sam
 _VERL_HIDDEN_STATE_MAX_ROWS_PARAM = "_verl_hidden_state_max_rows"
 _VERL_HIDDEN_STATE_PROMPT_LEN_PARAM = "_verl_prompt_len"
 _VERL_HIDDEN_STATE_METADATA_MARKER = "__verl_hidden_state_metadata__"
+_VERL_HIDDEN_STATES_STREAM_FINAL_ATTR = "_verl_hidden_states_stream_final"
 
 
 def configure_sglang_eagle_weight_update_patch(
@@ -1158,12 +1159,36 @@ def _append_sglang_hidden_chunk_payload(req, chunk, metadata: dict[str, int] | N
     return appended_rows
 
 
+def _mark_sglang_hidden_states_stream_final(req) -> None:
+    setattr(req, _VERL_HIDDEN_STATES_STREAM_FINAL_ATTR, True)
+
+
+def _refresh_sglang_batch_return_hidden_states(batch) -> None:
+    if batch is not None:
+        setattr(batch, "return_hidden_states", _sglang_batch_requests_hidden_states(batch))
+
+
+def _finish_sglang_hidden_state_capture(req, batch=None) -> None:
+    req.return_hidden_states = False
+    _refresh_sglang_batch_return_hidden_states(batch)
+
+
+def _sglang_req_should_stream_hidden_states(req) -> bool:
+    if getattr(req, _VERL_HIDDEN_STATES_STREAM_FINAL_ATTR, False):
+        try:
+            return bool(req.finished())
+        except Exception:  # noqa: BLE001
+            return False
+    return bool(getattr(req, "return_hidden_states", False))
+
+
 def _append_sglang_hidden_state_chunk_with_budget(
     req,
     chunk,
     *,
     position_start: int | None = None,
     prefix_cache_rows: int | None = None,
+    batch=None,
 ) -> None:
     if not getattr(req, "return_hidden_states", False):
         return
@@ -1185,6 +1210,7 @@ def _append_sglang_hidden_state_chunk_with_budget(
 
     window_config = _sglang_hidden_window_config(req)
     if window_config is not None:
+        _mark_sglang_hidden_states_stream_final(req)
         if getattr(req, "_verl_hidden_state_window_done", False):
             return
         window_start = window_config["window_start"]
@@ -1194,6 +1220,7 @@ def _append_sglang_hidden_state_chunk_with_budget(
         if clipped_start >= clipped_end:
             if position_end >= window_end:
                 setattr(req, "_verl_hidden_state_window_done", True)
+                _finish_sglang_hidden_state_capture(req, batch)
             return
 
         local_start = clipped_start - position_start
@@ -1212,6 +1239,7 @@ def _append_sglang_hidden_state_chunk_with_budget(
         )
         if clipped_end >= window_end:
             setattr(req, "_verl_hidden_state_window_done", True)
+            _finish_sglang_hidden_state_capture(req, batch)
         return
 
     if getattr(req, "_verl_hidden_state_budget_done", False):
@@ -1226,9 +1254,11 @@ def _append_sglang_hidden_state_chunk_with_budget(
 
     collected_rows = int(getattr(req, "_verl_hidden_state_rows", 0) or 0)
     if max_rows is not None and max_rows > 0:
+        _mark_sglang_hidden_states_stream_final(req)
         remaining_rows = max_rows - collected_rows
         if remaining_rows <= 0:
             setattr(req, "_verl_hidden_state_budget_done", True)
+            _finish_sglang_hidden_state_capture(req, batch)
             return
         if _is_torch_tensor(chunk) and chunk.dim() > 0 and int(chunk.shape[0]) > remaining_rows:
             chunk = chunk[:remaining_rows]
@@ -1244,9 +1274,10 @@ def _append_sglang_hidden_state_chunk_with_budget(
     setattr(req, "_verl_hidden_state_rows", collected_rows)
     if max_rows is not None and max_rows > 0 and collected_rows >= max_rows:
         setattr(req, "_verl_hidden_state_budget_done", True)
+        _finish_sglang_hidden_state_capture(req, batch)
 
 
-def _append_sglang_prefill_hidden_states(req, logits_output, hidden_state_offset: int, extend_input_len: int) -> int:
+def _append_sglang_prefill_hidden_states(req, logits_output, hidden_state_offset: int, extend_input_len: int, batch=None) -> int:
     hidden_states = getattr(logits_output, "hidden_states", None)
     if hidden_states is None:
         return hidden_state_offset
@@ -1267,11 +1298,12 @@ def _append_sglang_prefill_hidden_states(req, logits_output, hidden_state_offset
         chunk,
         position_start=prefix_cache_rows,
         prefix_cache_rows=prefix_cache_rows,
+        batch=batch,
     )
     return end
 
 
-def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: int, hidden_state_offset: int) -> int:
+def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: int, hidden_state_offset: int, batch=None) -> int:
     hidden_states = getattr(logits_output, "hidden_states", None)
     if hidden_states is None:
         return hidden_state_offset
@@ -1292,6 +1324,7 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
                     req,
                     hidden_states[req_index, :rows],
                     position_start=position_start,
+                    batch=batch,
                 )
                 return hidden_state_offset + rows
             if getattr(req, "return_hidden_states", False):
@@ -1308,6 +1341,7 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
                 req,
                 hidden_states[hidden_state_offset:end],
                 position_start=position_start,
+                batch=batch,
             )
             return end
 
@@ -1329,12 +1363,14 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
             req,
             hidden_states[req_index],
             position_start=position_start,
+            batch=batch,
         )
     else:
         _append_sglang_hidden_state_chunk_with_budget(
             req,
             hidden_states[req_index],
             position_start=position_start,
+            batch=batch,
         )
     return hidden_state_offset
 
@@ -1535,6 +1571,9 @@ _SGLANG_PREFILL_HIDDEN_STATES_APPEND_PATTERN = re.compile(
     r"(?:\.detach\(\)\.to\(\"cpu\",\s*copy=True\)|\.cpu\(\)\s*\.clone\(\)\s*\.tolist\(\))\r?\n"
     r"(?P=indent)[ \t]+\)\r?\n",
 )
+_SGLANG_STREAM_HIDDEN_STATES_PATTERN = re.compile(
+    r"(?m)^(?P<indent>[ \t]+)if\s+req\.return_hidden_states\s*:\r?$",
+)
 
 
 def _replace_sglang_hidden_states_list_output(source: str) -> tuple[str, int]:
@@ -1553,6 +1592,7 @@ def _render_sglang_decode_hidden_states_append(match: re.Match) -> str:
         f"{indent}    result,\n"
         f"{indent}    i,\n"
         f"{indent}    hidden_state_offset,\n"
+        f"{indent}    batch,\n"
         f"{indent})\n"
     )
 
@@ -1569,6 +1609,7 @@ def _render_sglang_prefill_hidden_states_append(match: re.Match) -> str:
         f"{indent}        if extend_input_len_per_req is not None\n"
         f"{indent}        else len(req.origin_input_ids)\n"
         f"{indent}    ),\n"
+        f"{indent}    batch,\n"
         f"{indent})\n"
     )
 
@@ -1609,6 +1650,17 @@ def _patch_sglang_prefill_hidden_states_source(source: str) -> str | None:
     return patched_source
 
 
+def _patch_sglang_stream_hidden_states_source(source: str) -> str | None:
+    patched_source, hidden_stream_count = _SGLANG_STREAM_HIDDEN_STATES_PATTERN.subn(
+        lambda match: f"{match.group('indent')}if _sglang_req_should_stream_hidden_states(req):",
+        source,
+        count=1,
+    )
+    if hidden_stream_count <= 0:
+        return None
+    return patched_source
+
+
 def _make_sglang_hidden_states_tensor_output_patch(original_method):
     """Patch SGLang output processors to keep hidden-state chunks as CPU tensors.
 
@@ -1643,6 +1695,15 @@ def _make_sglang_hidden_states_tensor_output_patch(original_method):
             )
             return None
         patched_source = patched_decode_source
+    elif original_method.__name__ == "stream_output_generation":
+        patched_stream_source = _patch_sglang_stream_hidden_states_source(patched_source)
+        if patched_stream_source is None:
+            logger.warning(
+                "Skip SGLang stream hidden-state final-output patch for %s: hidden stream block not found.",
+                original_method.__name__,
+            )
+            return None
+        patched_source = patched_stream_source
     elif conversion_count <= 0:
         return None
 
@@ -1652,6 +1713,7 @@ def _make_sglang_hidden_states_tensor_output_patch(original_method):
     globals_dict = original_method.__globals__
     globals_dict["_append_sglang_prefill_hidden_states"] = _append_sglang_prefill_hidden_states
     globals_dict["_append_sglang_decode_hidden_states"] = _append_sglang_decode_hidden_states
+    globals_dict["_sglang_req_should_stream_hidden_states"] = _sglang_req_should_stream_hidden_states
     namespace = {}
     exec(  # noqa: S102
         "from __future__ import annotations\n" + patched_source,
@@ -1680,7 +1742,7 @@ def patch_sglang_hidden_states_tensor_output() -> None:
 
     patched_methods = []
     active_methods = []
-    for method_name in ("process_batch_result_prefill", "process_batch_result_decode"):
+    for method_name in ("process_batch_result_prefill", "process_batch_result_decode", "stream_output_generation"):
         original_method = getattr(processor_cls, method_name, None)
         if original_method is None or getattr(
             original_method,
@@ -1700,7 +1762,7 @@ def patch_sglang_hidden_states_tensor_output() -> None:
         patched_methods.append(method_name)
         active_methods.append(method_name)
 
-    required_methods = {"process_batch_result_prefill", "process_batch_result_decode"}
+    required_methods = {"process_batch_result_prefill", "process_batch_result_decode", "stream_output_generation"}
     missing_methods = sorted(required_methods.difference(active_methods))
     if missing_methods:
         raise RuntimeError(
