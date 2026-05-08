@@ -46,6 +46,7 @@ _EAGLE_V1_TARGET_SAMPLING_ENV = "VERL_SGLANG_NPU_EAGLE_V1_TARGET_SAMPLING"
 _EAGLE_V1_VERIFY_MODE_ENV = "VERL_SGLANG_NPU_EAGLE_V1_VERIFY_MODE"
 _EAGLE_FORCE_FP32_SAMPLING_ENV = "VERL_SGLANG_NPU_EAGLE_FORCE_FP32_SAMPLING"
 _EAGLE_LINEAR_TRITON_ENV = "VERL_SGLANG_NPU_EAGLE_LINEAR_TRITON"
+_EAGLE_LINEAR_TRITON_DEBUG_ENV = "VERL_SGLANG_NPU_EAGLE_LINEAR_TRITON_DEBUG"
 _EAGLE_TOP_K_RENORM_FAST_PATH_ENV = "VERL_SGLANG_NPU_EAGLE_TOP_K_RENORM_FAST_PATH"
 _DISABLE_SGLANG_PATCH_ENV = "VERL_DISABLE_SGLANG_PATCH"
 _SGLANG_PATCHES_ENV = "VERL_SGLANG_PATCHES"
@@ -274,15 +275,130 @@ def _sglang_npu_eagle_linear_triton_enabled() -> bool:
     return _env_flag_enabled(_EAGLE_LINEAR_TRITON_ENV, default=True)
 
 
-def _triton_ascend_available() -> bool:
-    if not (_HAS_TRITON and _is_sglang_npu_backend()):
-        return False
+def _sglang_npu_eagle_linear_triton_debug_enabled() -> bool:
+    return _env_flag_enabled(_EAGLE_LINEAR_TRITON_DEBUG_ENV, default=False)
+
+
+def _debug_sglang_npu_eagle_linear_triton(reason: str, **details: Any) -> None:
+    if not _sglang_npu_eagle_linear_triton_debug_enabled():
+        return
+    logger.warning("SGLang NPU EAGLE linear Triton skip: %s details=%s", reason, details)
+
+
+def _tensor_debug_summary(tensor: torch.Tensor) -> dict[str, Any]:
+    return {
+        "shape": tuple(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "device": str(tensor.device),
+        "contiguous": tensor.is_contiguous(),
+    }
+
+
+def _triton_property_int(properties: dict[str, Any], *keys: str) -> int | None:
+    for key in keys:
+        if key not in properties:
+            continue
+        try:
+            return int(properties[key])
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _triton_ascend_backend_module_available() -> bool:
     try:
-        properties = triton.runtime.driver.active.utils.get_device_properties(torch.npu.current_device())
+        return importlib.util.find_spec("triton.backends.ascend") is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _triton_ascend_available() -> bool:
+    if not _HAS_TRITON:
+        _debug_sglang_npu_eagle_linear_triton("triton_import_unavailable")
+        return False
+    if not _is_sglang_npu_backend():
+        _debug_sglang_npu_eagle_linear_triton("sglang_backend_not_npu")
+        return False
+
+    try:
+        active_driver = triton.runtime.driver.active
     except Exception as exc:  # noqa: BLE001
+        _debug_sglang_npu_eagle_linear_triton(
+            "triton_active_driver_unavailable",
+            error=repr(exc),
+        )
+        return False
+
+    target_backend = None
+    try:
+        target = active_driver.get_current_target()
+        target_backend = getattr(target, "backend", None)
+    except Exception as exc:  # noqa: BLE001
+        _debug_sglang_npu_eagle_linear_triton(
+            "triton_target_unavailable",
+            error=repr(exc),
+        )
+    if target_backend is not None and target_backend != "npu":
+        _debug_sglang_npu_eagle_linear_triton(
+            "triton_target_not_npu",
+            target_backend=target_backend,
+        )
+        return False
+
+    try:
+        if hasattr(active_driver, "get_current_device"):
+            device = active_driver.get_current_device()
+        else:
+            device = torch.npu.current_device()
+        properties = active_driver.utils.get_device_properties(device)
+    except Exception as exc:  # noqa: BLE001
+        has_ascend_backend = _triton_ascend_backend_module_available()
+        _debug_sglang_npu_eagle_linear_triton(
+            "triton_device_properties_unavailable",
+            error=repr(exc),
+            target_backend=target_backend,
+            has_ascend_backend=has_ascend_backend,
+        )
         logger.debug("Triton Ascend device properties are unavailable: %s", exc)
         return False
-    return int(properties.get("num_aicore", -1)) > 0 and int(properties.get("num_vectorcore", -1)) > 0
+
+    if not isinstance(properties, dict):
+        _debug_sglang_npu_eagle_linear_triton(
+            "triton_device_properties_invalid",
+            properties_type=type(properties).__name__,
+        )
+        return False
+
+    aicore = _triton_property_int(
+        properties,
+        "num_aicore",
+        "num_ai_core",
+        "num_aic",
+        "aicore_num",
+        "ai_core_num",
+    )
+    vectorcore = _triton_property_int(
+        properties,
+        "num_vectorcore",
+        "num_vector_core",
+        "vectorcore_num",
+        "vector_core_num",
+    )
+    if aicore is not None or vectorcore is not None:
+        available = (aicore or 0) > 0 or (vectorcore or 0) > 0
+        if not available:
+            _debug_sglang_npu_eagle_linear_triton(
+                "triton_core_count_unavailable",
+                aicore=aicore,
+                vectorcore=vectorcore,
+                properties=properties,
+            )
+        return available
+
+    # Some Triton Ascend builds expose a non-empty properties dict without the
+    # exact core-count keys above. In NPU mode, prefer trying the kernel and
+    # falling back through the existing exception guard if launch fails.
+    return bool(properties)
 
 
 def _sglang_npu_eagle_top_k_renorm_fast_path_enabled() -> bool:
@@ -619,28 +735,53 @@ def _try_tree_speculative_sampling_target_only_linear_triton(
     threshold_single: float,
     threshold_acc: float,
 ) -> bool:
-    if not (_sglang_npu_eagle_linear_triton_enabled() and _triton_ascend_available()):
+    linear_triton_enabled = _sglang_npu_eagle_linear_triton_enabled()
+    if not linear_triton_enabled:
+        _debug_sglang_npu_eagle_linear_triton("linear_triton_disabled")
+        return False
+
+    triton_ascend_available = _triton_ascend_available()
+    if not triton_ascend_available:
+        _debug_sglang_npu_eagle_linear_triton(
+            "triton_ascend_unavailable",
+        )
         return False
     if _tree_speculative_sampling_target_only_linear_triton_kernel is None:
+        _debug_sglang_npu_eagle_linear_triton("kernel_not_compiled")
         return False
     if target_probs.device.type != "npu":
+        _debug_sglang_npu_eagle_linear_triton(
+            "target_probs_not_npu",
+            target_probs=_tensor_debug_summary(target_probs),
+        )
         return False
     if target_probs.ndim != 3 or candidates.ndim != 2:
-        return False
-    if not all(
-        tensor.is_contiguous()
-        for tensor in (
-            predicts,
-            accept_index,
-            accept_token_num,
-            candidates,
-            retrive_index,
-            retrive_next_token,
-            uniform_samples,
-            uniform_samples_for_final_sampling,
-            target_probs,
+        _debug_sglang_npu_eagle_linear_triton(
+            "unexpected_rank",
+            target_probs=_tensor_debug_summary(target_probs),
+            candidates=_tensor_debug_summary(candidates),
         )
-    ):
+        return False
+
+    input_tensors = {
+        "predicts": predicts,
+        "accept_index": accept_index,
+        "accept_token_num": accept_token_num,
+        "candidates": candidates,
+        "retrive_index": retrive_index,
+        "retrive_next_token": retrive_next_token,
+        "uniform_samples": uniform_samples,
+        "uniform_samples_for_final_sampling": uniform_samples_for_final_sampling,
+        "target_probs": target_probs,
+    }
+    non_contiguous_inputs = [
+        name for name, tensor in input_tensors.items() if not tensor.is_contiguous()
+    ]
+    if non_contiguous_inputs:
+        _debug_sglang_npu_eagle_linear_triton(
+            "non_contiguous_inputs",
+            tensors=non_contiguous_inputs,
+        )
         return False
 
     batch_size, num_draft_tokens = candidates.shape
@@ -653,6 +794,15 @@ def _try_tree_speculative_sampling_target_only_linear_triton(
         or target_probs.shape[:2] != candidates.shape
         or uniform_samples.shape != candidates.shape
     ):
+        _debug_sglang_npu_eagle_linear_triton(
+            "unexpected_shape",
+            batch_size=int(batch_size),
+            num_draft_tokens=int(num_draft_tokens),
+            num_speculative_tokens=int(num_speculative_tokens),
+            target_probs=_tensor_debug_summary(target_probs),
+            candidates=_tensor_debug_summary(candidates),
+            uniform_samples=_tensor_debug_summary(uniform_samples),
+        )
         return False
 
     target_probs_for_sampling = _as_sglang_npu_eagle_sampling_float(target_probs)
@@ -665,6 +815,14 @@ def _try_tree_speculative_sampling_target_only_linear_triton(
         and uniform_samples_for_sampling.is_contiguous()
         and final_uniform_samples_for_sampling.is_contiguous()
     ):
+        _debug_sglang_npu_eagle_linear_triton(
+            "non_contiguous_sampling_inputs",
+            target_probs_for_sampling=_tensor_debug_summary(target_probs_for_sampling),
+            uniform_samples_for_sampling=_tensor_debug_summary(uniform_samples_for_sampling),
+            final_uniform_samples_for_sampling=_tensor_debug_summary(
+                final_uniform_samples_for_sampling
+            ),
+        )
         return False
 
     sub_block = 4096
@@ -690,6 +848,14 @@ def _try_tree_speculative_sampling_target_only_linear_triton(
         )
         return True
     except Exception as exc:  # noqa: BLE001
+        _debug_sglang_npu_eagle_linear_triton(
+            "kernel_launch_failed",
+            error=repr(exc),
+            batch_size=int(batch_size),
+            num_draft_tokens=int(num_draft_tokens),
+            num_speculative_tokens=int(num_speculative_tokens),
+            vocab_size=int(vocab_size),
+        )
         logger.debug("SGLang NPU EAGLE linear target-only Triton kernel failed: %s", exc)
         return False
 
@@ -960,7 +1126,8 @@ def _tree_speculative_sampling_target_only_torch(
     deterministic: bool = True,
 ) -> None:
     # Linear EAGLE trees (for example spec_topk=1) can skip sibling scanning.
-    if not bool(torch.any(retrive_next_sibling >= 0).item()):
+    has_sibling = bool(torch.any(retrive_next_sibling >= 0).item())
+    if not has_sibling:
         if _try_tree_speculative_sampling_target_only_linear_triton(
             predicts=predicts,
             accept_index=accept_index,
@@ -993,6 +1160,10 @@ def _tree_speculative_sampling_target_only_torch(
         )
         return
 
+    _debug_sglang_npu_eagle_linear_triton(
+        "tree_has_sibling",
+        retrive_next_sibling=_tensor_debug_summary(retrive_next_sibling),
+    )
     _tree_speculative_sampling_target_only_vectorized_torch(
         predicts=predicts,
         accept_index=accept_index,
