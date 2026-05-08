@@ -285,6 +285,23 @@ def _debug_sglang_npu_eagle_linear_triton(reason: str, **details: Any) -> None:
     logger.warning("SGLang NPU EAGLE linear Triton skip: %s details=%s", reason, details)
 
 
+def _debug_sglang_npu_eagle_linear_triton_exception(reason: str, exc: Exception, **details: Any) -> None:
+    if not _sglang_npu_eagle_linear_triton_debug_enabled():
+        return
+    details = {
+        **details,
+        "error_type": type(exc).__name__,
+        "error": str(exc),
+        "repr": repr(exc),
+    }
+    logger.warning(
+        "SGLang NPU EAGLE linear Triton exception: %s details=%s",
+        reason,
+        details,
+        exc_info=True,
+    )
+
+
 def _tensor_debug_summary(tensor: torch.Tensor) -> dict[str, Any]:
     return {
         "shape": tuple(tensor.shape),
@@ -323,9 +340,9 @@ def _triton_ascend_available() -> bool:
     try:
         active_driver = triton.runtime.driver.active
     except Exception as exc:  # noqa: BLE001
-        _debug_sglang_npu_eagle_linear_triton(
+        _debug_sglang_npu_eagle_linear_triton_exception(
             "triton_active_driver_unavailable",
-            error=repr(exc),
+            exc,
         )
         return False
 
@@ -334,9 +351,9 @@ def _triton_ascend_available() -> bool:
         target = active_driver.get_current_target()
         target_backend = getattr(target, "backend", None)
     except Exception as exc:  # noqa: BLE001
-        _debug_sglang_npu_eagle_linear_triton(
+        _debug_sglang_npu_eagle_linear_triton_exception(
             "triton_target_unavailable",
-            error=repr(exc),
+            exc,
         )
     if target_backend is not None and target_backend != "npu":
         _debug_sglang_npu_eagle_linear_triton(
@@ -353,9 +370,9 @@ def _triton_ascend_available() -> bool:
         properties = active_driver.utils.get_device_properties(device)
     except Exception as exc:  # noqa: BLE001
         has_ascend_backend = _triton_ascend_backend_module_available()
-        _debug_sglang_npu_eagle_linear_triton(
+        _debug_sglang_npu_eagle_linear_triton_exception(
             "triton_device_properties_unavailable",
-            error=repr(exc),
+            exc,
             target_backend=target_backend,
             has_ascend_backend=has_ascend_backend,
         )
@@ -826,6 +843,17 @@ def _try_tree_speculative_sampling_target_only_linear_triton(
         return False
 
     sub_block = 4096
+    kernel_meta = {
+        "batch_size": int(batch_size),
+        "num_draft_tokens": int(num_draft_tokens),
+        "num_speculative_tokens": int(num_speculative_tokens),
+        "vocab_size": int(vocab_size),
+        "sub_block": int(sub_block),
+        "num_vocab_blocks": (int(vocab_size) + sub_block - 1) // sub_block,
+        "spec_block": _triton_next_power_of_2(num_speculative_tokens),
+        "threshold_single": float(threshold_single),
+        "threshold_acc": float(threshold_acc),
+    }
     try:
         _tree_speculative_sampling_target_only_linear_triton_kernel[(batch_size,)](
             predicts,
@@ -839,22 +867,31 @@ def _try_tree_speculative_sampling_target_only_linear_triton(
             target_probs_for_sampling,
             float(threshold_single),
             max(float(threshold_acc), 1.0e-9),
-            NUM_DRAFT_TOKENS=int(num_draft_tokens),
-            NUM_SPECULATIVE_TOKENS=int(num_speculative_tokens),
-            VOCAB_SIZE=int(vocab_size),
-            SUB_BLOCK=sub_block,
-            NUM_VOCAB_BLOCKS=(int(vocab_size) + sub_block - 1) // sub_block,
-            SPEC_BLOCK=_triton_next_power_of_2(num_speculative_tokens),
+            NUM_DRAFT_TOKENS=kernel_meta["num_draft_tokens"],
+            NUM_SPECULATIVE_TOKENS=kernel_meta["num_speculative_tokens"],
+            VOCAB_SIZE=kernel_meta["vocab_size"],
+            SUB_BLOCK=kernel_meta["sub_block"],
+            NUM_VOCAB_BLOCKS=kernel_meta["num_vocab_blocks"],
+            SPEC_BLOCK=kernel_meta["spec_block"],
         )
         return True
     except Exception as exc:  # noqa: BLE001
-        _debug_sglang_npu_eagle_linear_triton(
+        _debug_sglang_npu_eagle_linear_triton_exception(
             "kernel_launch_failed",
-            error=repr(exc),
-            batch_size=int(batch_size),
-            num_draft_tokens=int(num_draft_tokens),
-            num_speculative_tokens=int(num_speculative_tokens),
-            vocab_size=int(vocab_size),
+            exc,
+            kernel="_tree_speculative_sampling_target_only_linear_triton_kernel",
+            meta=kernel_meta,
+            predicts=_tensor_debug_summary(predicts),
+            accept_index=_tensor_debug_summary(accept_index),
+            accept_token_num=_tensor_debug_summary(accept_token_num),
+            candidates=_tensor_debug_summary(candidates),
+            retrive_index=_tensor_debug_summary(retrive_index),
+            retrive_next_token=_tensor_debug_summary(retrive_next_token),
+            uniform_samples_for_sampling=_tensor_debug_summary(uniform_samples_for_sampling),
+            final_uniform_samples_for_sampling=_tensor_debug_summary(
+                final_uniform_samples_for_sampling
+            ),
+            target_probs_for_sampling=_tensor_debug_summary(target_probs_for_sampling),
         )
         logger.debug("SGLang NPU EAGLE linear target-only Triton kernel failed: %s", exc)
         return False
