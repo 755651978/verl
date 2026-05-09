@@ -642,11 +642,11 @@ if triton is not None:
         tl.store(accept_token_num_ptr + req_idx, 0)
 
         threshold_acc = tl.maximum(threshold_acc, 1.0e-9)
-        cur_prob_idx = 0
-        accepted_count = 0
-        active = True
-        residual_token_id = -1
-        residual_token_prob = 0.0
+        cur_prob_idx = tl.full((), 0, tl.int64)
+        accepted_count = tl.full((), 0, tl.int32)
+        active = tl.full((), True, tl.int1)
+        residual_token_id = tl.full((), -1, tl.int64)
+        residual_token_prob = tl.full((), 0.0, tl.float32)
 
         last_accepted_retrive_idx = tl.load(retrive_index_ptr + row_base)
         tl.store(accept_index_ptr + accept_index_base, last_accepted_retrive_idx)
@@ -678,20 +678,20 @@ if triton is not None:
                 cur_prob_idx = safe_next_idx
                 last_accepted_retrive_idx = accepted_retrive_idx
                 coin = tl.load(uniform_samples_ptr + row_base + cur_prob_idx).to(tl.float32)
-                residual_token_id = -1
-                residual_token_prob = 0.0
+                residual_token_id = tl.full((), -1, tl.int64)
+                residual_token_prob = tl.full((), 0.0, tl.float32)
             else:
                 if valid:
                     residual_token_id = draft_token_id
                     residual_token_prob = target_prob_single
-                active = False
+                active = tl.full((), False, tl.int1)
 
         tl.store(accept_token_num_ptr + req_idx, accepted_count)
 
         final_row_base = (row_base + cur_prob_idx) * vocab_size
         need_residual = (accepted_count != (NUM_SPECULATIVE_TOKENS - 1)) & (residual_token_id >= 0)
         num_vocab_blocks = (vocab_size + SUB_BLOCK - 1) // SUB_BLOCK
-        total = 0.0
+        total = tl.full((), 0.0, tl.float32)
         vocab_offsets = tl.arange(0, SUB_BLOCK)
         for block_idx in range(num_vocab_blocks):
             token_offsets = block_idx * SUB_BLOCK + vocab_offsets
@@ -706,12 +706,13 @@ if triton is not None:
             total += tl.sum(probs, axis=0)
 
         final_coin = tl.load(uniform_samples_for_final_sampling_ptr + req_idx).to(tl.float32)
-        final_token_id = vocab_size - 1
+        last_vocab_token_id = (vocab_size - 1).to(tl.int64)
+        final_token_id = last_vocab_token_id
         if total <= 0.0:
-            final_token_id = tl.minimum((final_coin * vocab_size).to(tl.int64), (vocab_size - 1).to(tl.int64))
+            final_token_id = tl.minimum((final_coin * vocab_size).to(tl.int64), last_vocab_token_id)
         else:
             threshold = final_coin * total
-            cumulative = 0.0
+            cumulative = tl.full((), 0.0, tl.float32)
             found = tl.full((), False, tl.int1)
             for block_idx in range(num_vocab_blocks):
                 token_offsets = block_idx * SUB_BLOCK + vocab_offsets
@@ -728,7 +729,7 @@ if triton is not None:
                 hit_values = hits.to(tl.int32)
                 has_hit = tl.max(hit_values, axis=0) > 0
                 if has_hit & (~found):
-                    final_token_id = block_idx * SUB_BLOCK + tl.argmax(hit_values, axis=0)
+                    final_token_id = (block_idx * SUB_BLOCK + tl.argmax(hit_values, axis=0)).to(tl.int64)
                 found = found | has_hit
                 cumulative += tl.sum(probs, axis=0)
 
