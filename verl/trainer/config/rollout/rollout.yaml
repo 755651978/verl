@@ -471,6 +471,7 @@ drafter:
     max_seq_len: 8192
     max_epoch: 10
     step: 100
+    batch_size_per_gpu: 4
     training_interval_steps: 8
     sample_last_n_steps: 8
     buffer_capacity_steps: 128

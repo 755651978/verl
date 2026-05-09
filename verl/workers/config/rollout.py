@@ -93,6 +93,7 @@ class DrafterTrainingConfig(BaseConfig):
     max_seq_len: int = 8192
     max_epoch: int = 10
     step: int = 100
+    batch_size_per_gpu: int = 4
     training_interval_steps: int = 8
     sample_last_n_steps: int = 8
     buffer_capacity_steps: int = 128
@@ -126,6 +127,8 @@ class DrafterTrainingConfig(BaseConfig):
             raise ValueError("`hidden_state_max_tokens_per_sample` must be non-negative or null.")
         if self.hidden_state_front_tokens_per_sample is not None and self.hidden_state_front_tokens_per_sample < 0:
             raise ValueError("`hidden_state_front_tokens_per_sample` must be non-negative or null.")
+        if self.batch_size_per_gpu <= 0:
+            raise ValueError("`batch_size_per_gpu` must be positive.")
 
 
 @dataclass

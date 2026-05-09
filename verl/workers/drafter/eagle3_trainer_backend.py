@@ -478,6 +478,10 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
 
         total_local_ploss = torch.tensor(0.0, device=input_ids.device, dtype=torch.float32)
         total_local_tokens = torch.tensor(0.0, device=input_ids.device, dtype=torch.float32)
+        quality_top1_correct = torch.tensor(0.0, device=input_ids.device, dtype=torch.float32)
+        quality_topk_correct = torch.tensor(0.0, device=input_ids.device, dtype=torch.float32)
+        quality_tokens = torch.tensor(0.0, device=input_ids.device, dtype=torch.float32)
+        quality_topk = min(5, int(all_step_logits[0].size(-1)))
         gamma = 0.8
         
         # 预处理
@@ -506,11 +510,38 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
                     "Dropping %s EAGLE3 target positions with non-finite logits or targets",
                     int(dropped_tokens.detach().cpu().item()),
                 )
+            with torch.no_grad():
+                if valid_position.any():
+                    draft_top1 = logits.argmax(dim=-1)
+                    target_top1 = target_p.argmax(dim=-1)
+                    quality_top1_correct += (draft_top1[valid_position] == target_top1[valid_position]).float().sum()
+                    if quality_topk > 1:
+                        draft_topk = logits.topk(quality_topk, dim=-1).indices
+                        quality_topk_correct += (
+                            draft_topk[valid_position] == target_top1[valid_position].unsqueeze(-1)
+                        ).any(dim=-1).float().sum()
+                    else:
+                        quality_topk_correct += (
+                            draft_top1[valid_position] == target_top1[valid_position]
+                        ).float().sum()
+                    quality_tokens += valid_position.float().sum()
             step_loss_sum = per_token_ploss.sum()
             
             # 应用Eagle3的时间步衰减
             total_local_ploss += (gamma ** idx) * step_loss_sum
             total_local_tokens += valid_position.float().sum()
+
+        if quality_tokens.detach().float().item() > 0:
+            logger.warning(
+                "[drafter logits quality] valid_tokens=%s top1_acc=%.6f top%s_acc=%.6f "
+                "local_ploss_sum=%.6f local_tokens=%s",
+                int(quality_tokens.detach().cpu().item()),
+                float((quality_top1_correct / quality_tokens).detach().cpu().item()),
+                quality_topk,
+                float((quality_topk_correct / quality_tokens).detach().cpu().item()),
+                float(total_local_ploss.detach().float().cpu().item()),
+                int(total_local_tokens.detach().cpu().item()),
+            )
 
         return {
             "total_local_vloss": torch.tensor(0.0, device=input_ids.device),

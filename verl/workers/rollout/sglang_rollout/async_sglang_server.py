@@ -932,6 +932,18 @@ class SGLangHttpServer:
                 request.update({"return_logprob": True})
                 request.update({"top_logprobs_num": self.config.drafter.training.logits_topk})
 
+        if self.config.drafter.enable:
+            logger.warning(
+                "[sglang generate] request_id=%s server_global_steps=%s request_global_steps=%s "
+                "should_collect=%s return_hidden_states=%s drafter_training=%s",
+                request_id,
+                self.global_steps,
+                collection_global_steps,
+                should_collect,
+                bool(request.get("return_hidden_states", False)),
+                self.config.drafter.enable_drafter_training,
+            )
+
         generate_request = GenerateReqInput(**request)
 
         # Add lora request

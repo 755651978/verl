@@ -460,6 +460,28 @@ class ServerAdapter(BaseRollout):
         if not self.config.drafter.enable or not weights:
             return
 
+        if self.device_mesh["infer_tp"].get_local_rank() == 0:
+            preview = []
+            for name, tensor in list(weights.items())[:5]:
+                tensor_f = tensor.detach().float()
+                preview.append(
+                    {
+                        "name": name,
+                        "shape": tuple(tensor.shape),
+                        "mean": float(tensor_f.mean().item()),
+                        "std": float(tensor_f.std().item()) if tensor_f.numel() > 1 else 0.0,
+                        "absmax": float(tensor_f.abs().max().item()) if tensor_f.numel() > 0 else 0.0,
+                    }
+                )
+            logger.warning(
+                "[sglang draft update] enter global_steps=%s num_weights=%s "
+                "disable_draft_model=False disable_target_model=True load_format=%s preview=%s",
+                global_steps,
+                len(weights),
+                VERL_SGLANG_DRAFT_WEIGHT_LOADER if _supports_sglang_custom_weight_loader() else None,
+                preview,
+            )
+
         update_weights_bucket_bytes = int(self.config.checkpoint_engine.update_weights_bucket_megabytes) << 20
         pause_for_speculative_update = bool(
             self.config.drafter.enable and not _speculative_weight_sync_guard_disabled()
@@ -471,7 +493,21 @@ class ServerAdapter(BaseRollout):
                 generation_paused = True
                 await self._engine.flush_cache()
 
+            bucket_idx = 0
             async for params_batch in get_named_tensor_buckets(weights.items(), update_weights_bucket_bytes):
+                bucket_idx += 1
+                params_batch = list(params_batch)
+                if self.device_mesh["infer_tp"].get_local_rank() == 0:
+                    bucket_bytes = sum(tensor.numel() * tensor.element_size() for _, tensor in params_batch)
+                    logger.warning(
+                        "[sglang draft update] bucket global_steps=%s bucket=%s num_tensors=%s "
+                        "bytes=%s first_names=%s",
+                        global_steps,
+                        bucket_idx,
+                        len(params_batch),
+                        bucket_bytes,
+                        [name for name, _ in params_batch[:5]],
+                    )
                 await _sgl_update_weights_with_route(
                     engine=self._engine,
                     params_batch=params_batch,
@@ -491,6 +527,12 @@ class ServerAdapter(BaseRollout):
                 await self._engine.flush_cache()
                 if global_steps is not None:
                     await self.server_actor.set_global_steps.remote(global_steps)
+                logger.warning(
+                    "[sglang draft update] done global_steps=%s buckets=%s server_global_steps_set=%s",
+                    global_steps,
+                    bucket_idx,
+                    global_steps is not None,
+                )
         finally:
             if self.device_mesh["infer_tp"].get_local_rank() == 0 and generation_paused:
                 await self._engine.continue_generation()

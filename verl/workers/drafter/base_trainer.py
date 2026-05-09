@@ -987,7 +987,7 @@ class DrafterBaseTrainer:
         Returns:
             Dictionary containing batch tensors for training
         """
-        effective_batch_size = min(self.batch_size, 4)
+        effective_batch_size = self.batch_size
 
         current_step = int(self.current_rl_step)
 
@@ -1016,10 +1016,32 @@ class DrafterBaseTrainer:
             if len(current_step_data) < effective_batch_size:
                 if len(current_step_data) >= min_items_for_batch:
                     items = current_step_data
+                    selected_indices = list(range(len(current_step_data)))
                 else:
                     return None
             else:
-                items = current_step_data[:effective_batch_size]
+                rng = random.Random((current_step << 16) + int(self.training_steps))
+                selected_indices = rng.sample(range(len(current_step_data)), effective_batch_size)
+                items = [current_step_data[idx] for idx in selected_indices]
+            selected_summary = [
+                {
+                    "idx": idx,
+                    "prompt_len": current_step_data[idx].get("_verl_prompt_len"),
+                    "response_len": current_step_data[idx].get("_verl_response_len"),
+                    "hidden_len": current_step_data[idx].get("_verl_hidden_end"),
+                }
+                for idx in selected_indices
+            ]
+            logger.info(
+                "[Rank %s] Drafter sampled current-step batch: rl_step=%s train_step=%s "
+                "available=%s batch=%s selected=%s",
+                self.rank,
+                current_step,
+                self.training_steps + 1,
+                len(current_step_data),
+                len(items),
+                selected_summary,
+            )
         
         # Filter out items without the tensors required by the selected loss path.
         use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))
@@ -1407,7 +1429,7 @@ class DrafterBaseTrainer:
         if batch is None:
             logger.debug(
                 f"[EagleTrainer rank {self.rank}] Not enough data at step {step} "
-                f"(have={len(self.collected_data)} need≥{min(self.batch_size, 4)})"
+                f"(have={len(self.collected_data)} need>={self.batch_size})"
             )
             return False
         
