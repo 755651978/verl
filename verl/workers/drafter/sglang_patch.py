@@ -852,6 +852,7 @@ def _try_tree_speculative_sampling_target_only_linear_triton(
         "sub_block": int(sub_block),
         "num_vocab_blocks": (int(vocab_size) + sub_block - 1) // sub_block,
         "spec_block": _triton_next_power_of_2(num_speculative_tokens),
+        "multibuffer": False,
         "threshold_single": float(threshold_single),
         "threshold_acc": float(threshold_acc),
     }
@@ -873,6 +874,7 @@ def _try_tree_speculative_sampling_target_only_linear_triton(
             NUM_SPECULATIVE_TOKENS=kernel_meta["num_speculative_tokens"],
             SUB_BLOCK=kernel_meta["sub_block"],
             SPEC_BLOCK=kernel_meta["spec_block"],
+            multibuffer=kernel_meta["multibuffer"],
         )
         return True
     except Exception as exc:  # noqa: BLE001
