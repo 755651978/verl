@@ -114,6 +114,12 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
+def _rotary_seq_len_for_position_ids(seq_len: int, position_ids: Optional[torch.Tensor]) -> int:
+    if position_ids is None or position_ids.numel() == 0:
+        return int(seq_len)
+    return max(int(seq_len), int(position_ids.detach().max().item()) + 1)
+
+
 def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section, unsqueeze_dim=1):
     """Applies Rotary Position Embedding with Multimodal Sections to the query and key tensors (https://qwenlm.github.io/blog/qwen2-vl/).
 
@@ -694,7 +700,8 @@ class LlamaAttention(nn.Module):
                     self.config.rope_scaling["mrope_section"],
                 )
             else:
-                cos, sin = self.rotary_emb(query_states, seq_len=q_len)
+                rotary_seq_len = _rotary_seq_len_for_position_ids(q_len, position_ids)
+                cos, sin = self.rotary_emb(query_states, seq_len=rotary_seq_len)
                 cos, sin = cos.to(query_states.device), sin.to(query_states.device)
                 query_states, key_states = apply_rotary_pos_emb(
                     query_states, key_states, cos, sin, position_ids
@@ -725,10 +732,12 @@ class LlamaAttention(nn.Module):
                     self.config.rope_scaling["mrope_section"],
                 )
             else:
-                cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
+                shifted_position_ids = position_ids + lck
+                rotary_seq_len = _rotary_seq_len_for_position_ids(q_len + lck, shifted_position_ids)
+                cos, sin = self.rotary_emb(query_states, seq_len=rotary_seq_len)
                 cos, sin = cos.to(query_states.device), sin.to(query_states.device)
                 query_states, key_states = apply_rotary_pos_emb(
-                    query_states, key_states, cos, sin, position_ids + lck
+                    query_states, key_states, cos, sin, shifted_position_ids
                 )
 
             key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -835,11 +844,13 @@ class LlamaFlexAttention(LlamaAttention):
                 self.config.rope_scaling["mrope_section"],
             )
         else:
-            cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
+            shifted_position_ids = position_ids + lck
+            rotary_seq_len = _rotary_seq_len_for_position_ids(q_len + lck, shifted_position_ids)
+            cos, sin = self.rotary_emb(query_states, seq_len=rotary_seq_len)
             cos, sin = cos.to(query_states.device), sin.to(query_states.device)
             # Keep positions ids aligned when padding so the KV cache is unaffected.
             query_states, key_states = apply_rotary_pos_emb(
-                query_states, key_states, cos, sin, position_ids + lck
+                query_states, key_states, cos, sin, shifted_position_ids
             )
 
         cache_position: torch.Tensor = torch.arange(
@@ -939,10 +950,12 @@ class LlamaFlashAttention(LlamaAttention):
                 unsqueeze_dim=2,
             )
         else:
-            cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
+            shifted_position_ids = position_ids + lck
+            rotary_seq_len = _rotary_seq_len_for_position_ids(q_len + lck, shifted_position_ids)
+            cos, sin = self.rotary_emb(query_states, seq_len=rotary_seq_len)
             cos, sin = cos.to(query_states.device), sin.to(query_states.device)
             query_states, key_states = apply_rotary_pos_emb(
-                query_states, key_states, cos, sin, position_ids + lck, unsqueeze_dim=2
+                query_states, key_states, cos, sin, shifted_position_ids, unsqueeze_dim=2
             )
 
         if cache_hidden is not None:
