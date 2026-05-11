@@ -19,7 +19,6 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
-import logging
 import os
 import uuid
 from collections import defaultdict
@@ -77,7 +76,6 @@ from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_pad
 
 
 _POLICY_MODEL_NON_TENSOR_KEYS = {"multi_modal_inputs", "pad_token_id"}
-logger = logging.getLogger(__name__)
 
 
 def _select_policy_model_batch(batch: DataProto) -> DataProto:
@@ -1752,28 +1750,6 @@ class RayPPOTrainer:
                                     drafter_weights = self._get_published_drafter_weights()
                                     try:
                                         if drafter_weights is not None:
-                                            weight_preview = []
-                                            for name, tensor in list(drafter_weights.items())[:5]:
-                                                tensor_f = tensor.detach().float()
-                                                weight_preview.append(
-                                                    {
-                                                        "name": name,
-                                                        "shape": tuple(tensor.shape),
-                                                        "mean": float(tensor_f.mean().item()),
-                                                        "std": float(tensor_f.std().item())
-                                                        if tensor_f.numel() > 1
-                                                        else 0.0,
-                                                        "absmax": float(tensor_f.abs().max().item())
-                                                        if tensor_f.numel() > 0
-                                                        else 0.0,
-                                                    }
-                                                )
-                                            logger.warning(
-                                                "[drafter publish] step=%s num_weights=%s preview=%s",
-                                                self.global_steps,
-                                                len(drafter_weights),
-                                                weight_preview,
-                                            )
                                             self.actor_rollout_wg.update_draft_weights(
                                                 drafter_weights, global_steps=self.global_steps
                                             )
