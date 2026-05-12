@@ -462,19 +462,17 @@ drafter:
     _target_: verl.workers.config.DrafterTrainingConfig
     collect_hidden_states_from_sgl: false
     use_data_buffer: false
-    collect_interval_steps: 10
+    collect_interval_steps: 5
     collection_sample_rate: 1.0
-    max_collect_samples_per_step_per_replica: 1
+    max_collect_samples_per_step_per_replica: 16
     max_collect_tokens_per_step_per_replica: 8192
     hidden_state_front_tokens_per_sample: 2000
     hidden_state_max_tokens_per_sample: null
     max_seq_len: 8192
-    max_epoch: 10
-    step: 100
+    step: 10
     batch_size_per_gpu: 4
-    training_interval_steps: 8
-    sample_last_n_steps: 8
-    buffer_capacity_steps: 128
+    training_interval_steps: 10
+    sample_last_n_steps: 20
     train_batches_per_cycle: 4
     lr: 1e-6
     lr_warmup_steps: 1000

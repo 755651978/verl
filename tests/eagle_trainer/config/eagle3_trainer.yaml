@@ -159,11 +159,9 @@ actor_rollout_ref:
       collect_interval_steps: 1
       batch_size_per_gpu: 2
       max_seq_len: 8192
-      max_epoch: 10
       step: 100
       training_interval_steps: 10
       sample_last_n_steps: 8
-      buffer_capacity_steps: 128
       train_batches_per_cycle: 4
       lr: 1e-6
       lr_warmup_steps: 1000

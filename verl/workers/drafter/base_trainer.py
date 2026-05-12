@@ -1005,7 +1005,7 @@ class DrafterBaseTrainer:
                     return None
             else:
                 # Randomly sample from available data to ensure diversity
-                rng = random.Random(int(self.current_rl_step))
+                rng = random.Random((int(self.current_rl_step) << 16) + int(self.training_steps))
                 items = rng.sample(available_data, min(len(available_data), effective_batch_size))
         else:
             # Fall back to current step data only. collected_data can contain
@@ -1016,33 +1016,12 @@ class DrafterBaseTrainer:
             if len(current_step_data) < effective_batch_size:
                 if len(current_step_data) >= min_items_for_batch:
                     items = current_step_data
-                    selected_indices = list(range(len(current_step_data)))
                 else:
                     return None
             else:
                 rng = random.Random((current_step << 16) + int(self.training_steps))
-                selected_indices = rng.sample(range(len(current_step_data)), effective_batch_size)
-                items = [current_step_data[idx] for idx in selected_indices]
-            selected_summary = [
-                {
-                    "idx": idx,
-                    "prompt_len": current_step_data[idx].get("_verl_prompt_len"),
-                    "response_len": current_step_data[idx].get("_verl_response_len"),
-                    "hidden_len": current_step_data[idx].get("_verl_hidden_end"),
-                }
-                for idx in selected_indices
-            ]
-            logger.info(
-                "[Rank %s] Drafter sampled current-step batch: rl_step=%s train_step=%s "
-                "available=%s batch=%s selected=%s",
-                self.rank,
-                current_step,
-                self.training_steps + 1,
-                len(current_step_data),
-                len(items),
-                selected_summary,
-            )
-        
+                items = rng.sample(current_step_data, effective_batch_size)
+
         # Filter out items without the tensors required by the selected loss path.
         use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))
         items = [item for item in items if "hidden_states" in item]

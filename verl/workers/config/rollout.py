@@ -84,19 +84,17 @@ class DrafterRolloutConfig(BaseConfig):
 class DrafterTrainingConfig(BaseConfig):
     collect_hidden_states_from_sgl: bool = False
     use_data_buffer: bool = False
-    collect_interval_steps: int = 10
+    collect_interval_steps: int = 5
     collection_sample_rate: float = 1.0
-    max_collect_samples_per_step_per_replica: Optional[int] = 1
+    max_collect_samples_per_step_per_replica: Optional[int] = 16
     max_collect_tokens_per_step_per_replica: Optional[int] = 8192
     hidden_state_front_tokens_per_sample: Optional[int] = 2000
     hidden_state_max_tokens_per_sample: Optional[int] = None
     max_seq_len: int = 8192
-    max_epoch: int = 10
-    step: int = 100
+    step: int = 10
     batch_size_per_gpu: int = 4
-    training_interval_steps: int = 8
-    sample_last_n_steps: int = 8
-    buffer_capacity_steps: int = 128
+    training_interval_steps: int = 10
+    sample_last_n_steps: int = 20
     train_batches_per_cycle: int = 4
     lr: float = 1e-6
     lr_warmup_steps: int =1000
