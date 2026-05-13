@@ -70,6 +70,8 @@ _ALIGNMENT_DEBUG_RANKS_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_RANKS"
 _VERL_DRAFTER_HIDDEN_WINDOW_PARAM = "_verl_drafter_hidden_state_window"
 _VERL_HIDDEN_STATE_FRONT_TOKENS_PARAM = "_verl_hidden_state_front_tokens_per_sample"
 _VERL_HIDDEN_STATE_PROMPT_LEN_PARAM = "_verl_prompt_len"
+_VERL_TOP_LOGPROBS_TENSOR_PARAM = "_verl_top_logprobs_tensor_output"
+_VERL_OUTPUT_TOP_LOGPROBS_TENSOR_KEY = "_verl_output_top_logprobs_tensor"
 
 
 def _env_flag_enabled(name: str, default: bool = False) -> bool:
@@ -342,6 +344,79 @@ def _top_logprobs_to_tensor(top_logprobs: list, topk: int) -> Optional[torch.Ten
     if not rows:
         return None
     return torch.tensor(rows, dtype=torch.float32)
+
+
+def _normalize_output_top_logprobs_tensor(output_top_logprobs: Any, topk: int) -> Optional[torch.Tensor]:
+    if topk <= 0 or output_top_logprobs is None:
+        return None
+
+    if isinstance(output_top_logprobs, dict):
+        values = output_top_logprobs.get("values")
+        indices = output_top_logprobs.get("indices")
+        if values is None or indices is None:
+            return None
+        if not torch.is_tensor(values):
+            values = torch.tensor(values, dtype=torch.float32)
+        else:
+            values = values.detach().cpu().to(dtype=torch.float32)
+        if not torch.is_tensor(indices):
+            indices = torch.tensor(indices, dtype=torch.float32)
+        else:
+            indices = indices.detach().cpu().to(dtype=torch.float32)
+        if values.dim() != 2 or indices.dim() != 2:
+            return None
+        rows = min(values.size(0), indices.size(0))
+        cols = min(values.size(1), indices.size(1), topk)
+        if rows <= 0 or cols <= 0:
+            return None
+        values = values[:rows, :cols]
+        indices = indices[:rows, :cols]
+        tensor = torch.empty((rows, topk, 2), dtype=torch.float32)
+        tensor[..., 0] = float("-inf")
+        tensor[..., 1] = -1.0
+        tensor[:, :cols, 0] = values
+        tensor[:, :cols, 1] = indices
+        return tensor
+
+    if not torch.is_tensor(output_top_logprobs):
+        return None
+
+    tensor = output_top_logprobs.detach().cpu().to(dtype=torch.float32)
+    if tensor.dim() != 3 or tensor.size(-1) < 2:
+        return None
+
+    rows = tensor.size(0)
+    cols = min(tensor.size(1), topk)
+    if rows <= 0 or cols <= 0:
+        return None
+
+    if tensor.size(1) == topk and tensor.size(-1) == 2:
+        return tensor.contiguous()
+
+    normalized = torch.empty((rows, topk, 2), dtype=torch.float32)
+    normalized[..., 0] = float("-inf")
+    normalized[..., 1] = -1.0
+    normalized[:, :cols, :] = tensor[:, :cols, :2]
+    return normalized.contiguous()
+
+
+def _response_aligned_top_logprobs_tensor(
+    prompt_len: int,
+    output_top_logprobs: Any,
+    topk: int,
+) -> Optional[torch.Tensor]:
+    tensor = _normalize_output_top_logprobs_tensor(output_top_logprobs, topk)
+    if tensor is None:
+        return None
+
+    prompt_target_rows = max(int(prompt_len) - 1, 0)
+    if prompt_target_rows <= 0:
+        return tensor
+
+    padding = torch.empty((prompt_target_rows, topk, 2), dtype=tensor.dtype)
+    padding[..., 0] = float("-inf")
+    padding[..., 1] = -1.0
+    return torch.cat((padding, tensor), dim=0).contiguous()
 
 
 def _response_aligned_top_logprobs_to_tensor(
@@ -927,10 +1002,11 @@ class SGLangHttpServer:
             )
             if front_hidden_tokens is not None:
                 custom_params[_VERL_HIDDEN_STATE_FRONT_TOKENS_PARAM] = int(front_hidden_tokens)
-            sampling_params["custom_params"] = custom_params
             if self.config.drafter.training.use_logits:
+                custom_params[_VERL_TOP_LOGPROBS_TENSOR_PARAM] = True
                 request.update({"return_logprob": True})
                 request.update({"top_logprobs_num": self.config.drafter.training.logits_topk})
+            sampling_params["custom_params"] = custom_params
 
         if self.config.drafter.enable:
             logger.warning(
@@ -994,15 +1070,30 @@ class SGLangHttpServer:
         if should_collect:
             target_logprobs = None
             output_top = []
+            output_top_len = None
             output_token_logprobs = output.get("meta_info", {}).get("output_token_logprobs", []) or []
             sampled_token_mismatch = _count_sampled_token_mismatches(output_token_logprobs, list(token_ids))
             if self.config.drafter.training.use_logits:
-                output_top = output.get("meta_info", {}).get("output_top_logprobs", [])
-                target_logprobs = _response_aligned_top_logprobs_to_tensor(
+                logits_topk = int(self.config.drafter.training.logits_topk)
+                output_top_tensor = meta_info.pop(_VERL_OUTPUT_TOP_LOGPROBS_TENSOR_KEY, None)
+                target_logprobs = _response_aligned_top_logprobs_tensor(
                     prompt_len=len(prompt_ids),
-                    output_top_logprobs=output_top,
-                    topk=int(self.config.drafter.training.logits_topk),
+                    output_top_logprobs=output_top_tensor,
+                    topk=logits_topk,
                 )
+                if target_logprobs is not None and output_top_tensor is not None:
+                    output_top_tensor_normalized = _normalize_output_top_logprobs_tensor(output_top_tensor, logits_topk)
+                    output_top_len = (
+                        int(output_top_tensor_normalized.size(0)) if output_top_tensor_normalized is not None else None
+                    )
+                if target_logprobs is None:
+                    output_top = output.get("meta_info", {}).get("output_top_logprobs", [])
+                    output_top_len = len(output_top) if output_top else None
+                    target_logprobs = _response_aligned_top_logprobs_to_tensor(
+                        prompt_len=len(prompt_ids),
+                        output_top_logprobs=output_top,
+                        topk=logits_topk,
+                    )
                 if target_logprobs is None:
                     logger.warning("Failed to convert output top_logprobs to tensor; skip target_logprobs collection")
 
@@ -1086,8 +1177,8 @@ class SGLangHttpServer:
                 or (sampled_token_mismatch is not None and sampled_token_mismatch > 0)
                 or (
                     self.config.drafter.training.use_logits
-                    and output_top
-                    and len(output_top) != len(token_ids)
+                    and output_top_len is not None
+                    and output_top_len != len(token_ids)
                 )
                 or not hidden_complete
             )
@@ -1127,7 +1218,7 @@ class SGLangHttpServer:
                             "hidden_state_max_tokens_per_sample",
                             None,
                         ),
-                        "output_top_len": len(output_top),
+                        "output_top_len": output_top_len if output_top_len is not None else len(output_top),
                         "output_token_logprob_len": len(output_token_logprobs),
                         "target_shape": _tensor_shape(target_logprobs),
                         "sampled_token_mismatch": sampled_token_mismatch,

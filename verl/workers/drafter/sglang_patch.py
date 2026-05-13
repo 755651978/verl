@@ -59,25 +59,15 @@ _SGLANG_EAGLE_UPDATE_PATCHED = False
 _SGLANG_NPU_EAGLE_SAMPLING_PATCHED = False
 _SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED = False
 _SGLANG_EAGLE_VERIFY_HIDDEN_STATES_PATCHED = False
+_SGLANG_TOP_LOGPROBS_TENSOR_OUTPUT_PATCHED = False
 _SGLANG_SCHEDULER_PROCESS_PATCHED = False
 _SCHEDULER_PROCESS_PATCH_ATTR = "_verl_patched_scheduler_process"
 _SGLANG_TOP_K_ALL = 1 << 30
-_SGLANG_PATCH_ALIASES = {
-    "all": "all",
-    "none": "none",
-    "off": "none",
-    "0": "none",
-    "eagle_update_weights": "eagle_update_weights",
-    "eagle_weight_update": "eagle_update_weights",
-    "weight_update": "eagle_update_weights",
-    "weight_routing": "eagle_update_weights",
-    "route_weights": "eagle_update_weights",
-    "target_draft_weight_routing": "eagle_update_weights",
-    "npu_eagle_target_sampling": "npu_eagle_target_sampling",
-    "target_sampling": "npu_eagle_target_sampling",
-    "hidden_states_tensor_output": "hidden_states_tensor_output",
-    "hidden_states": "hidden_states_tensor_output",
-    "hidden_state_tensor_output": "hidden_states_tensor_output",
+_SGLANG_PATCH_NAMES = {
+    "eagle_update_weights",
+    "npu_eagle_target_sampling",
+    "hidden_states_tensor_output",
+    "top_logprobs_tensor_output",
 }
 _VERL_DRAFTER_HIDDEN_WINDOW_PARAM = "_verl_drafter_hidden_state_window"
 _VERL_HIDDEN_STATE_FRONT_TOKENS_PARAM = "_verl_hidden_state_front_tokens_per_sample"
@@ -85,6 +75,8 @@ _VERL_HIDDEN_STATE_MAX_ROWS_PARAM = "_verl_hidden_state_max_rows"
 _VERL_HIDDEN_STATE_PROMPT_LEN_PARAM = "_verl_prompt_len"
 _VERL_HIDDEN_STATE_METADATA_MARKER = "__verl_hidden_state_metadata__"
 _VERL_HIDDEN_STATES_STREAM_FINAL_ATTR = "_verl_hidden_states_stream_final"
+_VERL_TOP_LOGPROBS_TENSOR_PARAM = "_verl_top_logprobs_tensor_output"
+_VERL_OUTPUT_TOP_LOGPROBS_TENSOR_KEY = "_verl_output_top_logprobs_tensor"
 
 
 def configure_sglang_eagle_weight_update_patch(
@@ -431,18 +423,36 @@ def _selected_sglang_patches() -> set[str] | None:
     if raw_value is None or not raw_value.strip():
         return None
 
-    selected = set()
-    for item in re.split(r"[\s,]+", raw_value.strip()):
-        key = item.strip().lower().replace("-", "_")
-        if not key:
-            continue
-        patch_name = _SGLANG_PATCH_ALIASES.get(key, key)
+    patch_names = [item.strip().lower() for item in re.split(r"[\s,]+", raw_value.strip()) if item.strip()]
+    if not patch_names:
+        return None
+
+    invalid_names = sorted(
+        patch_name
+        for patch_name in patch_names
+        if patch_name not in {"all", "none"} and patch_name not in _SGLANG_PATCH_NAMES
+    )
+    if invalid_names:
+        raise ValueError(
+            f"Unknown SGLang patch '{invalid_names[0]}' in {_SGLANG_PATCHES_ENV}. "
+            f"Supported values are: all, none, {', '.join(sorted(_SGLANG_PATCH_NAMES))}."
+        )
+
+    special_names = {"all", "none"}.intersection(patch_names)
+    if special_names:
+        special_name = "all" if "all" in special_names else "none"
+        if len(patch_names) > 1:
+            raise ValueError(
+                f"{_SGLANG_PATCHES_ENV}={special_name} cannot be combined with other patch names. "
+                f"Use either a single special value or a list of canonical patch names."
+            )
+        patch_name = patch_names[0]
         if patch_name == "all":
             return None
         if patch_name == "none":
             return set()
-        selected.add(patch_name)
-    return selected
+
+    return set(patch_names)
 
 
 def _sglang_patch_enabled(patch_name: str) -> bool:
@@ -1759,6 +1769,315 @@ def patch_sglang_eagle_verify_hidden_states_full() -> None:
         logger.info("Patched SGLang EAGLE verify full hidden states for %s", ", ".join(patched_targets))
 
 
+def _sglang_logprob_stage_name(stage: Any) -> str:
+    return str(getattr(stage, "name", stage)).upper()
+
+
+def _make_sglang_top_logprobs_raw_tensor_output(original_fn):
+    @wraps(original_fn)
+    def patched_get_top_logprobs_raw(
+        logprobs,
+        top_logprobs_nums,
+        stage,
+        extend_logprob_pruned_lens_cpu=None,
+    ):
+        if not top_logprobs_nums:
+            return [], []
+
+        max_k = max(top_logprobs_nums)
+        if max_k <= 0:
+            return original_fn(
+                logprobs,
+                top_logprobs_nums,
+                stage,
+                extend_logprob_pruned_lens_cpu=extend_logprob_pruned_lens_cpu,
+            )
+
+        values, indices = logprobs.topk(max_k, dim=-1)
+        values = values.detach().to("cpu", copy=True)
+        indices = indices.detach().to("cpu", copy=True)
+
+        if _sglang_logprob_stage_name(stage) == "DECODE":
+            return values, indices
+
+        if extend_logprob_pruned_lens_cpu is None:
+            return original_fn(
+                logprobs,
+                top_logprobs_nums,
+                stage,
+                extend_logprob_pruned_lens_cpu=extend_logprob_pruned_lens_cpu,
+            )
+
+        top_logprobs_val = []
+        top_logprobs_idx = []
+        pt = 0
+        for k, pruned_len in zip(top_logprobs_nums, extend_logprob_pruned_lens_cpu):
+            if pruned_len <= 0 or k <= 0:
+                top_logprobs_val.append([])
+                top_logprobs_idx.append([])
+                continue
+
+            end = pt + pruned_len
+            top_logprobs_val.append(values[pt:end, :k])
+            top_logprobs_idx.append(indices[pt:end, :k])
+            pt = end
+
+        return top_logprobs_val, top_logprobs_idx
+
+    patched_get_top_logprobs_raw._verl_patched_top_logprobs_tensor_output = True
+    return patched_get_top_logprobs_raw
+
+
+def _make_sglang_detokenize_logprob_tokens_tensor_aware(original_method):
+    @wraps(original_method)
+    def patched_detokenize_logprob_tokens(self, token_logprobs_val, token_logprobs_idx, decode_to_text):
+        if _is_torch_tensor(token_logprobs_val):
+            token_logprobs_val = token_logprobs_val.detach().cpu().tolist()
+        if _is_torch_tensor(token_logprobs_idx):
+            token_logprobs_idx = token_logprobs_idx.detach().cpu().tolist()
+        return original_method(self, token_logprobs_val, token_logprobs_idx, decode_to_text)
+
+    patched_detokenize_logprob_tokens._verl_patched_top_logprobs_tensor_output = True
+    return patched_detokenize_logprob_tokens
+
+
+def _make_sglang_detokenize_top_logprobs_tokens_tensor_aware(original_method):
+    @wraps(original_method)
+    def patched_detokenize_top_logprobs_tokens(self, token_logprobs_val, token_logprobs_idx, decode_to_text):
+        ret = []
+        for i in range(len(token_logprobs_val)):
+            values = token_logprobs_val[i]
+            indices = token_logprobs_idx[i]
+            if values is None:
+                ret.append(None)
+                continue
+            if _is_torch_tensor(values):
+                if values.numel() <= 0:
+                    ret.append(None)
+                    continue
+            elif not values:
+                ret.append(None)
+                continue
+            ret.append(self.detokenize_logprob_tokens(values, indices, decode_to_text))
+        return ret
+
+    patched_detokenize_top_logprobs_tokens._verl_patched_top_logprobs_tensor_output = True
+    return patched_detokenize_top_logprobs_tokens
+
+
+def _sglang_state_custom_params(state) -> dict[str, Any]:
+    obj = getattr(state, "obj", None)
+    sampling_params = getattr(obj, "sampling_params", None)
+    if isinstance(sampling_params, dict):
+        custom_params = sampling_params.get("custom_params")
+    else:
+        custom_params = getattr(sampling_params, "custom_params", None)
+    return custom_params if isinstance(custom_params, dict) else {}
+
+
+def _sglang_state_requests_top_logprobs_tensor(state) -> bool:
+    return _custom_flag_enabled(_sglang_state_custom_params(state).get(_VERL_TOP_LOGPROBS_TENSOR_PARAM, False))
+
+
+def _sglang_1d_tensor_from_top_logprob_row(row, *, topk: int, dtype: torch.dtype, fill_value: float):
+    if _is_torch_tensor(row):
+        tensor = row.detach().cpu().to(dtype=dtype).reshape(-1)
+    elif row is None:
+        tensor = torch.empty((0,), dtype=dtype)
+    else:
+        tensor = torch.tensor(list(row), dtype=dtype).reshape(-1)
+
+    if tensor.numel() >= topk:
+        return tensor[:topk]
+
+    padded = torch.full((topk,), fill_value, dtype=dtype)
+    if tensor.numel() > 0:
+        padded[: tensor.numel()] = tensor
+    return padded
+
+
+def _pack_sglang_output_top_logprobs_tensor(values_rows, indices_rows, topk: int) -> torch.Tensor | None:
+    if topk <= 0 or values_rows is None or indices_rows is None:
+        return None
+
+    rows = []
+    for values, indices in zip(values_rows, indices_rows):
+        value_row = _sglang_1d_tensor_from_top_logprob_row(
+            values,
+            topk=topk,
+            dtype=torch.float32,
+            fill_value=float("-inf"),
+        )
+        index_row = _sglang_1d_tensor_from_top_logprob_row(
+            indices,
+            topk=topk,
+            dtype=torch.float32,
+            fill_value=-1.0,
+        )
+        rows.append(torch.stack((value_row, index_row), dim=-1))
+
+    if not rows:
+        return None
+    return torch.stack(rows, dim=0).contiguous()
+
+
+def _make_sglang_add_logprob_to_meta_info_tensor_output(original_method):
+    @wraps(original_method)
+    def patched_add_logprob_to_meta_info(
+        self,
+        meta_info: dict,
+        state,
+        top_logprobs_num: int,
+        token_ids_logprob,
+        return_text_in_logprobs: bool,
+    ):
+        if not _sglang_state_requests_top_logprobs_tensor(state):
+            return original_method(
+                self,
+                meta_info,
+                state,
+                top_logprobs_num,
+                token_ids_logprob,
+                return_text_in_logprobs,
+            )
+
+        if len(state.input_token_logprobs_val) > len(state.input_token_logprobs):
+            state.input_token_logprobs.extend(
+                self.detokenize_logprob_tokens(
+                    state.input_token_logprobs_val[len(state.input_token_logprobs) :],
+                    state.input_token_logprobs_idx[len(state.input_token_logprobs) :],
+                    return_text_in_logprobs,
+                )
+            )
+
+        if len(state.output_token_logprobs_val) > len(state.output_token_logprobs):
+            state.output_token_logprobs.extend(
+                self.detokenize_logprob_tokens(
+                    state.output_token_logprobs_val[len(state.output_token_logprobs) :],
+                    state.output_token_logprobs_idx[len(state.output_token_logprobs) :],
+                    return_text_in_logprobs,
+                )
+            )
+
+        meta_info["input_token_logprobs"] = state.input_token_logprobs
+        meta_info["output_token_logprobs"] = state.output_token_logprobs
+
+        topk = int(top_logprobs_num or 0)
+        if topk > 0:
+            output_top_logprobs = _pack_sglang_output_top_logprobs_tensor(
+                state.output_top_logprobs_val,
+                state.output_top_logprobs_idx,
+                topk,
+            )
+            if output_top_logprobs is not None:
+                meta_info[_VERL_OUTPUT_TOP_LOGPROBS_TENSOR_KEY] = output_top_logprobs
+
+            # Keep public fields present but empty for this verl-only internal path.
+            # The full top-k payload is in the tensor side-channel above.
+            meta_info["input_top_logprobs"] = []
+            meta_info["output_top_logprobs"] = []
+
+        if token_ids_logprob is not None:
+            if len(state.input_token_ids_logprobs_val) > len(state.input_token_ids_logprobs):
+                state.input_token_ids_logprobs.extend(
+                    self.detokenize_top_logprobs_tokens(
+                        state.input_token_ids_logprobs_val[len(state.input_token_ids_logprobs) :],
+                        state.input_token_ids_logprobs_idx[len(state.input_token_ids_logprobs) :],
+                        return_text_in_logprobs,
+                    )
+                )
+            if len(state.output_token_ids_logprobs_val) > len(state.output_token_ids_logprobs):
+                state.output_token_ids_logprobs.extend(
+                    self.detokenize_top_logprobs_tokens(
+                        state.output_token_ids_logprobs_val[len(state.output_token_ids_logprobs) :],
+                        state.output_token_ids_logprobs_idx[len(state.output_token_ids_logprobs) :],
+                        return_text_in_logprobs,
+                    )
+                )
+
+            meta_info["input_token_ids_logprobs"] = state.input_token_ids_logprobs
+            meta_info["output_token_ids_logprobs"] = state.output_token_ids_logprobs
+
+    patched_add_logprob_to_meta_info._verl_patched_top_logprobs_tensor_output = True
+    return patched_add_logprob_to_meta_info
+
+
+def patch_sglang_top_logprobs_tensor_output() -> None:
+    """Return SGLang output top-logprobs through a verl-only tensor side-channel."""
+    global _SGLANG_TOP_LOGPROBS_TENSOR_OUTPUT_PATCHED
+    if _SGLANG_TOP_LOGPROBS_TENSOR_OUTPUT_PATCHED:
+        return
+
+    try:
+        logprob_module = importlib.import_module("sglang.srt.layers.utils.logprob")
+        sampler_module = importlib.import_module("sglang.srt.layers.sampler")
+        logits_processor_module = importlib.import_module("sglang.srt.layers.logits_processor")
+        tokenizer_manager_module = importlib.import_module("sglang.srt.managers.tokenizer_manager")
+        tokenizer_manager_cls = getattr(tokenizer_manager_module, "TokenizerManager")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Skip SGLang top-logprobs tensor output patch: %s", exc)
+        return
+
+    raw_fn = getattr(logprob_module, "get_top_logprobs_raw", None)
+    if raw_fn is None:
+        logger.debug("Skip SGLang top-logprobs tensor output patch: get_top_logprobs_raw missing")
+        return
+
+    if not getattr(raw_fn, "_verl_patched_top_logprobs_tensor_output", False):
+        patched_raw_fn = _make_sglang_top_logprobs_raw_tensor_output(raw_fn)
+        logprob_module.get_top_logprobs_raw = patched_raw_fn
+
+        def patched_get_top_logprobs(logprobs, top_logprobs_nums):
+            return patched_raw_fn(logprobs, top_logprobs_nums, stage=logprob_module.LogprobStage.DECODE)
+
+        def patched_get_top_logprobs_prefill(all_logprobs, logits_metadata):
+            return patched_raw_fn(
+                all_logprobs,
+                logits_metadata.top_logprobs_nums,
+                stage=logprob_module.LogprobStage.PREFILL,
+                extend_logprob_pruned_lens_cpu=logits_metadata.extend_logprob_pruned_lens_cpu,
+            )
+
+        patched_get_top_logprobs._verl_patched_top_logprobs_tensor_output = True
+        patched_get_top_logprobs_prefill._verl_patched_top_logprobs_tensor_output = True
+        logprob_module.get_top_logprobs = patched_get_top_logprobs
+        logprob_module.get_top_logprobs_prefill = patched_get_top_logprobs_prefill
+        sampler_module.get_top_logprobs = patched_get_top_logprobs
+        logits_processor_module.get_top_logprobs_prefill = patched_get_top_logprobs_prefill
+
+    detokenize_logprob = getattr(tokenizer_manager_cls, "detokenize_logprob_tokens", None)
+    if detokenize_logprob is not None and not getattr(
+        detokenize_logprob,
+        "_verl_patched_top_logprobs_tensor_output",
+        False,
+    ):
+        tokenizer_manager_cls.detokenize_logprob_tokens = _make_sglang_detokenize_logprob_tokens_tensor_aware(
+            detokenize_logprob
+        )
+
+    detokenize_top = getattr(tokenizer_manager_cls, "detokenize_top_logprobs_tokens", None)
+    if detokenize_top is not None and not getattr(
+        detokenize_top,
+        "_verl_patched_top_logprobs_tensor_output",
+        False,
+    ):
+        tokenizer_manager_cls.detokenize_top_logprobs_tokens = _make_sglang_detokenize_top_logprobs_tokens_tensor_aware(
+            detokenize_top
+        )
+
+    add_logprob = getattr(tokenizer_manager_cls, "add_logprob_to_meta_info", None)
+    if add_logprob is None:
+        logger.debug("Skip SGLang top-logprobs tensor output patch: add_logprob_to_meta_info missing")
+        return
+    if not getattr(add_logprob, "_verl_patched_top_logprobs_tensor_output", False):
+        tokenizer_manager_cls.add_logprob_to_meta_info = _make_sglang_add_logprob_to_meta_info_tensor_output(
+            add_logprob
+        )
+
+    _SGLANG_TOP_LOGPROBS_TENSOR_OUTPUT_PATCHED = True
+    logger.warning("SGLang top-logprobs tensor output patch active")
+
+
 _SGLANG_HIDDEN_STATES_LIST_OUTPUT_PATTERN = re.compile(
     r"\.cpu\(\)\s*\.clone\(\)\s*\.tolist\(\)",
 )
@@ -2009,6 +2328,7 @@ def _apply_selected_sglang_patches() -> bool:
         ("eagle_update_weights", patch_sglang_eagle_update_weights_from_tensor),
         ("npu_eagle_target_sampling", patch_sglang_npu_eagle_target_sampling),
         ("hidden_states_tensor_output", patch_sglang_hidden_states_tensor_output),
+        ("top_logprobs_tensor_output", patch_sglang_top_logprobs_tensor_output),
     )
 
     applied_any = False
