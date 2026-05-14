@@ -928,6 +928,7 @@ class DrafterWorker(Worker):
             return
 
         from verl.workers.drafter.base_trainer import DrafterBaseTrainer
+        from verl.workers.drafter.dflash_trainer_backend import DFlashTrainerBackend
         from verl.workers.drafter.eagle3_trainer_backend import Eagle3TrainerBackend
         from verl.workers.drafter.eagle_trainer_backend import EagleTrainerBackend
 
@@ -936,6 +937,8 @@ class DrafterWorker(Worker):
             trainer_backend = EagleTrainerBackend(self.config, self.config.model)
         elif algo == "EAGLE3":
             trainer_backend = Eagle3TrainerBackend(self.config, self.config.model)
+        elif algo == "DFLASH":
+            trainer_backend = DFlashTrainerBackend(self.config, self.config.model)
         else:
             raise ValueError(f"Unknown drafter algorithm: {self.config.rollout.drafter.speculative_algorithm}")
 

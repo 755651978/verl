@@ -106,6 +106,15 @@ class DrafterTrainingConfig(BaseConfig):
     logits_coverage_mask_require_top1: bool = False
     ttt_length: int = 1
     vocab_mapping_path: Optional[str] = None
+    dflash_block_size: int = 16
+    dflash_num_anchors: int = 512
+    dflash_loss_decay_gamma: float = 7.0
+    dflash_hidden_size: Optional[int] = None
+    dflash_num_target_layers: int = 5
+    dflash_num_hidden_layers: int = 1
+    dflash_mask_token_id: Optional[int] = None
+    dflash_target_layer_ids: Optional[list[int]] = None
+    dflash_max_window: int = 512
     current_max_samples: int = 2000
     data_buffer_max_size: int = 1024
     hidden_state_clip_value: Optional[float] = 1.0e4

@@ -484,6 +484,15 @@ drafter:
     logits_coverage_mask_require_top1: False
     ttt_length: 1
     vocab_mapping_path: null
+    dflash_block_size: 16
+    dflash_num_anchors: 512
+    dflash_loss_decay_gamma: 7.0
+    dflash_hidden_size: null
+    dflash_num_target_layers: 5
+    dflash_num_hidden_layers: 1
+    dflash_mask_token_id: null
+    dflash_target_layer_ids: null
+    dflash_max_window: 512
     current_max_samples: 2000
     data_buffer_max_size: 1024
     hidden_state_clip_value: 1.0e4
