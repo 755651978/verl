@@ -102,6 +102,8 @@ class DrafterTrainingConfig(BaseConfig):
     warmup_style: str = "constant"
     use_logits: bool = False
     logits_topk: int = 128
+    logits_coverage_mask_min_ratio: Optional[float] = None
+    logits_coverage_mask_require_top1: bool = False
     ttt_length: int = 1
     vocab_mapping_path: Optional[str] = None
     current_max_samples: int = 2000
@@ -125,6 +127,11 @@ class DrafterTrainingConfig(BaseConfig):
             raise ValueError("`hidden_state_max_tokens_per_sample` must be non-negative or null.")
         if self.hidden_state_front_tokens_per_sample is not None and self.hidden_state_front_tokens_per_sample < 0:
             raise ValueError("`hidden_state_front_tokens_per_sample` must be non-negative or null.")
+        if (
+            self.logits_coverage_mask_min_ratio is not None
+            and (self.logits_coverage_mask_min_ratio < 0 or self.logits_coverage_mask_min_ratio > 1)
+        ):
+            raise ValueError("`logits_coverage_mask_min_ratio` must be in [0, 1] or null.")
         if self.batch_size_per_gpu <= 0:
             raise ValueError("`batch_size_per_gpu` must be positive.")
 

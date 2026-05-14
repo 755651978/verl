@@ -71,6 +71,158 @@ def _masked_soft_cross_entropy(
     return per_token_ploss, valid_position
 
 
+def _log_topk_draft_vocab_coverage(
+    target_topk_logprobs: torch.Tensor,
+    t2d: torch.Tensor,
+    loss_mask: torch.Tensor | None = None,
+) -> None:
+    if (
+        not isinstance(target_topk_logprobs, torch.Tensor)
+        or target_topk_logprobs.dim() != 3
+        or target_topk_logprobs.size(-1) < 2
+        or target_topk_logprobs.numel() == 0
+    ):
+        return
+
+    with torch.no_grad():
+        device = target_topk_logprobs.device
+        t2d = t2d.to(device=device, dtype=torch.bool)
+        vocab_size = int(t2d.numel())
+        if vocab_size <= 0:
+            return
+
+        logprobs = target_topk_logprobs[..., 0].detach().float()
+        token_ids = target_topk_logprobs[..., 1].detach().long()
+        in_range = (token_ids >= 0) & (token_ids < vocab_size)
+        valid = torch.isfinite(logprobs) & in_range
+        safe_token_ids = token_ids.clamp(min=0, max=vocab_size - 1)
+        in_draft_vocab = valid & t2d[safe_token_ids]
+
+        valid_count = valid.sum(dim=-1)
+        hit_count = in_draft_vocab.sum(dim=-1)
+        topk_mass = torch.where(valid, logprobs.exp(), torch.zeros_like(logprobs)).sum(dim=-1)
+        hit_mass = torch.where(in_draft_vocab, logprobs.exp(), torch.zeros_like(logprobs)).sum(dim=-1)
+        active_rows = valid_count > 0
+
+        if loss_mask is not None:
+            flat_loss_mask = loss_mask.detach().to(device=device).reshape(-1)
+            common_rows = min(active_rows.numel(), flat_loss_mask.numel())
+            if common_rows <= 0:
+                return
+            active_rows = active_rows[:common_rows] & (flat_loss_mask[:common_rows] > 0)
+            valid_count = valid_count[:common_rows]
+            hit_count = hit_count[:common_rows]
+            topk_mass = topk_mass[:common_rows]
+            hit_mass = hit_mass[:common_rows]
+            in_draft_vocab = in_draft_vocab[:common_rows]
+            valid = valid[:common_rows]
+
+        if not active_rows.any():
+            return
+
+        active_valid_count = valid_count[active_rows].float()
+        active_hit_count = hit_count[active_rows].float()
+        active_topk_mass = topk_mass[active_rows].float()
+        active_hit_mass = hit_mass[active_rows].float()
+        hit_ratio = active_hit_count / active_valid_count.clamp_min(1)
+        hit_mass_ratio = active_hit_mass / active_topk_mass.clamp_min(torch.finfo(torch.float32).tiny)
+        top1_in_draft = in_draft_vocab[:, 0] & valid[:, 0]
+        top1_valid_rows = active_rows & valid[:, 0]
+        top1_in_draft_ratio = (
+            top1_in_draft[top1_valid_rows].float().mean()
+            if top1_valid_rows.any()
+            else torch.tensor(0.0, device=device)
+        )
+
+        logger.warning(
+            "[drafter logits coverage] rows=%s active_rows=%s target_vocab=%s draft_vocab=%s "
+            "topk_mean=%.2f hit_tokens_mean=%.2f hit_ratio_mean=%.6f "
+            "hit_mass_mean=%.6f hit_mass_p50=%.6f hit_mass_p5=%.6f "
+            "hit_mass_ratio_mean=%.6f top1_in_draft=%.6f rows_no_hit=%s",
+            int(valid_count.numel()),
+            int(active_rows.sum().detach().cpu().item()),
+            vocab_size,
+            int(t2d.sum().detach().cpu().item()),
+            float(active_valid_count.mean().detach().cpu().item()),
+            float(active_hit_count.mean().detach().cpu().item()),
+            float(hit_ratio.mean().detach().cpu().item()),
+            float(active_hit_mass.mean().detach().cpu().item()),
+            float(torch.quantile(active_hit_mass, 0.50).detach().cpu().item()),
+            float(torch.quantile(active_hit_mass, 0.05).detach().cpu().item()),
+            float(hit_mass_ratio.mean().detach().cpu().item()),
+            float(top1_in_draft_ratio.detach().cpu().item()),
+            int((active_hit_count <= 0).sum().detach().cpu().item()),
+        )
+
+
+def _build_topk_draft_vocab_coverage_mask(
+    target_topk_logprobs: torch.Tensor,
+    t2d: torch.Tensor,
+    min_hit_mass_ratio: float | None = None,
+    require_top1: bool = False,
+) -> torch.Tensor | None:
+    if min_hit_mass_ratio is None and not require_top1:
+        return None
+    if (
+        not isinstance(target_topk_logprobs, torch.Tensor)
+        or target_topk_logprobs.dim() != 3
+        or target_topk_logprobs.size(-1) < 2
+        or target_topk_logprobs.numel() == 0
+    ):
+        return None
+
+    with torch.no_grad():
+        device = target_topk_logprobs.device
+        t2d = t2d.to(device=device, dtype=torch.bool)
+        vocab_size = int(t2d.numel())
+        if vocab_size <= 0:
+            return None
+
+        logprobs = target_topk_logprobs[..., 0].detach().float()
+        token_ids = target_topk_logprobs[..., 1].detach().long()
+        in_range = (token_ids >= 0) & (token_ids < vocab_size)
+        valid = torch.isfinite(logprobs) & in_range
+        safe_token_ids = token_ids.clamp(min=0, max=vocab_size - 1)
+        in_draft_vocab = valid & t2d[safe_token_ids]
+
+        valid_count = valid.sum(dim=-1)
+        topk_mass = torch.where(valid, logprobs.exp(), torch.zeros_like(logprobs)).sum(dim=-1)
+        hit_mass = torch.where(in_draft_vocab, logprobs.exp(), torch.zeros_like(logprobs)).sum(dim=-1)
+        keep_mask = valid_count > 0
+
+        if min_hit_mass_ratio is not None:
+            hit_mass_ratio = hit_mass / topk_mass.clamp_min(torch.finfo(torch.float32).tiny)
+            keep_mask = keep_mask & (hit_mass_ratio >= float(min_hit_mass_ratio))
+        if require_top1:
+            keep_mask = keep_mask & in_draft_vocab[:, 0]
+
+        total_rows = int(keep_mask.numel())
+        kept_rows = int(keep_mask.sum().detach().cpu().item())
+        logger.warning(
+            "[drafter logits coverage mask] rows=%s kept=%s dropped=%s min_hit_mass_ratio=%s require_top1=%s",
+            total_rows,
+            kept_rows,
+            total_rows - kept_rows,
+            min_hit_mass_ratio,
+            require_top1,
+        )
+        return keep_mask.to(dtype=torch.float32).unsqueeze(0)
+
+
+def _apply_coverage_mask_to_loss_mask(loss_mask: torch.Tensor, coverage_mask: torch.Tensor | None) -> torch.Tensor:
+    if coverage_mask is None:
+        return loss_mask
+
+    coverage_mask = coverage_mask.to(device=loss_mask.device, dtype=loss_mask.dtype)
+    common_rows = min(loss_mask.size(-1), coverage_mask.size(-1))
+    if common_rows <= 0:
+        return loss_mask
+
+    masked_loss_mask = loss_mask.clone()
+    masked_loss_mask[..., :common_rows] = masked_loss_mask[..., :common_rows] * coverage_mask[..., :common_rows]
+    return masked_loss_mask
+
+
 def reconstruct_dense_logprob_view(target_topk_logprobs, topk, vocab_size):
     if topk <= 0:
         raise ValueError(f"topk must be positive when reconstructing dense logprob view, got {topk}")
@@ -363,6 +515,12 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
         loss_mask = batch["loss_mask"]
         position_ids = batch["position_ids"]
         use_logits = self.config.rollout.drafter.training.use_logits
+        logits_coverage_mask_min_ratio = self.config.rollout.drafter.training.get(
+            "logits_coverage_mask_min_ratio", None
+        )
+        logits_coverage_mask_require_top1 = bool(
+            self.config.rollout.drafter.training.get("logits_coverage_mask_require_top1", False)
+        )
         ttt_length = int(self.config.rollout.drafter.training.get("ttt_length", 1))
         if ttt_length < 1:
             raise ValueError(f"EAGLE3 ttt_length must be >= 1, got {ttt_length}")
@@ -414,6 +572,18 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
                     unpad_dim=0,
                     padding_size=_current_pad_size,
                 ).unsqueeze(0)
+                _log_topk_draft_vocab_coverage(
+                    target_topk_logprobs.squeeze(0),
+                    draft_model.t2d,
+                    loss_mask.squeeze(0),
+                )
+                coverage_mask = _build_topk_draft_vocab_coverage_mask(
+                    target_topk_logprobs.squeeze(0),
+                    draft_model.t2d,
+                    min_hit_mass_ratio=logits_coverage_mask_min_ratio,
+                    require_top1=logits_coverage_mask_require_top1,
+                )
+                loss_mask = _apply_coverage_mask_to_loss_mask(loss_mask, coverage_mask)
                 target_scores = reconstruct_dense_logprob_view(
                     target_topk_logprobs.squeeze(0),
                     topk=self.config.rollout.drafter.training.logits_topk,
@@ -436,6 +606,18 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
             loss_mask = loss_mask
             if use_logits:
                 target_topk_logprobs = batch["target_logprobs"]
+                _log_topk_draft_vocab_coverage(
+                    target_topk_logprobs.squeeze(0),
+                    draft_model.t2d,
+                    loss_mask.squeeze(0),
+                )
+                coverage_mask = _build_topk_draft_vocab_coverage_mask(
+                    target_topk_logprobs.squeeze(0),
+                    draft_model.t2d,
+                    min_hit_mass_ratio=logits_coverage_mask_min_ratio,
+                    require_top1=logits_coverage_mask_require_top1,
+                )
+                loss_mask = _apply_coverage_mask_to_loss_mask(loss_mask, coverage_mask)
                 target_scores = reconstruct_dense_logprob_view(
                     target_topk_logprobs.squeeze(0),
                     topk=self.config.rollout.drafter.training.logits_topk,
