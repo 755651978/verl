@@ -977,6 +977,8 @@ class DrafterWorker(Worker):
                 "hidden_prefix_cache_rows",
                 "hidden_window_start",
                 "hidden_window_end",
+                "target_logprobs_position_start",
+                "target_logprobs_position_end",
             ):
                 if key in sample:
                     batch[key] = sample[key]
