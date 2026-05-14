@@ -400,40 +400,6 @@ def _normalize_output_top_logprobs_tensor(output_top_logprobs: Any, topk: int) -
     return normalized.contiguous()
 
 
-def _response_aligned_top_logprobs_tensor(
-    prompt_len: int,
-    output_top_logprobs: Any,
-    topk: int,
-) -> Optional[torch.Tensor]:
-    tensor = _normalize_output_top_logprobs_tensor(output_top_logprobs, topk)
-    if tensor is None:
-        return None
-
-    prompt_target_rows = max(int(prompt_len) - 1, 0)
-    if prompt_target_rows <= 0:
-        return tensor
-
-    padding = torch.empty((prompt_target_rows, topk, 2), dtype=tensor.dtype)
-    padding[..., 0] = float("-inf")
-    padding[..., 1] = -1.0
-    return torch.cat((padding, tensor), dim=0).contiguous()
-
-
-def _response_aligned_top_logprobs_to_tensor(
-    prompt_len: int,
-    output_top_logprobs: list,
-    topk: int,
-) -> Optional[torch.Tensor]:
-    if not output_top_logprobs:
-        return None
-
-    # Drafter loss is response-only. Some SGLang GPU speculative paths may
-    # return partial input_top_logprobs, so keep prompt target rows as masked
-    # placeholders and align finite rows only from generated response tokens.
-    prompt_target_padding = [[] for _ in range(max(int(prompt_len) - 1, 0))]
-    return _top_logprobs_to_tensor(prompt_target_padding + output_top_logprobs, topk)
-
-
 def _hidden_state_metadata_from_chunk(hidden_state_chunk: Any) -> dict[str, int]:
     if not isinstance(hidden_state_chunk, dict):
         return {}
@@ -1071,31 +1037,26 @@ class SGLangHttpServer:
             target_logprobs = None
             output_top = []
             output_top_len = None
+            target_logprobs_position_start = None
+            target_logprobs_position_end = None
             output_token_logprobs = output.get("meta_info", {}).get("output_token_logprobs", []) or []
             sampled_token_mismatch = _count_sampled_token_mismatches(output_token_logprobs, list(token_ids))
             if self.config.drafter.training.use_logits:
                 logits_topk = int(self.config.drafter.training.logits_topk)
+                target_logprobs_position_start = max(len(prompt_ids) - 1, 0)
                 output_top_tensor = meta_info.pop(_VERL_OUTPUT_TOP_LOGPROBS_TENSOR_KEY, None)
-                target_logprobs = _response_aligned_top_logprobs_tensor(
-                    prompt_len=len(prompt_ids),
-                    output_top_logprobs=output_top_tensor,
-                    topk=logits_topk,
-                )
-                if target_logprobs is not None and output_top_tensor is not None:
-                    output_top_tensor_normalized = _normalize_output_top_logprobs_tensor(output_top_tensor, logits_topk)
-                    output_top_len = (
-                        int(output_top_tensor_normalized.size(0)) if output_top_tensor_normalized is not None else None
-                    )
+                target_logprobs = _normalize_output_top_logprobs_tensor(output_top_tensor, logits_topk)
+                if target_logprobs is not None:
+                    output_top_len = int(target_logprobs.size(0))
                 if target_logprobs is None:
                     output_top = output.get("meta_info", {}).get("output_top_logprobs", [])
                     output_top_len = len(output_top) if output_top else None
-                    target_logprobs = _response_aligned_top_logprobs_to_tensor(
-                        prompt_len=len(prompt_ids),
-                        output_top_logprobs=output_top,
-                        topk=logits_topk,
-                    )
+                    target_logprobs = _top_logprobs_to_tensor(output_top, logits_topk)
                 if target_logprobs is None:
                     logger.warning("Failed to convert output top_logprobs to tensor; skip target_logprobs collection")
+                    target_logprobs_position_start = None
+                else:
+                    target_logprobs_position_end = target_logprobs_position_start + int(target_logprobs.size(0))
 
             hidden_states_data = meta_info.pop("hidden_states", [])
             hidden_states_list = []
@@ -1165,6 +1126,8 @@ class SGLangHttpServer:
                     "hidden_window_start": hidden_window_start,
                     "hidden_window_end": hidden_window_end,
                     "target_logprobs": target_logprobs.unsqueeze(0).cpu() if target_logprobs is not None else None,
+                    "target_logprobs_position_start": target_logprobs_position_start,
+                    "target_logprobs_position_end": target_logprobs_position_end,
                     "global_step": collection_global_steps,
                     "replica_rank": self.replica_rank,
                 }
@@ -1179,6 +1142,11 @@ class SGLangHttpServer:
                     self.config.drafter.training.use_logits
                     and output_top_len is not None
                     and output_top_len != len(token_ids)
+                )
+                or (
+                    self.config.drafter.training.use_logits
+                    and target_logprobs is not None
+                    and int(target_logprobs.size(0)) <= 0
                 )
                 or not hidden_complete
             )
@@ -1221,6 +1189,8 @@ class SGLangHttpServer:
                         "output_top_len": output_top_len if output_top_len is not None else len(output_top),
                         "output_token_logprob_len": len(output_token_logprobs),
                         "target_shape": _tensor_shape(target_logprobs),
+                        "target_position_start": target_logprobs_position_start,
+                        "target_position_end": target_logprobs_position_end,
                         "sampled_token_mismatch": sampled_token_mismatch,
                         "finish_reason": finish_reason,
                     },

@@ -757,6 +757,40 @@ class DrafterBaseTrainer:
             hidden_end = hidden_feature_length
             feature_end = feature_start + hidden_feature_length + 1
 
+            target_logprobs_position_start = None
+            target_logprobs_position_end = None
+            if cpu_target_logprobs is not None:
+                target_rows = int(cpu_target_logprobs.size(1))
+                target_logprobs_position_start = _batch_item_int(batch.get("target_logprobs_position_start"), i)
+                target_logprobs_position_end = _batch_item_int(batch.get("target_logprobs_position_end"), i)
+                if target_logprobs_position_start is None:
+                    target_logprobs_position_start = 0
+                if target_logprobs_position_end is None:
+                    target_logprobs_position_end = target_logprobs_position_start + target_rows
+                target_logprobs_position_end = min(
+                    max(target_logprobs_position_end, target_logprobs_position_start),
+                    target_logprobs_position_start + target_rows,
+                )
+
+                # A compact target_logprobs tensor may start at a non-zero
+                # original sequence position, e.g. response rows start at
+                # prompt_len - 1. If the hidden window starts earlier, advance
+                # only the leading feature rows. The tail is left untouched and
+                # later training length is capped by the available target rows.
+                if target_logprobs_position_start > feature_start:
+                    hidden_shift = target_logprobs_position_start - feature_start
+                    hidden_start += hidden_shift
+                    hidden_feature_length -= hidden_shift
+                    feature_start = target_logprobs_position_start
+
+                if hidden_feature_length <= 0:
+                    hidden_feature_length = 0
+                    hidden_end = hidden_start
+                    feature_end = feature_start + 1
+                else:
+                    hidden_end = hidden_start + hidden_feature_length
+                    feature_end = feature_start + hidden_feature_length + 1
+
             input_feature_length = feature_end - feature_start
             if input_feature_length <= 0 or hidden_feature_length <= 0:
                 continue
@@ -779,10 +813,16 @@ class DrafterBaseTrainer:
             target_start = None
             target_end = None
             if cpu_target_logprobs is not None:
-                # target_logprobs are next-token targets for original positions
-                # [1..T-1], so original target position p lives at index p - 1.
-                target_start = min(feature_start, cpu_target_logprobs.size(1))
-                target_end = min(max(feature_start, feature_end - 1), cpu_target_logprobs.size(1))
+                # target_logprobs row p stores the next-token target for the
+                # hidden/input row at original position p. A compact rollout
+                # tensor can start at target_base instead of row 0.
+                target_base = target_logprobs_position_start or 0
+                target_limit = min(
+                    cpu_target_logprobs.size(1),
+                    max((target_logprobs_position_end or target_base) - target_base, 0),
+                )
+                target_start = min(max(feature_start - target_base, 0), target_limit)
+                target_end = min(max(feature_end - 1 - target_base, target_start), target_limit)
                 target_logprobs_item = cpu_target_logprobs[i, target_start:target_end, ...]
 
             data_item = {
@@ -800,6 +840,14 @@ class DrafterBaseTrainer:
                 "_verl_hidden_position_start": hidden_position_start,
                 "_verl_target_start": target_start if cpu_target_logprobs is not None else None,
                 "_verl_target_end": target_end if cpu_target_logprobs is not None else None,
+                "_verl_target_position_start": (
+                    (target_logprobs_position_start or 0) + target_start if target_start is not None else None
+                ),
+                "_verl_target_position_end": (
+                    (target_logprobs_position_start or 0) + target_end if target_end is not None else None
+                ),
+                "_verl_target_tensor_position_start": target_logprobs_position_start,
+                "_verl_target_tensor_position_end": target_logprobs_position_end,
                 "_verl_prompt_len": prompt_len if cpu_prompts is not None else None,
                 "_verl_response_len": response_len if cpu_responses is not None else None,
                 "_verl_input_seq_length": input_seq_length,
@@ -837,6 +885,10 @@ class DrafterBaseTrainer:
                             "hidden_position_start": hidden_position_start,
                             "target_start": target_start if cpu_target_logprobs is not None else None,
                             "target_end": target_end if cpu_target_logprobs is not None else None,
+                            "target_position_start": data_item.get("_verl_target_position_start"),
+                            "target_position_end": data_item.get("_verl_target_position_end"),
+                            "target_tensor_position_start": target_logprobs_position_start,
+                            "target_tensor_position_end": target_logprobs_position_end,
                             "prompt_len": prompt_len if cpu_prompts is not None else None,
                             "response_len": response_len if cpu_responses is not None else None,
                             "loss_before": int(full_loss_mask.sum().item()),
@@ -1138,6 +1190,10 @@ class DrafterBaseTrainer:
                             "hidden_position_start": source_item.get("_verl_hidden_position_start"),
                             "target_start": source_item.get("_verl_target_start"),
                             "target_end": source_item.get("_verl_target_end"),
+                            "target_position_start": source_item.get("_verl_target_position_start"),
+                            "target_position_end": source_item.get("_verl_target_position_end"),
+                            "target_tensor_position_start": source_item.get("_verl_target_tensor_position_start"),
+                            "target_tensor_position_end": source_item.get("_verl_target_tensor_position_end"),
                             "loss_after_shift": int(item_loss_mask[1 : 1 + train_seq_len].detach().float().sum().cpu().item()),
                             "target_rows": int(train_target_logprobs.size(0)) if train_target_logprobs is not None else None,
                             "row_valid": row_valid_count,
