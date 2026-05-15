@@ -384,15 +384,67 @@ def _log_last_hidden_logprob_check(
         logits = target_scores[:, :common_rows, :].float()
         topk = sglang_topk_logprobs[:, :common_rows, :, :]
         mask = loss_mask[:, :common_rows] > 0
-        sglang_top1_logprob = topk[..., 0, 0].float()
-        sglang_top1_id = topk[..., 0, 1].long()
-        valid = (
-            mask
-            & torch.isfinite(sglang_top1_logprob)
-            & (sglang_top1_id >= 0)
-            & (sglang_top1_id < logits.size(-1))
-        )
-        if not valid.any():
+        log_norm_all = torch.logsumexp(logits, dim=-1)
+        target_top1_score_all, target_top1_id_all = logits.max(dim=-1)
+        target_top1_logprob_all = target_top1_score_all - log_norm_all
+
+        def _compare_with_shift(shift: int):
+            if shift >= 0:
+                end = common_rows - shift
+                if end <= 0:
+                    return None
+                shifted_logits = logits[:, shift:common_rows, :]
+                shifted_log_norm = log_norm_all[:, shift:common_rows]
+                shifted_target_top1_id = target_top1_id_all[:, shift:common_rows]
+                shifted_target_top1_logprob = target_top1_logprob_all[:, shift:common_rows]
+                shifted_topk = topk[:, :end, :, :]
+                shifted_mask = mask[:, shift:common_rows]
+            else:
+                start = -shift
+                if start >= common_rows:
+                    return None
+                shifted_logits = logits[:, : common_rows - start, :]
+                shifted_log_norm = log_norm_all[:, : common_rows - start]
+                shifted_target_top1_id = target_top1_id_all[:, : common_rows - start]
+                shifted_target_top1_logprob = target_top1_logprob_all[:, : common_rows - start]
+                shifted_topk = topk[:, start:common_rows, :, :]
+                shifted_mask = mask[:, : common_rows - start]
+
+            sglang_top1_logprob = shifted_topk[..., 0, 0].float()
+            sglang_top1_id = shifted_topk[..., 0, 1].long()
+            valid = (
+                shifted_mask
+                & torch.isfinite(sglang_top1_logprob)
+                & (sglang_top1_id >= 0)
+                & (sglang_top1_id < shifted_logits.size(-1))
+            )
+            if not valid.any():
+                return None
+
+            gathered_sglang_top1_logprob = (
+                shifted_logits.gather(
+                    -1,
+                    sglang_top1_id.clamp(min=0, max=shifted_logits.size(-1) - 1).unsqueeze(-1),
+                ).squeeze(-1)
+                - shifted_log_norm
+            )
+            top1_match = shifted_target_top1_id[valid] == sglang_top1_id[valid]
+            logprob_diff = (gathered_sglang_top1_logprob[valid] - sglang_top1_logprob[valid]).abs()
+            return {
+                "shift": shift,
+                "rows": int(valid.detach().sum().cpu().item()),
+                "top1_match": float(top1_match.float().mean().detach().cpu().item()),
+                "diff_mean": float(logprob_diff.mean().detach().cpu().item()),
+                "diff_p95": float(torch.quantile(logprob_diff, 0.95).detach().cpu().item()),
+                "diff_max": float(logprob_diff.max().detach().cpu().item()),
+                "target_top1_logprob_mean": float(
+                    shifted_target_top1_logprob[valid].mean().detach().cpu().item()
+                ),
+                "sglang_top1_logprob_mean": float(sglang_top1_logprob[valid].mean().detach().cpu().item()),
+            }
+
+        base_metrics = _compare_with_shift(0)
+        if base_metrics is None:
             logger.warning(
                 "[drafter last_hidden logprob check] no valid rows rows=%s topk_shape=%s",
                 common_rows,
@@ -400,29 +452,51 @@ def _log_last_hidden_logprob_check(
             )
             return
 
-        log_norm = torch.logsumexp(logits, dim=-1)
-        target_top1_score, target_top1_id = logits.max(dim=-1)
-        target_top1_logprob = target_top1_score - log_norm
-        gathered_sglang_top1_logprob = (
-            logits.gather(-1, sglang_top1_id.clamp(min=0, max=logits.size(-1) - 1).unsqueeze(-1)).squeeze(-1)
-            - log_norm
-        )
-        top1_match = target_top1_id[valid] == sglang_top1_id[valid]
-        logprob_diff = (gathered_sglang_top1_logprob[valid] - sglang_top1_logprob[valid]).abs()
-
         logger.warning(
             "[drafter last_hidden logprob check] rows=%s active_rows=%s top1_match=%.6f "
             "logprob_abs_diff_mean=%.6g logprob_abs_diff_p95=%.6g logprob_abs_diff_max=%.6g "
             "target_top1_logprob_mean=%.6g sglang_top1_logprob_mean=%.6g",
             common_rows,
-            int(valid.detach().sum().cpu().item()),
-            float(top1_match.float().mean().detach().cpu().item()),
-            float(logprob_diff.mean().detach().cpu().item()),
-            float(torch.quantile(logprob_diff, 0.95).detach().cpu().item()),
-            float(logprob_diff.max().detach().cpu().item()),
-            float(target_top1_logprob[valid].mean().detach().cpu().item()),
-            float(sglang_top1_logprob[valid].mean().detach().cpu().item()),
+            base_metrics["rows"],
+            base_metrics["top1_match"],
+            base_metrics["diff_mean"],
+            base_metrics["diff_p95"],
+            base_metrics["diff_max"],
+            base_metrics["target_top1_logprob_mean"],
+            base_metrics["sglang_top1_logprob_mean"],
         )
+        shift_metrics = []
+        for shift in range(-3, 4):
+            metrics = _compare_with_shift(shift)
+            if metrics is not None:
+                shift_metrics.append(
+                    (
+                        shift,
+                        metrics["top1_match"],
+                        metrics["diff_mean"],
+                        metrics["rows"],
+                    )
+                )
+        if shift_metrics:
+            best_shift, best_match, best_diff, best_rows = max(shift_metrics, key=lambda item: item[1])
+            logger.warning(
+                "[drafter last_hidden logprob check shift_scan] best_shift=%s best_top1_match=%.6f "
+                "best_diff_mean=%.6g best_rows=%s shifts=%s",
+                best_shift,
+                best_match,
+                best_diff,
+                best_rows,
+                ", ".join(
+                    f"{shift}:{match:.4f}/{diff:.4g}/{rows}"
+                    for shift, match, diff, rows in shift_metrics
+                ),
+            )
+            if best_match < 0.5 and best_diff > 1.0:
+                logger.warning(
+                    "[drafter last_hidden logprob check] all tested shifts mismatch; likely causes are stale "
+                    "TargetHead lm_head weights versus SGLang target weights, or last-hidden rows not matching "
+                    "the SGLang logits rows."
+                )
 
 
 def reconstruct_dense_logprob_view(target_topk_logprobs, topk, vocab_size):
