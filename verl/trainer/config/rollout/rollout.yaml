@@ -480,6 +480,9 @@ drafter:
     warmup_style: constant
     use_logits: false
     logits_topk: 128
+    logits_loss_mode: dense_tail
+    logits_sparse_min_intersection: 1
+    logits_sparse_min_mass: null
     logits_coverage_mask_min_ratio: 0.1
     logits_coverage_mask_require_top1: False
     ttt_length: 1
