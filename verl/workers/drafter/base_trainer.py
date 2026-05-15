@@ -1199,8 +1199,9 @@ class DrafterBaseTrainer:
         for item_idx, (ids, h_states, item_loss_mask, item_position_ids) in enumerate(
             zip(ids_list, hidden_list, mask_list, position_list)
         ):
+            uses_shifted_eagle_inputs = self.backend.model_type in ("eagle", "eagle3")
             seq_len = min(ids.size(0), h_states.size(0), item_loss_mask.size(0), item_position_ids.size(0))
-            if seq_len < 2:
+            if seq_len < 1:
                 items_dropped_short += 1
                 continue
 
@@ -1208,20 +1209,32 @@ class DrafterBaseTrainer:
             if self.backend.model_type == "eagle3" and use_logits:
                 target_logprobs_item = preprocessed_lists["target_logprobs"][item_idx]
                 train_seq_len = min(
-                    ids.size(0),
+                    max(ids.size(0) - 2, 0),
                     h_states.size(0),
-                    max(item_loss_mask.size(0) - 1, 0),
+                    max(item_loss_mask.size(0) - 2, 0),
                     item_position_ids.size(0),
-                    target_logprobs_item.size(0),
+                    max(target_logprobs_item.size(0) - 1, 0),
                 )
             elif self.backend.model_type == "eagle3":
                 last_h_states = preprocessed_lists["last_h_states"][item_idx]
                 target_logprobs_list = preprocessed_lists.get("target_logprobs") or []
                 if last_hidden_logprob_check and item_idx < len(target_logprobs_list):
                     target_logprobs_item = target_logprobs_list[item_idx]
-                train_seq_len = min(seq_len - 1, last_h_states.size(0) - 1)
+                train_seq_len = min(
+                    max(ids.size(0) - 2, 0),
+                    h_states.size(0),
+                    max(item_loss_mask.size(0) - 2, 0),
+                    item_position_ids.size(0),
+                    max(last_h_states.size(0) - 1, 0),
+                )
             elif self.backend.model_type == "eagle":
-                train_seq_len = seq_len - 1
+                train_seq_len = min(
+                    max(ids.size(0) - 2, 0),
+                    h_states.size(0),
+                    max(item_loss_mask.size(0) - 2, 0),
+                    item_position_ids.size(0),
+                    max(h_states.size(0) - 1, 0),
+                )
             elif self.backend.model_type == "dflash":
                 train_seq_len = seq_len
             else:
@@ -1235,6 +1248,8 @@ class DrafterBaseTrainer:
             packed_tokens_before_shift += train_seq_len
             if self.backend.model_type == "dflash":
                 packed_loss_tokens += int(item_loss_mask[:train_seq_len].detach().float().sum().cpu().item())
+            elif uses_shifted_eagle_inputs:
+                packed_loss_tokens += int(item_loss_mask[2 : 2 + train_seq_len].detach().float().sum().cpu().item())
             else:
                 packed_loss_tokens += int(item_loss_mask[1 : 1 + train_seq_len].detach().float().sum().cpu().item())
 
@@ -1243,7 +1258,7 @@ class DrafterBaseTrainer:
                 sample_index = self._alignment_debug_sample_index(current_step, "prepare_item")
                 train_target_logprobs = None
                 if self.backend.model_type == "eagle3" and use_logits:
-                    train_target_logprobs = target_logprobs_item[:train_seq_len]
+                    train_target_logprobs = target_logprobs_item[1 : 1 + train_seq_len]
                 elif (
                     self.backend.model_type == "eagle3"
                     and last_hidden_logprob_check
@@ -1256,7 +1271,11 @@ class DrafterBaseTrainer:
                 if train_target_logprobs is not None:
                     row_valid = _target_row_valid_mask(train_target_logprobs)
                     if row_valid is not None and row_valid.numel() > 0:
-                        active_mask = item_loss_mask[1 : 1 + train_seq_len].bool()
+                        if uses_shifted_eagle_inputs:
+                            active_mask = item_loss_mask[2 : 2 + train_seq_len].bool()
+                        else:
+                            active_mask = item_loss_mask[1 : 1 + train_seq_len].bool()
+                        active_mask = active_mask[: row_valid.size(0)]
                         row_valid_count = int(row_valid.detach().sum().cpu().item())
                         active_rows = int(active_mask.detach().sum().cpu().item())
                         active_valid = int((row_valid & active_mask).detach().sum().cpu().item())
@@ -1289,7 +1308,18 @@ class DrafterBaseTrainer:
                             "target_position_end": source_item.get("_verl_target_position_end"),
                             "target_tensor_position_start": source_item.get("_verl_target_tensor_position_start"),
                             "target_tensor_position_end": source_item.get("_verl_target_tensor_position_end"),
-                            "loss_after_shift": int(item_loss_mask[1 : 1 + train_seq_len].detach().float().sum().cpu().item()),
+                            "loss_after_shift": int(
+                                (
+                                    item_loss_mask[2 : 2 + train_seq_len]
+                                    if uses_shifted_eagle_inputs
+                                    else item_loss_mask[1 : 1 + train_seq_len]
+                                )
+                                .detach()
+                                .float()
+                                .sum()
+                                .cpu()
+                                .item()
+                            ),
                             "target_rows": int(train_target_logprobs.size(0)) if train_target_logprobs is not None else None,
                             "row_valid": row_valid_count,
                             "active_rows": active_rows,
@@ -1297,11 +1327,18 @@ class DrafterBaseTrainer:
                             "target_shape": _tensor_shape(train_target_logprobs),
                         },
                     )
+                    window_input_ids = ids
+                    window_loss_mask = item_loss_mask
+                    window_feature_start = int(source_item.get("_verl_feature_start", 0) or 0)
+                    if uses_shifted_eagle_inputs:
+                        window_input_ids = ids[1 : 2 + train_seq_len]
+                        window_loss_mask = item_loss_mask[1 : 2 + train_seq_len]
+                        window_feature_start += 1
                     window_rows = _alignment_window_rows(
-                        ids,
-                        item_loss_mask,
+                        window_input_ids,
+                        window_loss_mask,
                         train_target_logprobs,
-                        feature_start=int(source_item.get("_verl_feature_start", 0) or 0),
+                        feature_start=window_feature_start,
                         prompt_len=source_item.get("_verl_prompt_len"),
                         response_len=source_item.get("_verl_response_len"),
                     )
@@ -1319,17 +1356,24 @@ class DrafterBaseTrainer:
                             },
                         )
 
-            input_id_chunks.append(ids[:train_seq_len])
-            hidden_state_chunks.append(h_states[:train_seq_len])
-            position_id_chunks.append(item_position_ids[:train_seq_len])
+            if uses_shifted_eagle_inputs:
+                input_id_chunks.append(ids[1 : 1 + train_seq_len])
+                hidden_state_chunks.append(h_states[:train_seq_len])
+                position_id_chunks.append(item_position_ids[:train_seq_len])
+            else:
+                input_id_chunks.append(ids[:train_seq_len])
+                hidden_state_chunks.append(h_states[:train_seq_len])
+                position_id_chunks.append(item_position_ids[:train_seq_len])
             if self.backend.model_type == "dflash":
                 loss_mask_chunks.append(item_loss_mask[:train_seq_len])
+            elif uses_shifted_eagle_inputs:
+                loss_mask_chunks.append(item_loss_mask[2 : 2 + train_seq_len])
             else:
                 loss_mask_chunks.append(item_loss_mask[1 : 1 + train_seq_len])
 
             if self.backend.model_type == "eagle3":
                 if use_logits:
-                    target_logprob_chunks.append(target_logprobs_item[:train_seq_len])
+                    target_logprob_chunks.append(target_logprobs_item[1 : 1 + train_seq_len])
                 else:
                     last_hidden_state_chunks.append(last_h_states[1 : 1 + train_seq_len])
                     if last_hidden_logprob_check:
