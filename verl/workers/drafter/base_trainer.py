@@ -588,6 +588,8 @@ class DrafterBaseTrainer:
                 continue
             # EAGLE shares target lm_head, while EAGLE3 trains and publishes its own lm_head.
             if any(frozen_name in name for frozen_name in self._frozen_param_names) or (
+                getattr(self.backend, "model_type", None) == "dflash" and "embed_tokens.weight" in name
+            ) or (
                 "lm_head.weight" in name and getattr(self.backend, "model_type", None) != "eagle3"
             ):
                 logger.debug(f"Skipping frozen parameter: {name}")
@@ -610,7 +612,7 @@ class DrafterBaseTrainer:
         if not self.checkpoint_dir:
             return None
 
-        checkpoint_path = os.path.join(self.checkpoint_dir, f"eagle_step_{step}")
+        checkpoint_path = os.path.join(self.checkpoint_dir, f"draft_step_{step}")
         os.makedirs(checkpoint_path, exist_ok=True)
 
         # Get trainable state dict (excluding frozen layers)
@@ -1090,6 +1092,8 @@ class DrafterBaseTrainer:
             return None
 
         dev = next(self.model.parameters()).device
+        if self.backend.model_type == "dflash" and self.use_ulysses_sp:
+            raise NotImplementedError("DFlash drafter training does not support Ulysses sequence parallel yet")
         
         preprocessed_lists = self.backend.preprocess_individual_items(items, dev, self.model_config)
         items_seen = len(items)
@@ -1099,9 +1103,9 @@ class DrafterBaseTrainer:
         packed_tokens_before_shift = 0
         packed_loss_tokens = 0
        
-        # Build next-token training chunks inside each sample before packing.
-        # Shifting after concatenation would create cross-sample targets and
-        # misalign target_logprobs whenever SGLang returns suffix-only features.
+        # Build training chunks inside each sample before packing. EAGLE-style
+        # models use next-token chunks, while DFlash keeps same-position blocks
+        # per sample so sampled anchors never cross sample boundaries.
         input_id_chunks = []
         loss_mask_chunks = []
         hidden_state_chunks = []
@@ -1138,6 +1142,8 @@ class DrafterBaseTrainer:
                 train_seq_len = min(seq_len - 1, last_h_states.size(0) - 1)
             elif self.backend.model_type == "eagle":
                 train_seq_len = seq_len - 1
+            elif self.backend.model_type == "dflash":
+                train_seq_len = seq_len
             else:
                 train_seq_len = seq_len - 1
 
@@ -1147,7 +1153,10 @@ class DrafterBaseTrainer:
 
             items_used += 1
             packed_tokens_before_shift += train_seq_len
-            packed_loss_tokens += int(item_loss_mask[1 : 1 + train_seq_len].detach().float().sum().cpu().item())
+            if self.backend.model_type == "dflash":
+                packed_loss_tokens += int(item_loss_mask[:train_seq_len].detach().float().sum().cpu().item())
+            else:
+                packed_loss_tokens += int(item_loss_mask[1 : 1 + train_seq_len].detach().float().sum().cpu().item())
 
             if alignment_debug_enabled():
                 source_item = items[item_idx] if item_idx < len(items) else {}
@@ -1227,7 +1236,10 @@ class DrafterBaseTrainer:
             input_id_chunks.append(ids[:train_seq_len])
             hidden_state_chunks.append(h_states[:train_seq_len])
             position_id_chunks.append(item_position_ids[:train_seq_len])
-            loss_mask_chunks.append(item_loss_mask[1 : 1 + train_seq_len])
+            if self.backend.model_type == "dflash":
+                loss_mask_chunks.append(item_loss_mask[:train_seq_len])
+            else:
+                loss_mask_chunks.append(item_loss_mask[1 : 1 + train_seq_len])
 
             if self.backend.model_type == "eagle3":
                 if use_logits:
@@ -1240,11 +1252,35 @@ class DrafterBaseTrainer:
         if not input_id_chunks:
             return None
 
-        input_ids = torch.cat(input_id_chunks, dim=0).unsqueeze(0).contiguous()
-        loss_mask = torch.cat(loss_mask_chunks, dim=0).unsqueeze(0).contiguous()
-        base_h = torch.cat(hidden_state_chunks, dim=0).unsqueeze(0).contiguous()
-        attn_mask = torch.ones_like(input_ids, dtype=torch.long, device=dev)
-        position_ids = torch.cat(position_id_chunks, dim=0).unsqueeze(0).contiguous()
+        if self.backend.model_type == "dflash":
+            max_train_len = max(chunk.size(0) for chunk in input_id_chunks)
+            hidden_dim = hidden_state_chunks[0].size(-1)
+            input_ids = torch.zeros(len(input_id_chunks), max_train_len, dtype=input_id_chunks[0].dtype, device=dev)
+            loss_mask = torch.zeros(len(loss_mask_chunks), max_train_len, dtype=loss_mask_chunks[0].dtype, device=dev)
+            base_h = torch.zeros(
+                len(hidden_state_chunks),
+                max_train_len,
+                hidden_dim,
+                dtype=hidden_state_chunks[0].dtype,
+                device=dev,
+            )
+            position_ids = torch.zeros(len(position_id_chunks), max_train_len, dtype=position_id_chunks[0].dtype, device=dev)
+            attn_mask = torch.zeros_like(input_ids, dtype=torch.long, device=dev)
+            for row_idx, (ids_chunk, mask_chunk, h_chunk, pos_chunk) in enumerate(
+                zip(input_id_chunks, loss_mask_chunks, hidden_state_chunks, position_id_chunks)
+            ):
+                row_len = ids_chunk.size(0)
+                input_ids[row_idx, :row_len] = ids_chunk
+                loss_mask[row_idx, :row_len] = mask_chunk
+                base_h[row_idx, :row_len] = h_chunk
+                position_ids[row_idx, :row_len] = pos_chunk
+                attn_mask[row_idx, :row_len] = 1
+        else:
+            input_ids = torch.cat(input_id_chunks, dim=0).unsqueeze(0).contiguous()
+            loss_mask = torch.cat(loss_mask_chunks, dim=0).unsqueeze(0).contiguous()
+            base_h = torch.cat(hidden_state_chunks, dim=0).unsqueeze(0).contiguous()
+            attn_mask = torch.ones_like(input_ids, dtype=torch.long, device=dev)
+            position_ids = torch.cat(position_id_chunks, dim=0).unsqueeze(0).contiguous()
 
         if self.backend.model_type == "eagle3":
             if use_logits:

@@ -1,9 +1,7 @@
 import json
 import os
-from typing import Optional, Union
 
-import torch
-from transformers import AutoConfig
+from typing import Union
 from transformers import AutoModelForCausalLM as AutoModelForCausalLMBase
 from transformers import (
     LlamaConfig,
@@ -11,7 +9,9 @@ from transformers import (
     modeling_utils,
 )
 
+from .dflash import DFlashConfig, DFlashDraftModel
 from .eagle.llama_eagle import LlamaForCausalLMEagle, LlamaForCausalLMEagle3
+
 
 class AutoDraftModel(AutoModelForCausalLMBase):
 
@@ -35,13 +35,13 @@ class AutoDraftModel(AutoModelForCausalLMBase):
         if torch_dtype is not None:
             model = model.to(dtype=torch_dtype)
         return model
-    
+
     @classmethod
     def from_pretrained(
-        cls,
-        pretrained_model_name_or_path: Union[str, os.PathLike[str]],
-        *model_args,
-        **kwargs,
+            cls,
+            pretrained_model_name_or_path: Union[str, os.PathLike[str]],
+            *model_args,
+            **kwargs,
     ):
         original_warn = modeling_utils.logger.warning
 
@@ -67,16 +67,18 @@ class AutoEagle3DraftModel(AutoDraftModel):
         LlamaConfig: LlamaForCausalLMEagle3,
     }
 
+
 class AutoEagleDraftModel(AutoDraftModel):
     _model_mapping = {
         LlamaConfig: LlamaForCausalLMEagle,
     }
 
-class AutoDraftModelConfig:
 
+class AutoDraftModelConfig:
     _config_mapping = {
         "LlamaForCausalLMEagle3": LlamaConfig,
         "LlamaForCausalLMEagle": LlamaConfig,
+        "DFlashDraftModel": DFlashConfig,
     }
 
     @classmethod
@@ -111,5 +113,9 @@ class AutoDraftModelConfig:
 
         if architecture not in cls._config_mapping:
             raise ValueError(f"Architecture {architecture} not supported")
+
+        if architecture == "DFlashDraftModel":
+            config["model_type"] = DFlashConfig.model_type
+            config["architectures"] = ["DFlashDraftModel"]
 
         return cls._config_mapping[architecture].from_dict(config)
