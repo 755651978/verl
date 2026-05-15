@@ -70,6 +70,8 @@ _ALIGNMENT_DEBUG_RANKS_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_RANKS"
 _VERL_DRAFTER_HIDDEN_WINDOW_PARAM = "_verl_drafter_hidden_state_window"
 _VERL_HIDDEN_STATE_FRONT_TOKENS_PARAM = "_verl_hidden_state_front_tokens_per_sample"
 _VERL_HIDDEN_STATE_PROMPT_LEN_PARAM = "_verl_prompt_len"
+_VERL_DRAFTER_RETURN_LAST_HIDDEN_ENV = "VERL_SGLANG_DRAFTER_RETURN_LAST_HIDDEN"
+_VERL_DRAFTER_RETURN_LAST_HIDDEN_PARAM = "_verl_drafter_return_last_hidden"
 _VERL_TOP_LOGPROBS_TENSOR_PARAM = "_verl_top_logprobs_tensor_output"
 _VERL_OUTPUT_TOP_LOGPROBS_TENSOR_KEY = "_verl_output_top_logprobs_tensor"
 
@@ -701,7 +703,13 @@ class SGLangHttpServer:
             args["enable_draft_weights_cpu_backup"] = True
 
         # drafter
+        return_last_hidden_for_drafter = False
         if self.config.drafter.enable:
+            return_last_hidden_for_drafter = bool(
+                self.config.drafter.enable_drafter_training
+                and self.config.drafter.training.collect_hidden_states_from_sgl
+                and not self.config.drafter.training.use_logits
+            )
             args["speculative_algorithm"] = self.config.drafter.speculative_algorithm
             args["cuda_graph_max_bs"] = 32
             args["speculative_draft_model_path"] = self.config.drafter.model_path
@@ -713,6 +721,9 @@ class SGLangHttpServer:
 
             args["enable_weights_cpu_backup"] = True
             args["enable_draft_weights_cpu_backup"] = True
+        os.environ[_VERL_DRAFTER_RETURN_LAST_HIDDEN_ENV] = (
+            "1" if return_last_hidden_for_drafter else "0"
+        )
 
         # NOTE: We can't directly call SGLang's launch_server since it's not an async function.
         # https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/entrypoints/http_server.py
@@ -972,6 +983,8 @@ class SGLangHttpServer:
                 custom_params[_VERL_TOP_LOGPROBS_TENSOR_PARAM] = True
                 request.update({"return_logprob": True})
                 request.update({"top_logprobs_num": self.config.drafter.training.logits_topk})
+            else:
+                custom_params[_VERL_DRAFTER_RETURN_LAST_HIDDEN_PARAM] = True
             sampling_params["custom_params"] = custom_params
 
         if self.config.drafter.enable:

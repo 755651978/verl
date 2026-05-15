@@ -48,6 +48,7 @@ _EAGLE_FORCE_FP32_SAMPLING_ENV = "VERL_SGLANG_NPU_EAGLE_FORCE_FP32_SAMPLING"
 _EAGLE_LINEAR_TRITON_ENV = "VERL_SGLANG_NPU_EAGLE_LINEAR_TRITON"
 _EAGLE_LINEAR_TRITON_DEBUG_ENV = "VERL_SGLANG_NPU_EAGLE_LINEAR_TRITON_DEBUG"
 _EAGLE_TOP_K_RENORM_FAST_PATH_ENV = "VERL_SGLANG_NPU_EAGLE_TOP_K_RENORM_FAST_PATH"
+_DRAFTER_RETURN_LAST_HIDDEN_ENV = "VERL_SGLANG_DRAFTER_RETURN_LAST_HIDDEN"
 _DISABLE_SGLANG_PATCH_ENV = "VERL_DISABLE_SGLANG_PATCH"
 _SGLANG_PATCHES_ENV = "VERL_SGLANG_PATCHES"
 
@@ -59,6 +60,7 @@ _SGLANG_EAGLE_UPDATE_PATCHED = False
 _SGLANG_NPU_EAGLE_SAMPLING_PATCHED = False
 _SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED = False
 _SGLANG_EAGLE_VERIFY_HIDDEN_STATES_PATCHED = False
+_SGLANG_DRAFTER_LAST_HIDDEN_OUTPUT_PATCHED = False
 _SGLANG_TOP_LOGPROBS_TENSOR_OUTPUT_PATCHED = False
 _SGLANG_SCHEDULER_PROCESS_PATCHED = False
 _SCHEDULER_PROCESS_PATCH_ATTR = "_verl_patched_scheduler_process"
@@ -75,6 +77,8 @@ _VERL_HIDDEN_STATE_MAX_ROWS_PARAM = "_verl_hidden_state_max_rows"
 _VERL_HIDDEN_STATE_PROMPT_LEN_PARAM = "_verl_prompt_len"
 _VERL_HIDDEN_STATE_METADATA_MARKER = "__verl_hidden_state_metadata__"
 _VERL_HIDDEN_STATES_STREAM_FINAL_ATTR = "_verl_hidden_states_stream_final"
+_VERL_DRAFTER_RETURN_LAST_HIDDEN_PARAM = "_verl_drafter_return_last_hidden"
+_VERL_DRAFTER_RETURN_LAST_HIDDEN_ATTR = "_verl_return_last_hidden_for_drafter"
 _VERL_TOP_LOGPROBS_TENSOR_PARAM = "_verl_top_logprobs_tensor_output"
 _VERL_OUTPUT_TOP_LOGPROBS_TENSOR_KEY = "_verl_output_top_logprobs_tensor"
 _VERL_TOP_LOGPROBS_TENSOR_CHUNK_MARKER = "__verl_top_logprobs_tensor_chunk__"
@@ -270,6 +274,10 @@ def _sglang_npu_eagle_linear_triton_enabled() -> bool:
 
 def _sglang_npu_eagle_linear_triton_debug_enabled() -> bool:
     return _env_flag_enabled(_EAGLE_LINEAR_TRITON_DEBUG_ENV, default=False)
+
+
+def _sglang_drafter_return_last_hidden_enabled() -> bool:
+    return _env_flag_enabled(_DRAFTER_RETURN_LAST_HIDDEN_ENV, default=False)
 
 
 def _debug_sglang_npu_eagle_linear_triton(reason: str, **details: Any) -> None:
@@ -1299,6 +1307,24 @@ def _sglang_req_custom_params(req) -> dict[str, Any]:
 
 def _sglang_req_requests_top_logprobs_tensor(req) -> bool:
     return _custom_flag_enabled(_sglang_req_custom_params(req).get(_VERL_TOP_LOGPROBS_TENSOR_PARAM, False))
+
+
+def _sglang_req_requests_last_hidden_for_drafter(req) -> bool:
+    return _custom_flag_enabled(
+        _sglang_req_custom_params(req).get(_VERL_DRAFTER_RETURN_LAST_HIDDEN_PARAM, False)
+    )
+
+
+def _sglang_forward_batch_requests_last_hidden_for_drafter(forward_batch) -> bool:
+    if _sglang_drafter_return_last_hidden_enabled():
+        return True
+    for req in getattr(forward_batch, "reqs", []) or []:
+        if (
+            getattr(req, "return_hidden_states", False)
+            and _sglang_req_requests_last_hidden_for_drafter(req)
+        ):
+            return True
+    return False
 
 
 def _sglang_hidden_chunk_rows(chunk) -> int:
@@ -2434,10 +2460,137 @@ def _make_sglang_hidden_states_tensor_output_patch(original_method):
     return patched_method
 
 
+def _make_sglang_drafter_last_hidden_output_patch(original_method):
+    @wraps(original_method)
+    def patched_get_hidden_states_to_store(
+        self,
+        hidden_states,
+        hidden_states_before_norm,
+        aux_hidden_states,
+        pruned_states,
+        pruned_states_before_norm,
+        aux_pruned_states,
+        sample_indices,
+        logits_metadata,
+    ):
+        capture_hidden_mode = getattr(logits_metadata, "capture_hidden_mode", None)
+        if (
+            (
+                getattr(logits_metadata, _VERL_DRAFTER_RETURN_LAST_HIDDEN_ATTR, False)
+                or _sglang_drafter_return_last_hidden_enabled()
+            )
+            and capture_hidden_mode is not None
+            and capture_hidden_mode.is_full()
+            and aux_hidden_states is not None
+            and hidden_states is not None
+        ):
+            if torch.is_tensor(aux_hidden_states):
+                hidden_parts = [aux_hidden_states]
+            else:
+                hidden_parts = list(aux_hidden_states)
+            if hidden_parts:
+                hidden_parts.append(hidden_states)
+                return torch.cat(hidden_parts, dim=-1)
+
+        return original_method(
+            self,
+            hidden_states,
+            hidden_states_before_norm,
+            aux_hidden_states,
+            pruned_states,
+            pruned_states_before_norm,
+            aux_pruned_states,
+            sample_indices,
+            logits_metadata,
+        )
+
+    patched_get_hidden_states_to_store._verl_patched_drafter_last_hidden_output = True
+    return patched_get_hidden_states_to_store
+
+
+def patch_sglang_drafter_last_hidden_output() -> None:
+    """Optionally append the final target hidden to SGLang's EAGLE3 aux hidden output."""
+    global _SGLANG_DRAFTER_LAST_HIDDEN_OUTPUT_PATCHED
+    if _SGLANG_DRAFTER_LAST_HIDDEN_OUTPUT_PATCHED:
+        return
+
+    try:
+        logits_module = importlib.import_module("sglang.srt.layers.logits_processor")
+        logits_metadata_cls = getattr(logits_module, "LogitsMetadata")
+        logits_processor_cls = getattr(logits_module, "LogitsProcessor")
+    except Exception as exc:  # noqa: BLE001
+        if _sglang_drafter_return_last_hidden_enabled():
+            raise RuntimeError(
+                "Failed to import SGLang logits processor for drafter last-hidden output patch."
+            ) from exc
+        logger.debug("Skip SGLang drafter last-hidden output patch: %s", exc)
+        return
+
+    active_parts = []
+
+    original_from_forward_batch = getattr(logits_metadata_cls, "from_forward_batch", None)
+    original_from_forward_batch_func = getattr(
+        original_from_forward_batch, "__func__", original_from_forward_batch
+    )
+    if original_from_forward_batch is None:
+        if _sglang_drafter_return_last_hidden_enabled():
+            raise RuntimeError(
+                "SGLang LogitsMetadata.from_forward_batch is missing; "
+                "cannot patch drafter last-hidden output."
+            )
+    elif getattr(original_from_forward_batch_func, "_verl_patched_drafter_last_hidden_output", False):
+        active_parts.append("LogitsMetadata.from_forward_batch")
+    else:
+        @wraps(original_from_forward_batch)
+        def patched_from_forward_batch(cls, forward_batch):
+            if hasattr(original_from_forward_batch, "__func__"):
+                metadata = original_from_forward_batch.__func__(cls, forward_batch)
+            else:
+                metadata = original_from_forward_batch(forward_batch)
+            setattr(
+                metadata,
+                _VERL_DRAFTER_RETURN_LAST_HIDDEN_ATTR,
+                _sglang_forward_batch_requests_last_hidden_for_drafter(forward_batch),
+            )
+            return metadata
+
+        patched_from_forward_batch._verl_patched_drafter_last_hidden_output = True
+        setattr(logits_metadata_cls, "from_forward_batch", classmethod(patched_from_forward_batch))
+        active_parts.append("LogitsMetadata.from_forward_batch")
+
+    original_get_hidden_states = getattr(
+        logits_processor_cls, "_get_hidden_states_to_store", None
+    )
+    if original_get_hidden_states is None:
+        if _sglang_drafter_return_last_hidden_enabled():
+            raise RuntimeError(
+                "SGLang LogitsProcessor._get_hidden_states_to_store is missing; "
+                "cannot patch drafter last-hidden output."
+            )
+    elif getattr(original_get_hidden_states, "_verl_patched_drafter_last_hidden_output", False):
+        active_parts.append("LogitsProcessor._get_hidden_states_to_store")
+    else:
+        setattr(
+            logits_processor_cls,
+            "_get_hidden_states_to_store",
+            _make_sglang_drafter_last_hidden_output_patch(original_get_hidden_states),
+        )
+        active_parts.append("LogitsProcessor._get_hidden_states_to_store")
+
+    if active_parts:
+        _SGLANG_DRAFTER_LAST_HIDDEN_OUTPUT_PATCHED = True
+        logger.warning(
+            "SGLang drafter last-hidden output patch active for %s; return_last_hidden=%s",
+            ", ".join(active_parts),
+            _sglang_drafter_return_last_hidden_enabled(),
+        )
+
+
 def patch_sglang_hidden_states_tensor_output() -> None:
     """Return SGLang hidden-state chunks as CPU tensors instead of Python lists."""
     global _SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED
     patch_sglang_eagle_verify_hidden_states_full()
+    patch_sglang_drafter_last_hidden_output()
     if _SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED:
         return
 
