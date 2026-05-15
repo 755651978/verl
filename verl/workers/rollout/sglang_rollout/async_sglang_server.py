@@ -67,6 +67,7 @@ _ALIGNMENT_DEBUG_EVERY_N_STEPS_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_EVERY_N_STEPS
 _ALIGNMENT_DEBUG_MAX_SAMPLES_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_MAX_SAMPLES_PER_STEP"
 _ALIGNMENT_DEBUG_TOKEN_WINDOW_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_TOKEN_WINDOW"
 _ALIGNMENT_DEBUG_RANKS_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_RANKS"
+_LAST_HIDDEN_LOGPROB_CHECK_ENV = "VERL_DRAFTER_LAST_HIDDEN_LOGPROB_CHECK"
 _VERL_DRAFTER_HIDDEN_WINDOW_PARAM = "_verl_drafter_hidden_state_window"
 _VERL_HIDDEN_STATE_FRONT_TOKENS_PARAM = "_verl_hidden_state_front_tokens_per_sample"
 _VERL_HIDDEN_STATE_PROMPT_LEN_PARAM = "_verl_prompt_len"
@@ -144,6 +145,10 @@ def alignment_debug_rank_selected(rank: int | None) -> bool:
             except ValueError:
                 continue
     return False
+
+
+def last_hidden_logprob_check_enabled() -> bool:
+    return _env_flag_enabled(_LAST_HIDDEN_LOGPROB_CHECK_ENV, default=False)
 
 
 def should_log_alignment(
@@ -985,6 +990,10 @@ class SGLangHttpServer:
                 request.update({"top_logprobs_num": self.config.drafter.training.logits_topk})
             else:
                 custom_params[_VERL_DRAFTER_RETURN_LAST_HIDDEN_PARAM] = True
+                if last_hidden_logprob_check_enabled():
+                    custom_params[_VERL_TOP_LOGPROBS_TENSOR_PARAM] = True
+                    request.update({"return_logprob": True})
+                    request.update({"top_logprobs_num": self.config.drafter.training.logits_topk})
             sampling_params["custom_params"] = custom_params
 
         if self.config.drafter.enable:
@@ -1054,7 +1063,11 @@ class SGLangHttpServer:
             target_logprobs_position_end = None
             output_token_logprobs = output.get("meta_info", {}).get("output_token_logprobs", []) or []
             sampled_token_mismatch = _count_sampled_token_mismatches(output_token_logprobs, list(token_ids))
-            if self.config.drafter.training.use_logits:
+            collect_target_logprobs = bool(
+                self.config.drafter.training.use_logits
+                or (last_hidden_logprob_check_enabled() and not self.config.drafter.training.use_logits)
+            )
+            if collect_target_logprobs:
                 logits_topk = int(self.config.drafter.training.logits_topk)
                 target_logprobs_position_start = max(len(prompt_ids) - 1, 0)
                 output_top_tensor = meta_info.pop(_VERL_OUTPUT_TOP_LOGPROBS_TENSOR_KEY, None)
@@ -1149,15 +1162,15 @@ class SGLangHttpServer:
 
             force_alignment_log = (
                 not has_hidden_states
-                or (self.config.drafter.training.use_logits and target_logprobs is None)
+                or (collect_target_logprobs and target_logprobs is None)
                 or (sampled_token_mismatch is not None and sampled_token_mismatch > 0)
                 or (
-                    self.config.drafter.training.use_logits
+                    collect_target_logprobs
                     and output_top_len is not None
                     and output_top_len != len(token_ids)
                 )
                 or (
-                    self.config.drafter.training.use_logits
+                    collect_target_logprobs
                     and target_logprobs is not None
                     and int(target_logprobs.size(0)) <= 0
                 )
@@ -1200,6 +1213,11 @@ class SGLangHttpServer:
                             None,
                         ),
                         "output_top_len": output_top_len if output_top_len is not None else len(output_top),
+                        "collect_target_logprobs": collect_target_logprobs,
+                        "last_hidden_logprob_check": (
+                            last_hidden_logprob_check_enabled()
+                            and not self.config.drafter.training.use_logits
+                        ),
                         "output_token_logprob_len": len(output_token_logprobs),
                         "target_shape": _tensor_shape(target_logprobs),
                         "target_position_start": target_logprobs_position_start,

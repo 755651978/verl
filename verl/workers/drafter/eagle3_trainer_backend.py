@@ -17,6 +17,23 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 device_name = get_device_name()
+_LAST_HIDDEN_LOGPROB_CHECK_ENV = "VERL_DRAFTER_LAST_HIDDEN_LOGPROB_CHECK"
+
+
+def _env_flag_enabled(name: str, default: bool = False) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    normalized = raw_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on", "y"}:
+        return True
+    if normalized in {"0", "false", "no", "off", "n"}:
+        return False
+    return default
+
+
+def _last_hidden_logprob_check_enabled() -> bool:
+    return _env_flag_enabled(_LAST_HIDDEN_LOGPROB_CHECK_ENV, default=False)
 
 
 def _scatter_topk_logprobs_with_tail(logprobs: torch.Tensor, indices: torch.Tensor, vocab_size: int) -> torch.Tensor:
@@ -221,6 +238,80 @@ def _apply_coverage_mask_to_loss_mask(loss_mask: torch.Tensor, coverage_mask: to
     masked_loss_mask = loss_mask.clone()
     masked_loss_mask[..., :common_rows] = masked_loss_mask[..., :common_rows] * coverage_mask[..., :common_rows]
     return masked_loss_mask
+
+
+def _log_last_hidden_logprob_check(
+    target_scores: torch.Tensor,
+    sglang_topk_logprobs: torch.Tensor | None,
+    loss_mask: torch.Tensor,
+) -> None:
+    if not _last_hidden_logprob_check_enabled() or sglang_topk_logprobs is None:
+        return
+    if not isinstance(sglang_topk_logprobs, torch.Tensor) or sglang_topk_logprobs.numel() == 0:
+        return
+    if sglang_topk_logprobs.dim() == 3:
+        sglang_topk_logprobs = sglang_topk_logprobs.unsqueeze(0)
+    if sglang_topk_logprobs.dim() != 4 or sglang_topk_logprobs.size(-1) < 2:
+        logger.warning(
+            "[drafter last_hidden logprob check] skip invalid SGLang top-k shape=%s",
+            tuple(sglang_topk_logprobs.shape),
+        )
+        return
+
+    with torch.no_grad():
+        device = target_scores.device
+        sglang_topk_logprobs = sglang_topk_logprobs.to(device=device)
+        loss_mask = loss_mask.to(device=device)
+        common_rows = min(
+            int(target_scores.size(1)),
+            int(sglang_topk_logprobs.size(1)),
+            int(loss_mask.size(-1)),
+        )
+        if common_rows <= 0:
+            return
+
+        logits = target_scores[:, :common_rows, :].float()
+        topk = sglang_topk_logprobs[:, :common_rows, :, :]
+        mask = loss_mask[:, :common_rows] > 0
+        sglang_top1_logprob = topk[..., 0, 0].float()
+        sglang_top1_id = topk[..., 0, 1].long()
+        valid = (
+            mask
+            & torch.isfinite(sglang_top1_logprob)
+            & (sglang_top1_id >= 0)
+            & (sglang_top1_id < logits.size(-1))
+        )
+        if not valid.any():
+            logger.warning(
+                "[drafter last_hidden logprob check] no valid rows rows=%s topk_shape=%s",
+                common_rows,
+                tuple(sglang_topk_logprobs.shape),
+            )
+            return
+
+        log_norm = torch.logsumexp(logits, dim=-1)
+        target_top1_score, target_top1_id = logits.max(dim=-1)
+        target_top1_logprob = target_top1_score - log_norm
+        gathered_sglang_top1_logprob = (
+            logits.gather(-1, sglang_top1_id.clamp(min=0, max=logits.size(-1) - 1).unsqueeze(-1)).squeeze(-1)
+            - log_norm
+        )
+        top1_match = target_top1_id[valid] == sglang_top1_id[valid]
+        logprob_diff = (gathered_sglang_top1_logprob[valid] - sglang_top1_logprob[valid]).abs()
+
+        logger.warning(
+            "[drafter last_hidden logprob check] rows=%s active_rows=%s top1_match=%.6f "
+            "logprob_abs_diff_mean=%.6g logprob_abs_diff_p95=%.6g logprob_abs_diff_max=%.6g "
+            "target_top1_logprob_mean=%.6g sglang_top1_logprob_mean=%.6g",
+            common_rows,
+            int(valid.detach().sum().cpu().item()),
+            float(top1_match.float().mean().detach().cpu().item()),
+            float(logprob_diff.mean().detach().cpu().item()),
+            float(torch.quantile(logprob_diff, 0.95).detach().cpu().item()),
+            float(logprob_diff.max().detach().cpu().item()),
+            float(target_top1_logprob[valid].mean().detach().cpu().item()),
+            float(sglang_top1_logprob[valid].mean().detach().cpu().item()),
+        )
 
 
 def reconstruct_dense_logprob_view(target_topk_logprobs, topk, vocab_size):
@@ -496,11 +587,11 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
             if not use_logits:
                 res['last_h_states'].append(last_h_states[start:end])
             res['masks'].append(item_loss_mask[start:end])
+            target_logprobs_item = None
             if item.get("target_logprobs") is not None:
                 target_end = max(start, end - 1)
-                res["target_logprobs"].append(
-                    item["target_logprobs"].to(device, dtype=torch.float32)[start:target_end]
-                )
+                target_logprobs_item = item["target_logprobs"].to(device, dtype=torch.float32)[start:target_end]
+            res["target_logprobs"].append(target_logprobs_item)
         
         return res
 
@@ -511,6 +602,7 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
         input_ids = batch["input_ids"]
         hidden_states = batch["hidden_states"]
         last_hidden_states = batch.get("last_hidden_states", None)
+        last_hidden_check_topk_logprobs = batch.get("last_hidden_check_topk_logprobs", None)
         attention_mask = batch["attention_mask"]
         loss_mask = batch["loss_mask"]
         position_ids = batch["position_ids"]
@@ -598,6 +690,13 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
                     unpad_dim=0,
                     padding_size=_current_pad_size,
                 ).unsqueeze(0)
+                if last_hidden_check_topk_logprobs is not None:
+                    last_hidden_check_topk_logprobs = gather_outputs_and_unpad(
+                        last_hidden_check_topk_logprobs.squeeze(0),
+                        gather_dim=0,
+                        unpad_dim=0,
+                        padding_size=_current_pad_size,
+                    ).unsqueeze(0)
                 with torch.no_grad():
                     target_scores = self.target_model(last_hidden_states)
         else:
@@ -647,6 +746,12 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
             target_scores = target_scores.to(target_device)
         if loss_mask.device != target_device:
             loss_mask = loss_mask.to(target_device)
+        if not use_logits:
+            _log_last_hidden_logprob_check(
+                target_scores=target_scores,
+                sglang_topk_logprobs=last_hidden_check_topk_logprobs,
+                loss_mask=loss_mask,
+            )
 
         target_p_padded, target_position_mask_padded = self._compute_target_p_padded(
             target_scores=target_scores,
