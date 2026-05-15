@@ -983,6 +983,36 @@ class RayPPOTrainer:
             )
         return non_null_weights[0]
 
+    def _get_actor_lm_head_payload(self) -> Optional[dict[str, torch.Tensor]]:
+        if not self.use_drafter or self.drafter_wg is None:
+            return None
+        if self.config.actor_rollout_ref.rollout.drafter.training.get("use_logits", False):
+            return None
+
+        lm_head_payloads = self.actor_rollout_wg.get_actor_lm_head_weight() or []
+        non_null_payloads = [payload for payload in lm_head_payloads if payload is not None]
+        if not non_null_payloads:
+            return None
+        if len(non_null_payloads) > 1:
+            raise RuntimeError(
+                "Expected at most one actor lm_head snapshot for drafter sync, "
+                f"but received {len(non_null_payloads)} results."
+            )
+        return non_null_payloads[0]
+
+    def _sync_drafter_target_lm_head(self) -> int:
+        payload = self._get_actor_lm_head_payload()
+        if payload is None:
+            return 0
+
+        sync_results = self.drafter_wg.sync_target_lm_head_weight(payload, global_step=self.global_steps) or []
+        accepted = [
+            result
+            for result in sync_results
+            if isinstance(result, dict) and bool(result.get("accepted", False))
+        ]
+        return int(bool(accepted))
+
     def _summarize_drafter_train_results(self, drafter_train_results: list[Any]) -> dict[str, float]:
         summary = {
             "drafter/triggered": 0,
@@ -1727,6 +1757,10 @@ class RayPPOTrainer:
                                 print("Force saving checkpoint: ESI instance expiration approaching.")
                             with marked_timer("save_checkpoint", timing_raw, color="green"):
                                 self._save_checkpoint()
+
+                        if self.use_drafter and self.drafter_wg is not None:
+                            with marked_timer("sync_drafter_target_lm_head", timing_raw, color="red"):
+                                metrics["drafter/target_lm_head_synced"] = self._sync_drafter_target_lm_head()
 
                         drafter_trained = False
                         if self.use_drafter and self.drafter_wg is not None:

@@ -705,6 +705,51 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         return output.cpu() if output is not None else None
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_actor_lm_head_weight(self):
+        if not self._is_actor or self.actor is None:
+            return None
+
+        per_tensor_param, _ = self.actor.engine.get_per_tensor_param(
+            layered_summon=getattr(self, "layered_summon", False),
+            base_sync_done=True,
+        )
+        selected_name = None
+        selected_weight = None
+        fallback_name = None
+        fallback_weight = None
+
+        for name, tensor in per_tensor_param:
+            if not torch.is_tensor(tensor):
+                continue
+            name = str(name)
+            if name == "model.embed_tokens.weight" or name.endswith(".embed_tokens.weight"):
+                fallback_name = name
+                fallback_weight = tensor
+            if name == "lm_head.weight" or name.endswith(".lm_head.weight"):
+                selected_name = name
+                selected_weight = tensor
+                break
+
+        if selected_weight is None:
+            selected_name = fallback_name
+            selected_weight = fallback_weight
+
+        if self.rank != 0:
+            return None
+        if selected_weight is None:
+            logger.warning("Unable to find actor lm_head.weight or tied model.embed_tokens.weight for drafter sync")
+            return None
+
+        weight = selected_weight.detach().cpu().to(torch.bfloat16).contiguous()
+        logger.warning(
+            "[actor lm_head export] name=%s shape=%s dtype=%s",
+            selected_name,
+            tuple(weight.shape),
+            weight.dtype,
+        )
+        return {"name": selected_name, "weight": weight}
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     async def update_draft_weights(self, weights: dict[str, torch.Tensor], global_steps: int = None):
         if not self.config.rollout.drafter.enable:
             return
@@ -1001,6 +1046,28 @@ class DrafterWorker(Worker):
             return
         self.last_global_step = global_step
         self.trainer.increment_rl_step(global_step)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def sync_target_lm_head_weight(self, payload: Optional[dict], global_step: Optional[int] = None):
+        if not self.enable_drafter:
+            return {"accepted": False, "applied": False, "reason": "disabled"}
+        if not self.in_drafter_train_group or self.trainer is None:
+            return {"accepted": False, "applied": False, "reason": "not_in_training_group"}
+        if not payload:
+            return {"accepted": False, "applied": False, "reason": "missing_payload"}
+
+        weight = payload.get("weight")
+        name = payload.get("name")
+        result = self.trainer.sync_target_lm_head_weight(weight, global_step=global_step)
+        if self.is_drafter_group_leader:
+            logger.warning(
+                "[drafter target lm_head sync] replica=%s source=%s global_step=%s result=%s",
+                self.replica_rank,
+                name,
+                global_step,
+                result,
+            )
+        return result
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def train_drafter(self):

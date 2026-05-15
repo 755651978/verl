@@ -406,6 +406,8 @@ class DrafterBaseTrainer:
         self.optimizer = None
         self.lr_scheduler = None
         self.drafter_train_config = None
+        self._pending_target_lm_head_weight = None
+        self._target_lm_head_weight_step = None
         self._frozen_param_names = {"model.embed_tokens.weight"}
 
         # Ulysses Sequence Parallelism configuration
@@ -552,6 +554,7 @@ class DrafterBaseTrainer:
         self.drafter_train_config = drafter_train_config
         self.model_config = drafter_model_config
         self.pad_token_id = int(getattr(drafter_model_config, "pad_token_id", self.pad_token_id) or self.pad_token_id)
+        self._apply_pending_target_lm_head_weight()
         
     def _prepare_training_config(self, rollout_config):
         """
@@ -683,6 +686,7 @@ class DrafterBaseTrainer:
             target_model = getattr(self.backend, "target_model", None)
             if target_model is not None:
                 target_model.to(self.runtime_device)
+            self._apply_pending_target_lm_head_weight()
 
             # 先标记初始化完成，然后开启 active 开关，确保训练循环不会读到中间状态
             self._training_initialized = True
@@ -698,6 +702,59 @@ class DrafterBaseTrainer:
             logger.error(f"[EagleTrainer rank {getattr(self, 'rank', -1)}] activate_training_model failed: {e}")
             self._training_active = False
             return False
+
+    def sync_target_lm_head_weight(self, weight: torch.Tensor, global_step: Optional[int] = None) -> dict[str, Any]:
+        """Update the frozen target lm_head used by last-hidden drafter training."""
+        if weight is None or not torch.is_tensor(weight):
+            return {"accepted": False, "applied": False, "reason": "missing_weight"}
+
+        self._pending_target_lm_head_weight = weight.detach().cpu().contiguous()
+        self._target_lm_head_weight_step = global_step
+        applied = self._apply_pending_target_lm_head_weight()
+        return {
+            "accepted": True,
+            "applied": applied,
+            "pending": not applied,
+            "global_step": global_step,
+            "shape": tuple(self._pending_target_lm_head_weight.shape),
+        }
+
+    def _target_lm_head_module(self):
+        target_model = getattr(self.backend, "target_model", None)
+        if target_model is not None and getattr(target_model, "fc", None) is not None:
+            return target_model.fc
+        target_lm_head = getattr(self.backend, "target_lm_head", None)
+        if target_lm_head is not None and getattr(target_lm_head, "fc", None) is not None:
+            return target_lm_head.fc
+        return None
+
+    @torch.no_grad()
+    def _apply_pending_target_lm_head_weight(self) -> bool:
+        if self._pending_target_lm_head_weight is None:
+            return False
+
+        lm_head = self._target_lm_head_module()
+        if lm_head is None:
+            return False
+
+        target_weight = lm_head.weight
+        source_weight = self._pending_target_lm_head_weight
+        if tuple(source_weight.shape) != tuple(target_weight.shape):
+            raise ValueError(
+                "Target lm_head weight shape mismatch for drafter training: "
+                f"source={tuple(source_weight.shape)}, target={tuple(target_weight.shape)}"
+            )
+
+        target_weight.copy_(source_weight.to(device=target_weight.device, dtype=target_weight.dtype, non_blocking=True))
+        lm_head.requires_grad_(False)
+        logger.warning(
+            "[drafter target lm_head sync] applied global_step=%s shape=%s dtype=%s device=%s",
+            self._target_lm_head_weight_step,
+            tuple(target_weight.shape),
+            target_weight.dtype,
+            target_weight.device,
+        )
+        return True
 
     def collect_online_data(self, batch: dict, hidden_states: torch.Tensor, target_logprobs: List = None) -> None:
         """Collect online data from inference for Eagle training.
