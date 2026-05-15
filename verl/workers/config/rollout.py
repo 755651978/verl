@@ -102,6 +102,9 @@ class DrafterTrainingConfig(BaseConfig):
     warmup_style: str = "constant"
     use_logits: bool = False
     logits_topk: int = 128
+    logits_loss_mode: str = "dense_tail"
+    logits_sparse_min_intersection: int = 1
+    logits_sparse_min_mass: Optional[float] = None
     logits_coverage_mask_min_ratio: Optional[float] = None
     logits_coverage_mask_require_top1: bool = False
     ttt_length: int = 1
@@ -141,6 +144,15 @@ class DrafterTrainingConfig(BaseConfig):
             and (self.logits_coverage_mask_min_ratio < 0 or self.logits_coverage_mask_min_ratio > 1)
         ):
             raise ValueError("`logits_coverage_mask_min_ratio` must be in [0, 1] or null.")
+        if self.logits_loss_mode not in {"dense_tail", "sparse_restricted"}:
+            raise ValueError("`logits_loss_mode` must be either 'dense_tail' or 'sparse_restricted'.")
+        if self.logits_sparse_min_intersection < 1:
+            raise ValueError("`logits_sparse_min_intersection` must be positive.")
+        if (
+            self.logits_sparse_min_mass is not None
+            and (self.logits_sparse_min_mass < 0 or self.logits_sparse_min_mass > 1)
+        ):
+            raise ValueError("`logits_sparse_min_mass` must be in [0, 1] or null.")
         if self.batch_size_per_gpu <= 0:
             raise ValueError("`batch_size_per_gpu` must be positive.")
 
