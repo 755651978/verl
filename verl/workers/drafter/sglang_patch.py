@@ -78,7 +78,7 @@ _VERL_HIDDEN_STATE_PROMPT_LEN_PARAM = "_verl_prompt_len"
 _VERL_HIDDEN_STATE_METADATA_MARKER = "__verl_hidden_state_metadata__"
 _VERL_HIDDEN_STATES_STREAM_FINAL_ATTR = "_verl_hidden_states_stream_final"
 _VERL_DRAFTER_RETURN_LAST_HIDDEN_PARAM = "_verl_drafter_return_last_hidden"
-_VERL_DRAFTER_RETURN_LAST_HIDDEN_ATTR = "_verl_return_last_hidden_for_drafter"
+_VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR = "_verl_drafter_last_hidden_states"
 _VERL_TOP_LOGPROBS_TENSOR_PARAM = "_verl_top_logprobs_tensor_output"
 _VERL_OUTPUT_TOP_LOGPROBS_TENSOR_KEY = "_verl_output_top_logprobs_tensor"
 _VERL_TOP_LOGPROBS_TENSOR_CHUNK_MARKER = "__verl_top_logprobs_tensor_chunk__"
@@ -1327,6 +1327,39 @@ def _sglang_forward_batch_requests_last_hidden_for_drafter(forward_batch) -> boo
     return False
 
 
+def _sglang_concat_last_hidden_for_drafter(req, logits_output, hidden_chunk, last_hidden_chunk):
+    if not _sglang_req_requests_last_hidden_for_drafter(req):
+        return hidden_chunk
+    if last_hidden_chunk is None:
+        raise RuntimeError("SGLang did not return final target hidden states for drafter training.")
+    if not (_is_torch_tensor(hidden_chunk) and _is_torch_tensor(last_hidden_chunk)):
+        raise RuntimeError(
+            "SGLang drafter last-hidden output requires tensor hidden chunks: "
+            f"hidden_type={type(hidden_chunk)}, last_hidden_type={type(last_hidden_chunk)}."
+        )
+    if tuple(hidden_chunk.shape[:-1]) != tuple(last_hidden_chunk.shape[:-1]):
+        raise RuntimeError(
+            "SGLang drafter last-hidden shape does not align with EAGLE hidden states: "
+            f"hidden_shape={tuple(hidden_chunk.shape)}, last_hidden_shape={tuple(last_hidden_chunk.shape)}."
+        )
+    if last_hidden_chunk.device != hidden_chunk.device:
+        last_hidden_chunk = last_hidden_chunk.to(hidden_chunk.device)
+    return torch.cat((hidden_chunk, last_hidden_chunk), dim=-1)
+
+
+def _slice_sglang_drafter_last_hidden_output(logits_output, index):
+    last_hidden_states = getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, None)
+    if last_hidden_states is None:
+        return None
+    return last_hidden_states[index]
+
+
+def _filter_sglang_drafter_last_hidden_output(logits_output, index) -> None:
+    last_hidden_states = _slice_sglang_drafter_last_hidden_output(logits_output, index)
+    if last_hidden_states is not None:
+        setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, last_hidden_states)
+
+
 def _sglang_hidden_chunk_rows(chunk) -> int:
     if _is_torch_tensor(chunk):
         if chunk.dim() <= 1:
@@ -1544,6 +1577,12 @@ def _append_sglang_prefill_hidden_states(req, logits_output, hidden_state_offset
     prefix_cache_rows = max(prompt_len - rows, 0)
     end = hidden_state_offset + rows
     chunk = hidden_states[hidden_state_offset:end]
+    chunk = _sglang_concat_last_hidden_for_drafter(
+        req,
+        logits_output,
+        chunk,
+        _slice_sglang_drafter_last_hidden_output(logits_output, slice(hidden_state_offset, end)),
+    )
     _append_sglang_hidden_state_chunk_with_budget(
         req,
         chunk,
@@ -1571,9 +1610,16 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
 
         if hidden_states.dim() == 3 and req_index < int(hidden_states.shape[0]):
             if int(hidden_states.shape[1]) >= rows:
+                chunk = hidden_states[req_index, :rows]
+                chunk = _sglang_concat_last_hidden_for_drafter(
+                    req,
+                    logits_output,
+                    chunk,
+                    _slice_sglang_drafter_last_hidden_output(logits_output, (req_index, slice(0, rows))),
+                )
                 _append_sglang_hidden_state_chunk_with_budget(
                     req,
-                    hidden_states[req_index, :rows],
+                    chunk,
                     position_start=position_start,
                     batch=batch,
                 )
@@ -1588,9 +1634,16 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
         end = hidden_state_offset + rows
         has_expected_rows = int(hidden_states.shape[0]) >= expected_rows and end <= int(hidden_states.shape[0])
         if hidden_states.dim() >= 2 and has_expected_rows:
+            chunk = hidden_states[hidden_state_offset:end]
+            chunk = _sglang_concat_last_hidden_for_drafter(
+                req,
+                logits_output,
+                chunk,
+                _slice_sglang_drafter_last_hidden_output(logits_output, slice(hidden_state_offset, end)),
+            )
             _append_sglang_hidden_state_chunk_with_budget(
                 req,
-                hidden_states[hidden_state_offset:end],
+                chunk,
                 position_start=position_start,
                 batch=batch,
             )
@@ -1610,9 +1663,16 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
         0,
     )
     if _is_torch_tensor(hidden_states):
+        chunk = hidden_states[req_index]
+        chunk = _sglang_concat_last_hidden_for_drafter(
+            req,
+            logits_output,
+            chunk,
+            _slice_sglang_drafter_last_hidden_output(logits_output, req_index),
+        )
         _append_sglang_hidden_state_chunk_with_budget(
             req,
-            hidden_states[req_index],
+            chunk,
             position_start=position_start,
             batch=batch,
         )
@@ -1749,12 +1809,21 @@ def _make_sglang_eagle_verify_full_hidden_patch(original_method):
     else:
         return None
 
+    old_hidden_filter = "        logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]\n"
+    new_hidden_filter = (
+        "        logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]\n"
+        "        _filter_sglang_drafter_last_hidden_output(logits_output, res.accepted_indices)\n"
+    )
+    if old_hidden_filter in patched_source:
+        patched_source = patched_source.replace(old_hidden_filter, new_hidden_filter, 1)
+
     globals_dict = original_method.__globals__
     globals_dict["logger"] = logger
     globals_dict["_ensure_sglang_eagle_verify_full_hidden_mode"] = _ensure_sglang_eagle_verify_full_hidden_mode
     globals_dict["_sglang_eagle_verify_hidden_states_incomplete"] = _sglang_eagle_verify_hidden_states_incomplete
     globals_dict["_rerun_sglang_eagle_verify_without_graph"] = _rerun_sglang_eagle_verify_without_graph
     globals_dict["_validate_sglang_eagle_verify_hidden_states"] = _validate_sglang_eagle_verify_hidden_states
+    globals_dict["_filter_sglang_drafter_last_hidden_output"] = _filter_sglang_drafter_last_hidden_output
     namespace = {}
     exec(  # noqa: S102
         "from __future__ import annotations\n" + patched_source,
@@ -2460,63 +2529,82 @@ def _make_sglang_hidden_states_tensor_output_patch(original_method):
     return patched_method
 
 
-def _make_sglang_drafter_last_hidden_output_patch(original_method):
+def _make_sglang_drafter_last_hidden_forward_patch(original_method):
     @wraps(original_method)
-    def patched_get_hidden_states_to_store(
+    def patched_logits_processor_forward(
         self,
+        input_ids,
         hidden_states,
-        hidden_states_before_norm,
-        aux_hidden_states,
-        pruned_states,
-        pruned_states_before_norm,
-        aux_pruned_states,
-        sample_indices,
+        lm_head,
         logits_metadata,
+        aux_hidden_states=None,
+        hidden_states_before_norm=None,
     ):
-        capture_hidden_mode = getattr(logits_metadata, "capture_hidden_mode", None)
-        if (
-            (
-                getattr(logits_metadata, _VERL_DRAFTER_RETURN_LAST_HIDDEN_ATTR, False)
-                or _sglang_drafter_return_last_hidden_enabled()
-            )
-            and capture_hidden_mode is not None
-            and capture_hidden_mode.is_full()
-            and aux_hidden_states is not None
-            and hidden_states is not None
-        ):
-            if torch.is_tensor(aux_hidden_states):
-                hidden_parts = [aux_hidden_states]
-            else:
-                hidden_parts = list(aux_hidden_states)
-            if hidden_parts:
-                hidden_parts.append(hidden_states)
-                return torch.cat(hidden_parts, dim=-1)
+        return_last_hidden = False
+        if _sglang_drafter_return_last_hidden_enabled():
+            return_last_hidden = True
+        else:
+            return_last_hidden = _sglang_forward_batch_requests_last_hidden_for_drafter(logits_metadata)
 
-        return original_method(
+        output = original_method(
             self,
+            input_ids,
             hidden_states,
-            hidden_states_before_norm,
-            aux_hidden_states,
-            pruned_states,
-            pruned_states_before_norm,
-            aux_pruned_states,
-            sample_indices,
+            lm_head,
             logits_metadata,
+            aux_hidden_states,
+            hidden_states_before_norm,
         )
+        if return_last_hidden and getattr(output, "hidden_states", None) is not None and hidden_states is not None:
+            setattr(output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, hidden_states)
+        return output
 
-    patched_get_hidden_states_to_store._verl_patched_drafter_last_hidden_output = True
-    return patched_get_hidden_states_to_store
+    patched_logits_processor_forward._verl_patched_drafter_last_hidden_output = True
+    return patched_logits_processor_forward
+
+
+def _copy_sglang_drafter_last_hidden_output(src, dst, index) -> None:
+    last_hidden_states = getattr(src, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, None)
+    if last_hidden_states is not None and dst is not None:
+        setattr(dst, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, last_hidden_states[index])
+
+
+def _sglang_graph_replay_output_buffer(runner, original_method):
+    keys = []
+    if getattr(runner, "enable_pdmux", False):
+        get_current_stream_idx = original_method.__globals__.get("get_current_stream_idx")
+        if callable(get_current_stream_idx):
+            keys.append(f"{get_current_stream_idx()}_{runner.bs}")
+    keys.append(runner.bs)
+    for key in keys:
+        try:
+            return runner.output_buffers[key]
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def _make_sglang_drafter_last_hidden_graph_replay_patch(original_method):
+    @wraps(original_method)
+    def patched_graph_replay(self, *args, **kwargs):
+        result = original_method(self, *args, **kwargs)
+        output = _sglang_graph_replay_output_buffer(self, original_method)
+        if output is not None:
+            _copy_sglang_drafter_last_hidden_output(output, result, slice(0, self.raw_num_token))
+        return result
+
+    patched_graph_replay._verl_patched_drafter_last_hidden_output = True
+    return patched_graph_replay
 
 
 def patch_sglang_drafter_last_hidden_output() -> None:
-    """Optionally append the final target hidden to SGLang's EAGLE3 aux hidden output."""
+    """Carry final target hidden to verl output without changing SGLang EAGLE's 3H hidden."""
     global _SGLANG_DRAFTER_LAST_HIDDEN_OUTPUT_PATCHED
     if _SGLANG_DRAFTER_LAST_HIDDEN_OUTPUT_PATCHED:
         return
 
     try:
         logits_module = importlib.import_module("sglang.srt.layers.logits_processor")
-        logits_metadata_cls = getattr(logits_module, "LogitsMetadata")
         logits_processor_cls = getattr(logits_module, "LogitsProcessor")
     except Exception as exc:  # noqa: BLE001
         if _sglang_drafter_return_last_hidden_enabled():
@@ -2528,54 +2616,45 @@ def patch_sglang_drafter_last_hidden_output() -> None:
 
     active_parts = []
 
-    original_from_forward_batch = getattr(logits_metadata_cls, "from_forward_batch", None)
-    original_from_forward_batch_func = getattr(
-        original_from_forward_batch, "__func__", original_from_forward_batch
-    )
-    if original_from_forward_batch is None:
+    original_forward = getattr(logits_processor_cls, "forward", None)
+    if original_forward is None:
         if _sglang_drafter_return_last_hidden_enabled():
             raise RuntimeError(
-                "SGLang LogitsMetadata.from_forward_batch is missing; "
+                "SGLang LogitsProcessor.forward is missing; "
                 "cannot patch drafter last-hidden output."
             )
-    elif getattr(original_from_forward_batch_func, "_verl_patched_drafter_last_hidden_output", False):
-        active_parts.append("LogitsMetadata.from_forward_batch")
-    else:
-        @wraps(original_from_forward_batch)
-        def patched_from_forward_batch(cls, forward_batch):
-            if hasattr(original_from_forward_batch, "__func__"):
-                metadata = original_from_forward_batch.__func__(cls, forward_batch)
-            else:
-                metadata = original_from_forward_batch(forward_batch)
-            setattr(
-                metadata,
-                _VERL_DRAFTER_RETURN_LAST_HIDDEN_ATTR,
-                _sglang_forward_batch_requests_last_hidden_for_drafter(forward_batch),
-            )
-            return metadata
-
-        patched_from_forward_batch._verl_patched_drafter_last_hidden_output = True
-        setattr(logits_metadata_cls, "from_forward_batch", classmethod(patched_from_forward_batch))
-        active_parts.append("LogitsMetadata.from_forward_batch")
-
-    original_get_hidden_states = getattr(
-        logits_processor_cls, "_get_hidden_states_to_store", None
-    )
-    if original_get_hidden_states is None:
-        if _sglang_drafter_return_last_hidden_enabled():
-            raise RuntimeError(
-                "SGLang LogitsProcessor._get_hidden_states_to_store is missing; "
-                "cannot patch drafter last-hidden output."
-            )
-    elif getattr(original_get_hidden_states, "_verl_patched_drafter_last_hidden_output", False):
-        active_parts.append("LogitsProcessor._get_hidden_states_to_store")
+    elif getattr(original_forward, "_verl_patched_drafter_last_hidden_output", False):
+        active_parts.append("LogitsProcessor.forward")
     else:
         setattr(
             logits_processor_cls,
-            "_get_hidden_states_to_store",
-            _make_sglang_drafter_last_hidden_output_patch(original_get_hidden_states),
+            "forward",
+            _make_sglang_drafter_last_hidden_forward_patch(original_forward),
         )
-        active_parts.append("LogitsProcessor._get_hidden_states_to_store")
+        active_parts.append("LogitsProcessor.forward")
+
+    graph_targets = (
+        ("sglang.srt.model_executor.cuda_graph_runner", "CudaGraphRunner"),
+        ("sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner", "NPUGraphRunner"),
+    )
+    for module_name, class_name in graph_targets:
+        try:
+            graph_module = importlib.import_module(module_name)
+            graph_runner_cls = getattr(graph_module, class_name)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Skip SGLang graph replay last-hidden patch for %s.%s: %s", module_name, class_name, exc)
+            continue
+        original_replay = getattr(graph_runner_cls, "replay", None)
+        if original_replay is None or getattr(original_replay, "_verl_patched_drafter_last_hidden_output", False):
+            if original_replay is not None:
+                active_parts.append(f"{class_name}.replay")
+            continue
+        setattr(
+            graph_runner_cls,
+            "replay",
+            _make_sglang_drafter_last_hidden_graph_replay_patch(original_replay),
+        )
+        active_parts.append(f"{class_name}.replay")
 
     if active_parts:
         _SGLANG_DRAFTER_LAST_HIDDEN_OUTPUT_PATCHED = True
