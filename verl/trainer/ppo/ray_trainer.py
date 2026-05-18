@@ -1730,6 +1730,12 @@ class RayPPOTrainer:
                         # Still in critic warmup, only update weights to wake up rollout replicas.
                         self.checkpoint_manager.update_weights(self.global_steps)
                     else:
+                        # last-hidden drafter training must use the same actor head version
+                        # that produced this step's rollout hidden states.
+                        if self.use_drafter and self.drafter_wg is not None:
+                            with marked_timer("sync_drafter_target_lm_head", timing_raw, color="red"):
+                                metrics["drafter/target_lm_head_synced"] = self._sync_drafter_target_lm_head()
+
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self._update_actor(batch)
@@ -1757,10 +1763,6 @@ class RayPPOTrainer:
                                 print("Force saving checkpoint: ESI instance expiration approaching.")
                             with marked_timer("save_checkpoint", timing_raw, color="green"):
                                 self._save_checkpoint()
-
-                        if self.use_drafter and self.drafter_wg is not None:
-                            with marked_timer("sync_drafter_target_lm_head", timing_raw, color="red"):
-                                metrics["drafter/target_lm_head_synced"] = self._sync_drafter_target_lm_head()
 
                         drafter_trained = False
                         if self.use_drafter and self.drafter_wg is not None:

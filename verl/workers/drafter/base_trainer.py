@@ -1116,10 +1116,19 @@ class DrafterBaseTrainer:
 
         min_items_for_batch = 1
 
-        # Determine data source: DataBuffer (cross-step) or collected_data (current step only)
+        use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))
+        same_step_target_head_required = self.backend.model_type == "eagle3" and not use_logits
+
+        # Determine data source: DataBuffer (cross-step) or collected_data (current step only).
+        # last-hidden supervision can only be reconstructed with the exact target
+        # head version that produced those hidden states, so older buffered Eagle3
+        # samples are not valid for the actor head synced for this rollout step.
         if self.use_data_buffer and len(self.data_buffer) > 0:
-            # Use data from last N RL steps via DataBuffer
-            buffer_steps = int(self.config.rollout.drafter.training.get("sample_last_n_steps", buffer_steps))
+            if same_step_target_head_required:
+                buffer_steps = 0
+            else:
+                # Use data from last N RL steps via DataBuffer
+                buffer_steps = int(self.config.rollout.drafter.training.get("sample_last_n_steps", buffer_steps))
             available_data = self.data_buffer.get_data_from_last_n_steps(buffer_steps)
             if len(available_data) < effective_batch_size:
                 if len(available_data) >= min_items_for_batch:
@@ -1146,7 +1155,6 @@ class DrafterBaseTrainer:
                 items = rng.sample(current_step_data, effective_batch_size)
 
         # Filter out items without the tensors required by the selected loss path.
-        use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))
         last_hidden_logprob_check = bool(
             self.backend.model_type == "eagle3"
             and not use_logits
