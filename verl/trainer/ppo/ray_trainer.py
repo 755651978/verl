@@ -1013,6 +1013,15 @@ class RayPPOTrainer:
         ]
         return int(bool(accepted))
 
+    def _should_sync_drafter_target_lm_head(self) -> bool:
+        if not self.use_drafter or self.drafter_wg is None:
+            return False
+        training_cfg = self.config.actor_rollout_ref.rollout.drafter.training
+        if training_cfg.get("use_logits", False):
+            return False
+        train_interval = int(training_cfg.get("training_interval_steps", 1))
+        return train_interval > 0 and self.global_steps % train_interval == 0
+
     def _summarize_drafter_train_results(self, drafter_train_results: list[Any]) -> dict[str, float]:
         summary = {
             "drafter/triggered": 0,
@@ -1731,10 +1740,14 @@ class RayPPOTrainer:
                         self.checkpoint_manager.update_weights(self.global_steps)
                     else:
                         # last-hidden drafter training must use the same actor head version
-                        # that produced this step's rollout hidden states.
+                        # that produced this step's rollout hidden states. Only
+                        # copy it when the drafter will train on this PPO step.
                         if self.use_drafter and self.drafter_wg is not None:
-                            with marked_timer("sync_drafter_target_lm_head", timing_raw, color="red"):
-                                metrics["drafter/target_lm_head_synced"] = self._sync_drafter_target_lm_head()
+                            if self._should_sync_drafter_target_lm_head():
+                                with marked_timer("sync_drafter_target_lm_head", timing_raw, color="red"):
+                                    metrics["drafter/target_lm_head_synced"] = self._sync_drafter_target_lm_head()
+                            else:
+                                metrics["drafter/target_lm_head_synced"] = 0
 
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):

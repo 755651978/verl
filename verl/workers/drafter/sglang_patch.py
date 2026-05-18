@@ -1911,7 +1911,18 @@ def patch_sglang_eagle_verify_hidden_states_full() -> None:
             continue
         patched_method = _make_sglang_eagle_verify_full_hidden_patch(original_method)
         if patched_method is None:
-            logger.debug("Skip SGLang EAGLE full hidden-state patch for %s.%s", module_name, class_name)
+            wrapped_method = _wrap_sglang_eagle_verify_last_hidden_filter(original_method)
+            if wrapped_method is original_method:
+                logger.debug("Skip SGLang EAGLE full hidden-state patch for %s.%s", module_name, class_name)
+                continue
+            setattr(worker_cls, "verify", wrapped_method)
+            patched_targets.append(f"{module_name}.{class_name}.verify[last-hidden-filter]")
+            logger.warning(
+                "SGLang EAGLE full hidden-state source patch skipped for %s.%s; "
+                "installed last-hidden accepted-index filter only.",
+                module_name,
+                class_name,
+            )
             continue
         setattr(worker_cls, "verify", patched_method)
         patched_targets.append(f"{module_name}.{class_name}.verify")
