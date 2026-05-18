@@ -1355,9 +1355,35 @@ def _slice_sglang_drafter_last_hidden_output(logits_output, index):
 
 
 def _filter_sglang_drafter_last_hidden_output(logits_output, index) -> None:
-    last_hidden_states = _slice_sglang_drafter_last_hidden_output(logits_output, index)
-    if last_hidden_states is not None:
-        setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, last_hidden_states)
+    last_hidden_states = getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, None)
+    if last_hidden_states is None:
+        return
+
+    # The verify path may already have applied this filter through a source
+    # patch. Keep this helper idempotent so a wrapper can safely call it again
+    # across SGLang versions whose source layout differs.
+    try:
+        index_len = int(index.numel()) if _is_torch_tensor(index) else len(index)
+    except Exception:  # noqa: BLE001
+        index_len = None
+    if _is_torch_tensor(last_hidden_states) and index_len is not None and last_hidden_states.dim() > 0:
+        hidden_rows = int(last_hidden_states.shape[0])
+        if hidden_rows == index_len:
+            return
+        if hidden_rows < index_len:
+            logger.warning(
+                "Skip filtering SGLang drafter last-hidden output: hidden_rows=%s < index_len=%s",
+                hidden_rows,
+                index_len,
+            )
+            return
+
+    try:
+        filtered_last_hidden_states = last_hidden_states[index]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to filter SGLang drafter last-hidden output by accepted indices: %s", exc)
+        return
+    setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, filtered_last_hidden_states)
 
 
 def _sglang_hidden_chunk_rows(chunk) -> int:
@@ -1757,6 +1783,26 @@ def _validate_sglang_eagle_verify_hidden_states(batch, spec_info, logits_output)
     )
 
 
+def _wrap_sglang_eagle_verify_last_hidden_filter(method):
+    if getattr(method, "_verl_patched_drafter_last_hidden_filter", False):
+        return method
+
+    @wraps(method)
+    def patched_verify_last_hidden_filter(self, *args, **kwargs):
+        result = method(self, *args, **kwargs)
+        try:
+            logits_output, verify_output = result[0], result[1]
+            accepted_indices = getattr(verify_output, "accepted_indices", None)
+            if accepted_indices is not None:
+                _filter_sglang_drafter_last_hidden_output(logits_output, accepted_indices)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to apply SGLang drafter last-hidden verify filter: %s", exc)
+        return result
+
+    patched_verify_last_hidden_filter._verl_patched_drafter_last_hidden_filter = True
+    return patched_verify_last_hidden_filter
+
+
 def _make_sglang_eagle_verify_full_hidden_patch(original_method):
     try:
         source = inspect.getsource(original_method)
@@ -1833,7 +1879,7 @@ def _make_sglang_eagle_verify_full_hidden_patch(original_method):
     patched_method = namespace[original_method.__name__]
     patched_method = wraps(original_method)(patched_method)
     patched_method._verl_patched_eagle_verify_full_hidden_states = True
-    return patched_method
+    return _wrap_sglang_eagle_verify_last_hidden_filter(patched_method)
 
 
 def patch_sglang_eagle_verify_hidden_states_full() -> None:
@@ -1855,7 +1901,13 @@ def patch_sglang_eagle_verify_hidden_states_full() -> None:
         except Exception as exc:  # noqa: BLE001
             logger.debug("Skip SGLang EAGLE full hidden-state patch for %s.%s: %s", module_name, class_name, exc)
             continue
-        if original_method is None or getattr(original_method, "_verl_patched_eagle_verify_full_hidden_states", False):
+        if original_method is None:
+            continue
+        if getattr(original_method, "_verl_patched_eagle_verify_full_hidden_states", False):
+            wrapped_method = _wrap_sglang_eagle_verify_last_hidden_filter(original_method)
+            if wrapped_method is not original_method:
+                setattr(worker_cls, "verify", wrapped_method)
+            patched_targets.append(f"{module_name}.{class_name}.verify")
             continue
         patched_method = _make_sglang_eagle_verify_full_hidden_patch(original_method)
         if patched_method is None:
