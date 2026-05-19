@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import os
+import time
 from dataclasses import asdict
 from typing import Generator
 
@@ -482,16 +483,37 @@ class ServerAdapter(BaseRollout):
                 preview,
             )
 
-        update_weights_bucket_bytes = int(self.config.checkpoint_engine.update_weights_bucket_megabytes) << 20
+        training_cfg = self.config.drafter.training
+        draft_bucket_mb = training_cfg.get("draft_update_weights_bucket_megabytes", None)
+        if draft_bucket_mb is None:
+            draft_bucket_mb = self.config.checkpoint_engine.update_weights_bucket_megabytes
+        update_weights_bucket_bytes = int(draft_bucket_mb) << 20
         pause_for_speculative_update = bool(
             self.config.drafter.enable and not _speculative_weight_sync_guard_disabled()
         )
+        pause_for_speculative_update = pause_for_speculative_update and bool(
+            training_cfg.get("draft_update_pause_generation", True)
+        )
+        flush_before_update = bool(training_cfg.get("draft_update_flush_before", True))
+        flush_after_update = bool(training_cfg.get("draft_update_flush_after", True))
         generation_paused = False
+        timing = {
+            "pause_generation": 0.0,
+            "flush_before": 0.0,
+            "bucket_update": 0.0,
+            "flush_after": 0.0,
+            "set_global_steps": 0.0,
+        }
         try:
             if self.device_mesh["infer_tp"].get_local_rank() == 0 and pause_for_speculative_update:
+                ts = time.perf_counter()
                 await self._engine.pause_generation()
+                timing["pause_generation"] += time.perf_counter() - ts
                 generation_paused = True
-                await self._engine.flush_cache()
+                if flush_before_update:
+                    ts = time.perf_counter()
+                    await self._engine.flush_cache()
+                    timing["flush_before"] += time.perf_counter() - ts
 
             bucket_idx = 0
             async for params_batch in get_named_tensor_buckets(weights.items(), update_weights_bucket_bytes):
@@ -508,6 +530,7 @@ class ServerAdapter(BaseRollout):
                         bucket_bytes,
                         [name for name, _ in params_batch[:5]],
                     )
+                ts = time.perf_counter()
                 await _sgl_update_weights_with_route(
                     engine=self._engine,
                     params_batch=params_batch,
@@ -522,16 +545,29 @@ class ServerAdapter(BaseRollout):
                     flush_cache=False,
                     abort_all_requests=False,
                 )
+                timing["bucket_update"] += time.perf_counter() - ts
 
             if self.device_mesh["infer_tp"].get_local_rank() == 0:
-                await self._engine.flush_cache()
+                if flush_after_update:
+                    ts = time.perf_counter()
+                    await self._engine.flush_cache()
+                    timing["flush_after"] += time.perf_counter() - ts
                 if global_steps is not None:
+                    ts = time.perf_counter()
                     await self.server_actor.set_global_steps.remote(global_steps)
+                    timing["set_global_steps"] += time.perf_counter() - ts
                 logger.warning(
-                    "[sglang draft update] done global_steps=%s buckets=%s server_global_steps_set=%s",
+                    "[sglang draft update] done global_steps=%s buckets=%s bucket_mb=%s "
+                    "pause_generation=%s flush_before=%s flush_after=%s server_global_steps_set=%s "
+                    "timing=%s",
                     global_steps,
                     bucket_idx,
+                    int(draft_bucket_mb),
+                    pause_for_speculative_update,
+                    flush_before_update,
+                    flush_after_update,
                     global_steps is not None,
+                    {k: round(v, 3) for k, v in timing.items()},
                 )
         finally:
             if self.device_mesh["infer_tp"].get_local_rank() == 0 and generation_paused:

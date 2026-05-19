@@ -755,6 +755,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             return
         await self.rollout.update_draft_weights(weights, global_steps=global_steps)
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    async def update_draft_weights_async(self, weights: dict[str, torch.Tensor], global_steps: int = None):
+        if not self.config.rollout.drafter.enable:
+            return
+        await self.rollout.update_draft_weights(weights, global_steps=global_steps)
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
         assert "actor" in self.role, "load_checkpoint only support actor role"

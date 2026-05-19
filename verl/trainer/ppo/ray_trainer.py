@@ -313,6 +313,7 @@ class RayPPOTrainer:
             and Role.Drafter in role_worker_mapping
         )
         self.drafter_wg = None
+        self._pending_drafter_publish_refs = None
         self.ray_worker_group_cls = ray_worker_group_cls
         self.device_name = device_name if device_name else self.config.trainer.device
         self.validation_generations_logger = ValidationGenerationsLogger(
@@ -982,6 +983,21 @@ class RayPPOTrainer:
                 f"but received {len(non_null_weights)} results."
             )
         return non_null_weights[0]
+
+    def _should_publish_drafter_weights(self, drafter_trained: bool) -> bool:
+        if not drafter_trained or not self.use_drafter or self.drafter_wg is None:
+            return False
+        training_cfg = self.config.actor_rollout_ref.rollout.drafter.training
+        publish_interval = int(training_cfg.get("publish_interval_steps", 0))
+        return publish_interval <= 0 or self.global_steps % publish_interval == 0
+
+    def _wait_pending_drafter_publish(self) -> int:
+        if not self._pending_drafter_publish_refs:
+            return 0
+        pending_refs = self._pending_drafter_publish_refs
+        self._pending_drafter_publish_refs = None
+        ray.get(pending_refs)
+        return len(pending_refs)
 
     def _get_actor_lm_head_payload(self) -> Optional[dict[str, torch.Tensor]]:
         if not self.use_drafter or self.drafter_wg is None:
@@ -1793,15 +1809,29 @@ class RayPPOTrainer:
                             self.checkpoint_manager.update_weights(self.global_steps)
 
                         if self.use_drafter and self.drafter_wg is not None:
-                            if drafter_trained:
+                            should_publish_drafter = self._should_publish_drafter_weights(drafter_trained)
+                            if should_publish_drafter:
                                 with marked_timer("publish_drafter", timing_raw, color="red"):
                                     metrics["drafter/publish_attempted"] = 1
+                                    metrics["drafter/publish_skipped_interval"] = 0
+                                    waited_publish_refs = self._wait_pending_drafter_publish()
+                                    metrics["drafter/publish_async_waited"] = waited_publish_refs
                                     drafter_weights = self._get_published_drafter_weights()
                                     try:
                                         if drafter_weights is not None:
-                                            self.actor_rollout_wg.update_draft_weights(
-                                                drafter_weights, global_steps=self.global_steps
-                                            )
+                                            training_cfg = self.config.actor_rollout_ref.rollout.drafter.training
+                                            if bool(training_cfg.get("publish_async", False)):
+                                                self._pending_drafter_publish_refs = (
+                                                    self.actor_rollout_wg.update_draft_weights_async(
+                                                        drafter_weights, global_steps=self.global_steps
+                                                    )
+                                                )
+                                                metrics["drafter/publish_async"] = 1
+                                            else:
+                                                self.actor_rollout_wg.update_draft_weights(
+                                                    drafter_weights, global_steps=self.global_steps
+                                                )
+                                                metrics["drafter/publish_async"] = 0
                                             metrics["drafter/published"] = 1
                                         else:
                                             metrics["drafter/published"] = 0
@@ -1810,6 +1840,9 @@ class RayPPOTrainer:
                             else:
                                 metrics["drafter/publish_attempted"] = 0
                                 metrics["drafter/published"] = 0
+                                metrics["drafter/publish_async"] = 0
+                                metrics["drafter/publish_async_waited"] = 0
+                                metrics["drafter/publish_skipped_interval"] = int(drafter_trained)
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)

@@ -472,6 +472,14 @@ drafter:
     step: 10
     batch_size_per_gpu: 4
     training_interval_steps: 10
+    publish_interval_steps: 0
+    publish_async: false
+    publish_dtype: null
+    publish_param_name_patterns: null
+    draft_update_weights_bucket_megabytes: null
+    draft_update_pause_generation: true
+    draft_update_flush_before: true
+    draft_update_flush_after: true
     sample_last_n_steps: 20
     train_batches_per_cycle: 4
     lr: 1e-6
