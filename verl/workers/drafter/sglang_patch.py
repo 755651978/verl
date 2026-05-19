@@ -83,6 +83,8 @@ _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR = "_verl_drafter_last_hidden_states"
 _VERL_TOP_LOGPROBS_TENSOR_PARAM = "_verl_top_logprobs_tensor_output"
 _VERL_OUTPUT_TOP_LOGPROBS_TENSOR_KEY = "_verl_output_top_logprobs_tensor"
 _VERL_TOP_LOGPROBS_TENSOR_CHUNK_MARKER = "__verl_top_logprobs_tensor_chunk__"
+_VERL_TOP_LOGPROBS_OUTPUT_ROW_START_PARAM = "_verl_top_logprobs_output_row_start"
+_VERL_TOP_LOGPROBS_OUTPUT_ROW_END_PARAM = "_verl_top_logprobs_output_row_end"
 
 
 def configure_sglang_eagle_weight_update_patch(
@@ -1319,6 +1321,44 @@ def _sglang_req_requests_top_logprobs_tensor(req) -> bool:
     return _custom_flag_enabled(_sglang_req_custom_params(req).get(_VERL_TOP_LOGPROBS_TENSOR_PARAM, False))
 
 
+def _sglang_top_logprobs_output_row_bounds(custom_params: dict[str, Any]) -> tuple[int, int | None]:
+    start = _int_or_none(custom_params.get(_VERL_TOP_LOGPROBS_OUTPUT_ROW_START_PARAM))
+    end = _int_or_none(custom_params.get(_VERL_TOP_LOGPROBS_OUTPUT_ROW_END_PARAM))
+    start = max(int(start), 0) if start is not None else 0
+    if end is not None:
+        end = max(int(end), start)
+    return start, end
+
+
+def _sglang_req_top_logprobs_output_row_bounds(req) -> tuple[int, int | None]:
+    return _sglang_top_logprobs_output_row_bounds(_sglang_req_custom_params(req))
+
+
+def _sglang_state_top_logprobs_output_row_bounds(state) -> tuple[int, int | None]:
+    return _sglang_top_logprobs_output_row_bounds(_sglang_state_custom_params(state))
+
+
+def _sglang_req_should_keep_top_logprobs_output_row(req, output_row: int) -> bool:
+    start, end = _sglang_req_top_logprobs_output_row_bounds(req)
+    output_row = int(output_row)
+    if output_row < start:
+        return False
+    return end is None or output_row < end
+
+
+def _sglang_top_logprobs_nums_for_spec_output_rows(reqs, top_logprobs_nums, num_tokens_per_req):
+    nums = []
+    for req, topk, num_tokens in zip(reqs, top_logprobs_nums, num_tokens_per_req):
+        topk = int(topk or 0)
+        row_base = len(getattr(req, "output_token_logprobs_val", []) or [])
+        for row_offset in range(int(num_tokens)):
+            if topk > 0 and _sglang_req_should_keep_top_logprobs_output_row(req, row_base + row_offset):
+                nums.append(topk)
+            else:
+                nums.append(0)
+    return nums
+
+
 def _sglang_req_requests_last_hidden_for_drafter(req) -> bool:
     return _custom_flag_enabled(
         _sglang_req_custom_params(req).get(_VERL_DRAFTER_RETURN_LAST_HIDDEN_PARAM, False)
@@ -1957,16 +1997,33 @@ def _make_sglang_top_logprobs_raw_tensor_output(original_fn):
         if not top_logprobs_nums:
             return [], []
 
-        max_k = max(top_logprobs_nums)
+        active_positions = [i for i, k in enumerate(top_logprobs_nums) if int(k) > 0]
+        max_k = max((int(top_logprobs_nums[i]) for i in active_positions), default=0)
         if max_k <= 0:
-            return original_fn(
-                logprobs,
-                top_logprobs_nums,
-                stage,
-                extend_logprob_pruned_lens_cpu=extend_logprob_pruned_lens_cpu,
-            )
+            empty_values = torch.empty((len(top_logprobs_nums), 0), dtype=_sglang_top_logprobs_values_dtype())
+            empty_indices = torch.empty((len(top_logprobs_nums), 0), dtype=torch.int32)
+            return empty_values, empty_indices
 
-        values, indices = logprobs.topk(max_k, dim=-1)
+        if _sglang_logprob_stage_name(stage) == "DECODE" and len(active_positions) < int(logprobs.shape[0]):
+            active_index = torch.tensor(active_positions, device=logprobs.device, dtype=torch.long)
+            active_values, active_indices = logprobs.index_select(0, active_index).topk(max_k, dim=-1)
+            values = torch.full(
+                (len(top_logprobs_nums), max_k),
+                float("-inf"),
+                device=active_values.device,
+                dtype=active_values.dtype,
+            )
+            indices = torch.full(
+                (len(top_logprobs_nums), max_k),
+                -1,
+                device=active_indices.device,
+                dtype=active_indices.dtype,
+            )
+            values.index_copy_(0, active_index, active_values)
+            indices.index_copy_(0, active_index, active_indices)
+        else:
+            values, indices = logprobs.topk(max_k, dim=-1)
+
         values = values.detach().to(
             device="cpu",
             dtype=_sglang_top_logprobs_values_dtype(),
@@ -2141,14 +2198,28 @@ def _sglang_top_logprobs_chunk_tensor(chunk, topk: int) -> dict[str, torch.Tenso
     return None
 
 
-def _pack_sglang_output_top_logprobs_tensor(values_rows, indices_rows, topk: int) -> dict[str, torch.Tensor] | None:
+def _pack_sglang_output_top_logprobs_tensor(
+    values_rows,
+    indices_rows,
+    topk: int,
+    *,
+    output_row_start: int = 0,
+    output_row_end: int | None = None,
+) -> dict[str, torch.Tensor] | None:
     if topk <= 0 or values_rows is None or indices_rows is None:
+        return None
+
+    total_rows = min(len(values_rows), len(indices_rows))
+    output_row_start = max(int(output_row_start), 0)
+    output_row_end = total_rows if output_row_end is None else min(max(int(output_row_end), output_row_start), total_rows)
+    if output_row_start >= output_row_end:
         return None
 
     chunk_payloads = []
     plain_values_rows = []
     plain_indices_rows = []
-    for row_idx, values in enumerate(values_rows):
+    for row_idx in range(output_row_start, output_row_end):
+        values = values_rows[row_idx]
         indices = indices_rows[row_idx] if row_idx < len(indices_rows) else None
         chunk_payload = _sglang_top_logprobs_chunk_tensor(values, topk)
         if chunk_payload is not None:
@@ -2189,20 +2260,30 @@ def _pack_sglang_output_top_logprobs_tensor(values_rows, indices_rows, topk: int
         return {
             "values": payloads[0]["values"].contiguous(),
             "indices": payloads[0]["indices"].contiguous(),
+            "output_row_start": output_row_start,
+            "output_row_end": output_row_start + int(payloads[0]["values"].size(0)),
         }
+    values = torch.cat([payload["values"] for payload in payloads], dim=0).contiguous()
+    indices = torch.cat([payload["indices"] for payload in payloads], dim=0).contiguous()
     return {
-        "values": torch.cat([payload["values"] for payload in payloads], dim=0).contiguous(),
-        "indices": torch.cat([payload["indices"] for payload in payloads], dim=0).contiguous(),
+        "values": values,
+        "indices": indices,
+        "output_row_start": output_row_start,
+        "output_row_end": output_row_start + int(values.size(0)),
     }
 
 
 def _sglang_pack_output_top_logprobs_stream_slice(req, start: int):
-    values_rows = getattr(req, "output_top_logprobs_val", [])[start:]
-    indices_rows = getattr(req, "output_top_logprobs_idx", [])[start:]
+    values_rows = getattr(req, "output_top_logprobs_val", [])
+    indices_rows = getattr(req, "output_top_logprobs_idx", [])
+    row_start, row_end = _sglang_req_top_logprobs_output_row_bounds(req)
+    row_start = max(int(start), row_start)
     payload = _pack_sglang_output_top_logprobs_tensor(
         values_rows,
         indices_rows,
         int(getattr(req, "top_logprobs_num", 0) or 0),
+        output_row_start=row_start,
+        output_row_end=row_end,
     )
     if payload is None:
         return []
@@ -2258,10 +2339,13 @@ def _make_sglang_add_logprob_to_meta_info_tensor_output(original_method):
 
         topk = int(top_logprobs_num or 0)
         if topk > 0:
+            output_row_start, output_row_end = _sglang_state_top_logprobs_output_row_bounds(state)
             output_top_logprobs = _pack_sglang_output_top_logprobs_tensor(
                 state.output_top_logprobs_val,
                 state.output_top_logprobs_idx,
                 topk,
+                output_row_start=output_row_start,
+                output_row_end=output_row_end,
             )
             if output_top_logprobs is not None:
                 meta_info[_VERL_OUTPUT_TOP_LOGPROBS_TENSOR_KEY] = output_top_logprobs
@@ -2340,6 +2424,31 @@ def patch_sglang_top_logprobs_tensor_output() -> None:
         logprob_module.get_top_logprobs_prefill = patched_get_top_logprobs_prefill
         sampler_module.get_top_logprobs = patched_get_top_logprobs
         logits_processor_module.get_top_logprobs_prefill = patched_get_top_logprobs_prefill
+
+    spec_logprob_fn = getattr(logprob_module, "add_output_logprobs_for_spec_v1", None)
+    if spec_logprob_fn is not None and not getattr(
+        spec_logprob_fn,
+        "_verl_patched_top_logprobs_tensor_output",
+        False,
+    ):
+        patched_spec_logprob_fn = _make_sglang_spec_top_logprobs_window_patch(spec_logprob_fn)
+        if patched_spec_logprob_fn is not None:
+            logprob_module.add_output_logprobs_for_spec_v1 = patched_spec_logprob_fn
+            for module_name in (
+                "sglang.srt.speculative.eagle_worker",
+                "sglang.srt.speculative.multi_layer_eagle_worker",
+                "sglang.srt.speculative.ngram_worker",
+            ):
+                try:
+                    spec_module = importlib.import_module(module_name)
+                except Exception:  # noqa: BLE001
+                    continue
+                if getattr(spec_module, "add_output_logprobs_for_spec_v1", None) is spec_logprob_fn:
+                    spec_module.add_output_logprobs_for_spec_v1 = patched_spec_logprob_fn
+        else:
+            logger.debug(
+                "Skip SGLang spec top-logprobs row-window patch: add_output_logprobs_for_spec_v1 source block not found."
+            )
 
     detokenize_logprob = getattr(tokenizer_manager_cls, "detokenize_logprob_tokens", None)
     if detokenize_logprob is not None and not getattr(
@@ -2427,6 +2536,21 @@ _SGLANG_STREAM_TOP_LOGPROBS_SLICE_PATTERN = re.compile(
     r"(?P=indent)[ \t]+\]\r?\n"
     r"(?P=indent)\)\r?\n",
 )
+_SGLANG_SPEC_TOP_LOGPROBS_REPEAT_PATTERN = re.compile(
+    r"(?ms)^(?P<indent>[ \t]+)top_logprobs_nums_repeat_interleaved\s*=\s*\[\r?\n"
+    r"(?P=indent)[ \t]+num\r?\n"
+    r"(?P=indent)[ \t]+for\s+num,\s*num_tokens\s+in\s+zip\(top_logprobs_nums,\s*num_tokens_per_req\)\r?\n"
+    r"(?P=indent)[ \t]+for\s+_\s+in\s+range\(num_tokens\)\r?\n"
+    r"(?P=indent)\]\r?\n",
+)
+_SGLANG_SPEC_TOP_LOGPROBS_APPEND_PATTERN = re.compile(
+    r"(?ms)^(?P<indent>[ \t]+)if\s+req\.top_logprobs_num\s*>\s*0\s*:\r?\n"
+    r"(?P=indent)[ \t]+assert\s*\(\r?\n"
+    r"(?P=indent)[ \t]+[ \t]+should_top_logprobs\r?\n"
+    r"(?P=indent)[ \t]+\),\s*\"Inconsistent state: should_top_logprobs is False\"\r?\n"
+    r"(?P=indent)[ \t]+req\.output_top_logprobs_val\.append\(token_top_logprobs_val\[pt\]\)\r?\n"
+    r"(?P=indent)[ \t]+req\.output_top_logprobs_idx\.append\(token_top_logprobs_idx\[pt\]\)\r?\n",
+)
 
 
 def _replace_sglang_hidden_states_list_output(source: str) -> tuple[str, int]:
@@ -2502,6 +2626,54 @@ def _render_sglang_stream_top_logprobs_slice(match: re.Match) -> str:
         f"{indent}        ]\n"
         f"{indent}    )\n"
     )
+
+
+def _render_sglang_spec_top_logprobs_repeat(match: re.Match) -> str:
+    indent = match.group("indent")
+    return (
+        f"{indent}top_logprobs_nums_repeat_interleaved = _sglang_top_logprobs_nums_for_spec_output_rows(\n"
+        f"{indent}    batch.reqs,\n"
+        f"{indent}    top_logprobs_nums,\n"
+        f"{indent}    num_tokens_per_req,\n"
+        f"{indent})\n"
+    )
+
+
+def _render_sglang_spec_top_logprobs_append(match: re.Match) -> str:
+    indent = match.group("indent")
+    return (
+        f"{indent}if req.top_logprobs_num > 0:\n"
+        f"{indent}    if _sglang_req_should_keep_top_logprobs_output_row(\n"
+        f"{indent}        req,\n"
+        f"{indent}        len(req.output_token_logprobs_val) - 1,\n"
+        f"{indent}    ):\n"
+        f"{indent}        assert (\n"
+        f"{indent}            should_top_logprobs\n"
+        f"{indent}        ), \"Inconsistent state: should_top_logprobs is False\"\n"
+        f"{indent}        req.output_top_logprobs_val.append(token_top_logprobs_val[pt])\n"
+        f"{indent}        req.output_top_logprobs_idx.append(token_top_logprobs_idx[pt])\n"
+        f"{indent}    else:\n"
+        f"{indent}        req.output_top_logprobs_val.append([])\n"
+        f"{indent}        req.output_top_logprobs_idx.append([])\n"
+    )
+
+
+def _patch_sglang_spec_top_logprobs_window_source(source: str) -> str | None:
+    patched_source, repeat_count = _SGLANG_SPEC_TOP_LOGPROBS_REPEAT_PATTERN.subn(
+        _render_sglang_spec_top_logprobs_repeat,
+        source,
+        count=1,
+    )
+    if repeat_count <= 0:
+        return None
+    patched_source, append_count = _SGLANG_SPEC_TOP_LOGPROBS_APPEND_PATTERN.subn(
+        _render_sglang_spec_top_logprobs_append,
+        patched_source,
+        count=1,
+    )
+    if append_count <= 0:
+        return None
+    return patched_source
 
 
 def _insert_sglang_decode_hidden_state_offset(source: str) -> str | None:
@@ -2586,6 +2758,36 @@ def _make_sglang_top_logprobs_stream_output_patch(original_method):
     patched_method = wraps(original_method)(patched_method)
     patched_method._verl_patched_top_logprobs_stream_tensor_output = True
     return patched_method
+
+
+def _make_sglang_spec_top_logprobs_window_patch(original_fn):
+    try:
+        source = inspect.getsource(original_fn)
+    except (OSError, TypeError):
+        return None
+
+    source = textwrap.dedent(source)
+    patched_source = _patch_sglang_spec_top_logprobs_window_source(source)
+    if patched_source is None or patched_source == source:
+        return None
+
+    globals_dict = original_fn.__globals__
+    globals_dict["_sglang_top_logprobs_nums_for_spec_output_rows"] = (
+        _sglang_top_logprobs_nums_for_spec_output_rows
+    )
+    globals_dict["_sglang_req_should_keep_top_logprobs_output_row"] = (
+        _sglang_req_should_keep_top_logprobs_output_row
+    )
+    namespace = {}
+    exec(  # noqa: S102
+        "from __future__ import annotations\n" + patched_source,
+        globals_dict,
+        namespace,
+    )
+    patched_fn = namespace[original_fn.__name__]
+    patched_fn = wraps(original_fn)(patched_fn)
+    patched_fn._verl_patched_top_logprobs_tensor_output = True
+    return patched_fn
 
 
 def _make_sglang_hidden_states_tensor_output_patch(original_method):

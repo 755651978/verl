@@ -229,6 +229,16 @@ def _target_top_ids(target_logprobs: torch.Tensor, row: int, limit: int) -> list
     return top_ids
 
 
+def _eagle_target_logprobs_train_start(source_item: dict) -> int:
+    feature_start = source_item.get("_verl_feature_start")
+    target_position_start = source_item.get("_verl_target_position_start")
+    try:
+        return max(int(feature_start) + 1 - int(target_position_start), 0)
+    except (TypeError, ValueError):
+        # Legacy collected samples include an anchor target row at feature_start.
+        return 1
+
+
 def _first_index(mask: torch.Tensor) -> int | None:
     indices = torch.nonzero(mask, as_tuple=False).view(-1)
     if indices.numel() == 0:
@@ -831,16 +841,21 @@ class DrafterBaseTrainer:
                     target_logprobs_position_start + target_rows,
                 )
 
-                # A compact target_logprobs tensor may start at a non-zero
-                # original sequence position, e.g. response rows start at
-                # prompt_len - 1. If the hidden window starts earlier, advance
-                # only the leading feature rows. The tail is left untouched and
-                # later training length is capped by the available target rows.
-                if target_logprobs_position_start > feature_start:
-                    hidden_shift = target_logprobs_position_start - feature_start
+                # For EAGLE/EAGLE3, the loss target for hidden row p is the
+                # target row at original position p + 1. A compact tensor may
+                # therefore start one row after the hidden window without
+                # requiring us to drop the corresponding hidden/input row.
+                target_row_offset = (
+                    1
+                    if getattr(self.backend, "model_type", None) in ("eagle", "eagle3")
+                    else 0
+                )
+                required_target_start = feature_start + target_row_offset
+                if target_logprobs_position_start > required_target_start:
+                    hidden_shift = target_logprobs_position_start - required_target_start
                     hidden_start += hidden_shift
                     hidden_feature_length -= hidden_shift
-                    feature_start = target_logprobs_position_start
+                    feature_start += hidden_shift
 
                 if hidden_feature_length <= 0:
                     hidden_feature_length = 0
@@ -873,14 +888,19 @@ class DrafterBaseTrainer:
             target_end = None
             if cpu_target_logprobs is not None:
                 # target_logprobs row p stores the next-token target for the
-                # hidden/input row at original position p. A compact rollout
-                # tensor can start at target_base instead of row 0.
+                # original position p. For shifted EAGLE training, the first
+                # usable target row is feature_start + 1.
                 target_base = target_logprobs_position_start or 0
+                target_row_offset = (
+                    1
+                    if getattr(self.backend, "model_type", None) in ("eagle", "eagle3")
+                    else 0
+                )
                 target_limit = min(
                     cpu_target_logprobs.size(1),
                     max((target_logprobs_position_end or target_base) - target_base, 0),
                 )
-                target_start = min(max(feature_start - target_base, 0), target_limit)
+                target_start = min(max(feature_start + target_row_offset - target_base, 0), target_limit)
                 target_end = min(max(feature_end - 1 - target_base, target_start), target_limit)
                 target_logprobs_item = cpu_target_logprobs[i, target_start:target_end, ...]
 
@@ -920,7 +940,14 @@ class DrafterBaseTrainer:
                 if target_logprobs_item is not None:
                     row_valid = _target_row_valid_mask(target_logprobs_item)
                     if row_valid is not None and row_valid.numel() > 0:
-                        active_mask = data_item["loss_mask"][1 : 1 + row_valid.size(0)].bool()
+                        target_debug_offset = (
+                            2
+                            if getattr(self.backend, "model_type", None) in ("eagle", "eagle3")
+                            else 1
+                        )
+                        active_mask = data_item["loss_mask"][
+                            target_debug_offset : target_debug_offset + row_valid.size(0)
+                        ].bool()
                         row_valid_count = int(row_valid.detach().sum().cpu().item())
                         active_rows = int(active_mask.detach().sum().cpu().item())
                         active_valid = int((row_valid & active_mask).detach().sum().cpu().item())
@@ -959,11 +986,18 @@ class DrafterBaseTrainer:
                             "target_shape": _tensor_shape(target_logprobs_item),
                         },
                     )
+                    window_input_ids = data_item["input_ids"]
+                    window_loss_mask = data_item["loss_mask"]
+                    window_feature_start = feature_start
+                    if getattr(self.backend, "model_type", None) in ("eagle", "eagle3"):
+                        window_input_ids = data_item["input_ids"][1:]
+                        window_loss_mask = data_item["loss_mask"][1:]
+                        window_feature_start = feature_start + 1
                     window_rows = _alignment_window_rows(
-                        data_item["input_ids"],
-                        data_item["loss_mask"],
+                        window_input_ids,
+                        window_loss_mask,
                         target_logprobs_item,
-                        feature_start=feature_start,
+                        feature_start=window_feature_start,
                         prompt_len=prompt_len if cpu_prompts is not None else None,
                         response_len=response_len if cpu_responses is not None else None,
                     )
@@ -1188,6 +1222,7 @@ class DrafterBaseTrainer:
         for item_idx, (ids, h_states, item_loss_mask, item_position_ids) in enumerate(
             zip(ids_list, hidden_list, mask_list, position_list)
         ):
+            source_item = items[item_idx] if item_idx < len(items) else {}
             uses_shifted_eagle_inputs = self.backend.model_type in ("eagle", "eagle3")
             seq_len = min(ids.size(0), h_states.size(0), item_loss_mask.size(0), item_position_ids.size(0))
             if seq_len < 1:
@@ -1195,14 +1230,16 @@ class DrafterBaseTrainer:
                 continue
 
             target_logprobs_item = None
+            target_logprobs_train_start = 0
             if self.backend.model_type == "eagle3" and use_logits:
                 target_logprobs_item = preprocessed_lists["target_logprobs"][item_idx]
+                target_logprobs_train_start = _eagle_target_logprobs_train_start(source_item)
                 train_seq_len = min(
                     max(ids.size(0) - 2, 0),
                     h_states.size(0),
                     max(item_loss_mask.size(0) - 2, 0),
                     item_position_ids.size(0),
-                    max(target_logprobs_item.size(0) - 1, 0),
+                    max(target_logprobs_item.size(0) - target_logprobs_train_start, 0),
                 )
             elif self.backend.model_type == "eagle3":
                 last_h_states = preprocessed_lists["last_h_states"][item_idx]
@@ -1240,11 +1277,12 @@ class DrafterBaseTrainer:
                 packed_loss_tokens += int(item_loss_mask[1 : 1 + train_seq_len].detach().float().sum().cpu().item())
 
             if alignment_debug_enabled():
-                source_item = items[item_idx] if item_idx < len(items) else {}
                 sample_index = self._alignment_debug_sample_index(current_step, "prepare_item")
                 train_target_logprobs = None
                 if self.backend.model_type == "eagle3" and use_logits:
-                    train_target_logprobs = target_logprobs_item[1 : 1 + train_seq_len]
+                    train_target_logprobs = target_logprobs_item[
+                        target_logprobs_train_start : target_logprobs_train_start + train_seq_len
+                    ]
                 row_valid_count = None
                 active_rows = None
                 active_valid = None
@@ -1286,6 +1324,7 @@ class DrafterBaseTrainer:
                             "target_end": source_item.get("_verl_target_end"),
                             "target_position_start": source_item.get("_verl_target_position_start"),
                             "target_position_end": source_item.get("_verl_target_position_end"),
+                            "target_train_start": target_logprobs_train_start,
                             "target_tensor_position_start": source_item.get("_verl_target_tensor_position_start"),
                             "target_tensor_position_end": source_item.get("_verl_target_tensor_position_end"),
                             "loss_after_shift": int(
@@ -1353,7 +1392,11 @@ class DrafterBaseTrainer:
 
             if self.backend.model_type == "eagle3":
                 if use_logits:
-                    target_logprob_chunks.append(target_logprobs_item[1 : 1 + train_seq_len])
+                    target_logprob_chunks.append(
+                        target_logprobs_item[
+                            target_logprobs_train_start : target_logprobs_train_start + train_seq_len
+                        ]
+                    )
                 else:
                     last_hidden_state_chunks.append(last_h_states[1 : 1 + train_seq_len])
             elif self.backend.model_type == "eagle":

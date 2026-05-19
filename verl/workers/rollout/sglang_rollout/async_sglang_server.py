@@ -74,6 +74,8 @@ _VERL_DRAFTER_RETURN_LAST_HIDDEN_ENV = "VERL_SGLANG_DRAFTER_RETURN_LAST_HIDDEN"
 _VERL_DRAFTER_RETURN_LAST_HIDDEN_PARAM = "_verl_drafter_return_last_hidden"
 _VERL_TOP_LOGPROBS_TENSOR_PARAM = "_verl_top_logprobs_tensor_output"
 _VERL_OUTPUT_TOP_LOGPROBS_TENSOR_KEY = "_verl_output_top_logprobs_tensor"
+_VERL_TOP_LOGPROBS_OUTPUT_ROW_START_PARAM = "_verl_top_logprobs_output_row_start"
+_VERL_TOP_LOGPROBS_OUTPUT_ROW_END_PARAM = "_verl_top_logprobs_output_row_end"
 
 
 def _env_flag_enabled(name: str, default: bool = False) -> bool:
@@ -400,6 +402,47 @@ def _normalize_output_top_logprobs_tensor(output_top_logprobs: Any, topk: int) -
     normalized[..., 1] = -1.0
     normalized[:, :cols, :] = tensor[:, :cols, :2]
     return normalized.contiguous()
+
+
+def _output_top_logprobs_output_row_start(output_top_logprobs: Any) -> Optional[int]:
+    if not isinstance(output_top_logprobs, dict):
+        return None
+    for key in ("output_row_start", "row_start"):
+        value = output_top_logprobs.get(key)
+        if value is None:
+            continue
+        try:
+            return max(int(value), 0)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _crop_target_logprobs_to_position_window(
+    target_logprobs: Optional[torch.Tensor],
+    *,
+    position_start: Optional[int],
+    desired_position_start: int,
+    desired_position_end: int,
+) -> tuple[Optional[torch.Tensor], Optional[int], Optional[int], int]:
+    if target_logprobs is None or position_start is None:
+        return target_logprobs, position_start, None, 0
+
+    row_count = int(target_logprobs.size(0))
+    if row_count <= 0 or desired_position_end <= desired_position_start:
+        return None, None, None, row_count
+
+    current_start = int(position_start)
+    current_end = current_start + row_count
+    clipped_start = max(current_start, int(desired_position_start))
+    clipped_end = min(current_end, int(desired_position_end))
+    if clipped_start >= clipped_end:
+        return None, None, None, row_count
+
+    local_start = clipped_start - current_start
+    local_end = clipped_end - current_start
+    kept = target_logprobs[local_start:local_end].contiguous()
+    return kept, clipped_start, clipped_start + int(kept.size(0)), row_count - int(kept.size(0))
 
 
 def _hidden_state_metadata_from_chunk(hidden_state_chunk: Any) -> dict[str, int]:
@@ -981,6 +1024,17 @@ class SGLangHttpServer:
                 custom_params[_VERL_HIDDEN_STATE_FRONT_TOKENS_PARAM] = int(front_hidden_tokens)
             if self.config.drafter.training.use_logits:
                 custom_params[_VERL_TOP_LOGPROBS_TENSOR_PARAM] = True
+                # EAGLE-style drafter training uses hidden[k] + token[k+1]
+                # to predict token[k+2]. The first decode top-k row predicts
+                # token[k+1], so it is an alignment anchor only and does not
+                # enter the loss. Keep SGLang top-k rows within the same front
+                # window as hidden states.
+                custom_params[_VERL_TOP_LOGPROBS_OUTPUT_ROW_START_PARAM] = 1
+                if front_hidden_tokens is not None:
+                    custom_params[_VERL_TOP_LOGPROBS_OUTPUT_ROW_END_PARAM] = max(
+                        int(front_hidden_tokens),
+                        1,
+                    )
                 request.update({"return_logprob": True})
                 request.update({"top_logprobs_num": self.config.drafter.training.logits_topk})
             else:
@@ -1052,6 +1106,7 @@ class SGLangHttpServer:
             output_top_len = None
             target_logprobs_position_start = None
             target_logprobs_position_end = None
+            target_logprobs_dropped_rows = 0
             output_token_logprobs = output.get("meta_info", {}).get("output_token_logprobs", []) or []
             sampled_token_mismatch = _count_sampled_token_mismatches(output_token_logprobs, list(token_ids))
             collect_target_logprobs = bool(self.config.drafter.training.use_logits)
@@ -1061,6 +1116,9 @@ class SGLangHttpServer:
                 output_top_tensor = meta_info.pop(_VERL_OUTPUT_TOP_LOGPROBS_TENSOR_KEY, None)
                 target_logprobs = _normalize_output_top_logprobs_tensor(output_top_tensor, logits_topk)
                 if target_logprobs is not None:
+                    output_row_start = _output_top_logprobs_output_row_start(output_top_tensor)
+                    if output_row_start is not None:
+                        target_logprobs_position_start = max(len(prompt_ids) - 1, 0) + output_row_start
                     output_top_len = int(target_logprobs.size(0))
                 if target_logprobs is None:
                     output_top = output.get("meta_info", {}).get("output_top_logprobs", [])
@@ -1129,6 +1187,25 @@ class SGLangHttpServer:
                         tail_tokens=max_hidden_tokens,
                     )
                 hidden_kept_len = int(hidden_states.size(0))
+                if collect_target_logprobs and target_logprobs is not None:
+                    target_window_start = int(hidden_position_start) + 1
+                    target_window_end = min(
+                        int(hidden_position_end),
+                        max(len(prompt_ids) - 1, 0) + len(token_ids),
+                    )
+                    (
+                        target_logprobs,
+                        target_logprobs_position_start,
+                        target_logprobs_position_end,
+                        target_logprobs_dropped_rows,
+                    ) = _crop_target_logprobs_to_position_window(
+                        target_logprobs,
+                        position_start=target_logprobs_position_start,
+                        desired_position_start=target_window_start,
+                        desired_position_end=target_window_end,
+                    )
+                    if target_logprobs is not None:
+                        output_top_len = int(target_logprobs.size(0))
                 drafter_sample = {
                     "input_ids": torch.cat([prompt_tensor, response_tensor], dim=0).unsqueeze(0),
                     "prompts": prompt_tensor.unsqueeze(0),
@@ -1155,7 +1232,7 @@ class SGLangHttpServer:
                 or (
                     collect_target_logprobs
                     and output_top_len is not None
-                    and output_top_len != len(token_ids)
+                    and output_top_len > len(token_ids)
                 )
                 or (
                     collect_target_logprobs
@@ -1206,6 +1283,7 @@ class SGLangHttpServer:
                         "target_shape": _tensor_shape(target_logprobs),
                         "target_position_start": target_logprobs_position_start,
                         "target_position_end": target_logprobs_position_end,
+                        "target_dropped_rows": target_logprobs_dropped_rows,
                         "sampled_token_mismatch": sampled_token_mismatch,
                         "finish_reason": finish_reason,
                     },
