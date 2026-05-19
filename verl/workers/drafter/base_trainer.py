@@ -43,7 +43,6 @@ _ALIGNMENT_DEBUG_EVERY_N_STEPS_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_EVERY_N_STEPS
 _ALIGNMENT_DEBUG_MAX_SAMPLES_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_MAX_SAMPLES_PER_STEP"
 _ALIGNMENT_DEBUG_TOKEN_WINDOW_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_TOKEN_WINDOW"
 _ALIGNMENT_DEBUG_RANKS_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_RANKS"
-_LAST_HIDDEN_LOGPROB_CHECK_ENV = "VERL_DRAFTER_LAST_HIDDEN_LOGPROB_CHECK"
 
 
 def _env_flag_enabled(name: str, default: bool = False) -> bool:
@@ -114,10 +113,6 @@ def alignment_debug_rank_selected(rank: int | None) -> bool:
             except ValueError:
                 continue
     return False
-
-
-def last_hidden_logprob_check_enabled() -> bool:
-    return _env_flag_enabled(_LAST_HIDDEN_LOGPROB_CHECK_ENV, default=False)
 
 
 def should_log_alignment(
@@ -232,13 +227,6 @@ def _target_top_ids(target_logprobs: torch.Tensor, row: int, limit: int) -> list
         if token_id_int >= 0:
             top_ids.append(token_id_int)
     return top_ids
-
-
-def _invalid_topk_logprobs(rows: int, topk: int, device: torch.device) -> torch.Tensor:
-    tensor = torch.empty((max(int(rows), 0), max(int(topk), 1), 2), dtype=torch.float32, device=device)
-    tensor[..., 0] = float("-inf")
-    tensor[..., 1] = -1.0
-    return tensor
 
 
 def _first_index(mask: torch.Tensor) -> int | None:
@@ -1155,12 +1143,6 @@ class DrafterBaseTrainer:
                 items = rng.sample(current_step_data, effective_batch_size)
 
         # Filter out items without the tensors required by the selected loss path.
-        last_hidden_logprob_check = bool(
-            self.backend.model_type == "eagle3"
-            and not use_logits
-            and last_hidden_logprob_check_enabled()
-        )
-        logits_topk = int(self.config.rollout.drafter.training.get("logits_topk", 1))
         items = [item for item in items if "hidden_states" in item]
         if self.backend.model_type == "eagle3" and use_logits:
             items = [item for item in items if item.get("target_logprobs") is not None]
@@ -1196,7 +1178,6 @@ class DrafterBaseTrainer:
         target_chunks = []
         last_hidden_state_chunks = []
         target_logprob_chunks = []
-        last_hidden_check_target_logprob_chunks = []
 
         ids_list = preprocessed_lists["ids"]
         hidden_list = preprocessed_lists["h_states"]
@@ -1225,9 +1206,6 @@ class DrafterBaseTrainer:
                 )
             elif self.backend.model_type == "eagle3":
                 last_h_states = preprocessed_lists["last_h_states"][item_idx]
-                target_logprobs_list = preprocessed_lists.get("target_logprobs") or []
-                if last_hidden_logprob_check and item_idx < len(target_logprobs_list):
-                    target_logprobs_item = target_logprobs_list[item_idx]
                 train_seq_len = min(
                     max(ids.size(0) - 2, 0),
                     h_states.size(0),
@@ -1266,12 +1244,6 @@ class DrafterBaseTrainer:
                 sample_index = self._alignment_debug_sample_index(current_step, "prepare_item")
                 train_target_logprobs = None
                 if self.backend.model_type == "eagle3" and use_logits:
-                    train_target_logprobs = target_logprobs_item[1 : 1 + train_seq_len]
-                elif (
-                    self.backend.model_type == "eagle3"
-                    and last_hidden_logprob_check
-                    and target_logprobs_item is not None
-                ):
                     train_target_logprobs = target_logprobs_item[1 : 1 + train_seq_len]
                 row_valid_count = None
                 active_rows = None
@@ -1384,26 +1356,6 @@ class DrafterBaseTrainer:
                     target_logprob_chunks.append(target_logprobs_item[1 : 1 + train_seq_len])
                 else:
                     last_hidden_state_chunks.append(last_h_states[1 : 1 + train_seq_len])
-                    if last_hidden_logprob_check:
-                        if target_logprobs_item is None:
-                            check_target_logprobs = _invalid_topk_logprobs(train_seq_len, logits_topk, dev)
-                        else:
-                            check_target_logprobs = target_logprobs_item[1 : 1 + train_seq_len]
-                            if check_target_logprobs.size(0) < train_seq_len:
-                                pad_rows = train_seq_len - int(check_target_logprobs.size(0))
-                                pad_topk = (
-                                    int(check_target_logprobs.size(1))
-                                    if check_target_logprobs.dim() >= 2
-                                    else logits_topk
-                                )
-                                check_target_logprobs = torch.cat(
-                                    (
-                                        check_target_logprobs,
-                                        _invalid_topk_logprobs(pad_rows, pad_topk, check_target_logprobs.device),
-                                    ),
-                                    dim=0,
-                                )
-                        last_hidden_check_target_logprob_chunks.append(check_target_logprobs)
             elif self.backend.model_type == "eagle":
                 target_chunks.append(h_states[1 : 1 + train_seq_len])
 
@@ -1449,12 +1401,6 @@ class DrafterBaseTrainer:
                 if not last_hidden_state_chunks:
                     return None
                 last_hidden_states = torch.cat(last_hidden_state_chunks, dim=0).unsqueeze(0).contiguous()
-                if last_hidden_logprob_check and last_hidden_check_target_logprob_chunks:
-                    last_hidden_check_topk_logprobs = (
-                        torch.cat(last_hidden_check_target_logprob_chunks, dim=0).unsqueeze(0).contiguous()
-                    )
-                else:
-                    last_hidden_check_topk_logprobs = None
         elif self.backend.model_type == "eagle":
             if not target_chunks:
                 return None
@@ -1472,8 +1418,6 @@ class DrafterBaseTrainer:
                 batch["target_logprobs"] = target_logprobs
             else:
                 batch["last_hidden_states"] = last_hidden_states
-                if last_hidden_check_topk_logprobs is not None:
-                    batch["last_hidden_check_topk_logprobs"] = last_hidden_check_topk_logprobs
         elif self.backend.model_type == "eagle":
             batch["target"] = target
 
@@ -1488,7 +1432,6 @@ class DrafterBaseTrainer:
                 target_logprobs = batch["target_logprobs"]
             else:
                 last_hidden_states = batch["last_hidden_states"]
-                last_hidden_check_topk_logprobs = batch.get("last_hidden_check_topk_logprobs")
         elif self.backend.model_type == "eagle":
             target = batch["target"]
 
@@ -1521,19 +1464,6 @@ class DrafterBaseTrainer:
                         last_hidden_states = torch.nn.functional.pad(
                             last_hidden_states, (0, 0, 0, pad_size), value=0.0
                         )
-                        if last_hidden_check_topk_logprobs is not None:
-                            pad_shape = list(last_hidden_check_topk_logprobs.shape)
-                            pad_shape[1] = pad_size
-                            check_pad = torch.zeros(
-                                pad_shape,
-                                dtype=last_hidden_check_topk_logprobs.dtype,
-                                device=last_hidden_check_topk_logprobs.device,
-                            )
-                            check_pad[..., 0] = float("-inf")
-                            check_pad[..., 1] = -1.0
-                            last_hidden_check_topk_logprobs = torch.cat(
-                                (last_hidden_check_topk_logprobs, check_pad), dim=1
-                            )
                 elif self.backend.model_type == "eagle":
                     target = torch.nn.functional.pad(target, (0, 0, 0, pad_size), value=0.0)
 
@@ -1546,10 +1476,6 @@ class DrafterBaseTrainer:
                     target_logprobs = slice_input_tensor(target_logprobs, dim=1, padding=False)
                 else:
                     last_hidden_states = slice_input_tensor(last_hidden_states, dim=1, padding=False)
-                    if last_hidden_check_topk_logprobs is not None:
-                        last_hidden_check_topk_logprobs = slice_input_tensor(
-                            last_hidden_check_topk_logprobs, dim=1, padding=False
-                        )
             elif self.backend.model_type == "eagle":
                 target = slice_input_tensor(target, dim=1, padding=False)
 
@@ -1571,8 +1497,6 @@ class DrafterBaseTrainer:
                 batch["target_logprobs"] = target_logprobs
             else:
                 batch["last_hidden_states"] = last_hidden_states
-                if last_hidden_check_topk_logprobs is not None:
-                    batch["last_hidden_check_topk_logprobs"] = last_hidden_check_topk_logprobs
         elif self.backend.model_type == "eagle":
             batch["target"] = target
 
