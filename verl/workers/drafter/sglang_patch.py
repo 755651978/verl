@@ -2174,7 +2174,12 @@ def _sglang_normalize_top_logprobs_split_payload(payload, topk: int) -> dict[str
             return None
         values = _sglang_pad_2d_tensor(values[:rows, :cols], topk=topk, fill_value=float("-inf"))
         indices = _sglang_pad_2d_tensor(indices[:rows, :cols], topk=topk, fill_value=-1)
-        return {"values": values, "indices": indices}
+        ret = {"values": values, "indices": indices}
+        if isinstance(payload, dict):
+            for key in ("output_row_start", "output_row_end"):
+                if key in payload:
+                    ret[key] = payload[key]
+        return ret
 
     if not _is_torch_tensor(legacy_tensor):
         return None
@@ -2189,7 +2194,12 @@ def _sglang_normalize_top_logprobs_split_payload(payload, topk: int) -> dict[str
     indices = tensor[:, :cols, 1].to(dtype=torch.int32)
     values = _sglang_pad_2d_tensor(values, topk=topk, fill_value=float("-inf"))
     indices = _sglang_pad_2d_tensor(indices, topk=topk, fill_value=-1)
-    return {"values": values, "indices": indices}
+    ret = {"values": values, "indices": indices}
+    if isinstance(payload, dict):
+        for key in ("output_row_start", "output_row_end"):
+            if key in payload:
+                ret[key] = payload[key]
+    return ret
 
 
 def _sglang_top_logprobs_chunk_tensor(chunk, topk: int) -> dict[str, torch.Tensor] | None:
@@ -2209,22 +2219,22 @@ def _pack_sglang_output_top_logprobs_tensor(
     if topk <= 0 or values_rows is None or indices_rows is None:
         return None
 
-    total_rows = min(len(values_rows), len(indices_rows))
+    total_rows = len(values_rows)
     output_row_start = max(int(output_row_start), 0)
     output_row_end = total_rows if output_row_end is None else min(max(int(output_row_end), output_row_start), total_rows)
-    if output_row_start >= output_row_end:
-        return None
 
     chunk_payloads = []
     plain_values_rows = []
     plain_indices_rows = []
-    for row_idx in range(output_row_start, output_row_end):
-        values = values_rows[row_idx]
-        indices = indices_rows[row_idx] if row_idx < len(indices_rows) else None
+    for row_idx, values in enumerate(values_rows):
         chunk_payload = _sglang_top_logprobs_chunk_tensor(values, topk)
         if chunk_payload is not None:
             chunk_payloads.append(chunk_payload)
             continue
+        if row_idx < output_row_start or row_idx >= output_row_end:
+            continue
+        values = values_rows[row_idx]
+        indices = indices_rows[row_idx] if row_idx < len(indices_rows) else None
         plain_values_rows.append(values)
         plain_indices_rows.append(indices)
 
@@ -2292,6 +2302,8 @@ def _sglang_pack_output_top_logprobs_stream_slice(req, start: int):
             _VERL_TOP_LOGPROBS_TENSOR_CHUNK_MARKER: True,
             "values": payload["values"],
             "indices": payload["indices"],
+            "output_row_start": payload.get("output_row_start"),
+            "output_row_end": payload.get("output_row_end"),
         }
     ]
 
