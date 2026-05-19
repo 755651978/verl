@@ -49,6 +49,7 @@ _EAGLE_LINEAR_TRITON_ENV = "VERL_SGLANG_NPU_EAGLE_LINEAR_TRITON"
 _EAGLE_LINEAR_TRITON_DEBUG_ENV = "VERL_SGLANG_NPU_EAGLE_LINEAR_TRITON_DEBUG"
 _EAGLE_TOP_K_RENORM_FAST_PATH_ENV = "VERL_SGLANG_NPU_EAGLE_TOP_K_RENORM_FAST_PATH"
 _DRAFTER_RETURN_LAST_HIDDEN_ENV = "VERL_SGLANG_DRAFTER_RETURN_LAST_HIDDEN"
+_TOP_LOGPROBS_VALUES_DTYPE_ENV = "VERL_SGLANG_TOP_LOGPROBS_VALUES_DTYPE"
 _DISABLE_SGLANG_PATCH_ENV = "VERL_DISABLE_SGLANG_PATCH"
 _SGLANG_PATCHES_ENV = "VERL_SGLANG_PATCHES"
 
@@ -278,6 +279,15 @@ def _sglang_npu_eagle_linear_triton_debug_enabled() -> bool:
 
 def _sglang_drafter_return_last_hidden_enabled() -> bool:
     return _env_flag_enabled(_DRAFTER_RETURN_LAST_HIDDEN_ENV, default=False)
+
+
+def _sglang_top_logprobs_values_dtype() -> torch.dtype:
+    dtype_name = os.getenv(_TOP_LOGPROBS_VALUES_DTYPE_ENV, "float32").strip().lower()
+    if dtype_name in {"fp16", "float16", "half"}:
+        return torch.float16
+    if dtype_name in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    return torch.float32
 
 
 def _debug_sglang_npu_eagle_linear_triton(reason: str, **details: Any) -> None:
@@ -1957,8 +1967,12 @@ def _make_sglang_top_logprobs_raw_tensor_output(original_fn):
             )
 
         values, indices = logprobs.topk(max_k, dim=-1)
-        values = values.detach().to("cpu", copy=True)
-        indices = indices.detach().to("cpu", copy=True)
+        values = values.detach().to(
+            device="cpu",
+            dtype=_sglang_top_logprobs_values_dtype(),
+            copy=True,
+        )
+        indices = indices.detach().to(device="cpu", dtype=torch.int32, copy=True)
 
         if _sglang_logprob_stage_name(stage) == "DECODE":
             return values, indices
@@ -1989,6 +2003,126 @@ def _make_sglang_top_logprobs_raw_tensor_output(original_fn):
 
     patched_get_top_logprobs_raw._verl_patched_top_logprobs_tensor_output = True
     return patched_get_top_logprobs_raw
+
+
+def _sglang_top_logprobs_from_logits(
+    logits: torch.Tensor,
+    top_logprobs_nums,
+    *,
+    temperatures: torch.Tensor | None = None,
+    apply_temperature: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if apply_temperature and temperatures is not None:
+        scaled_logits = logits / temperatures
+    else:
+        scaled_logits = logits
+
+    log_norm = torch.logsumexp(scaled_logits.float(), dim=-1)
+    max_k = max(top_logprobs_nums) if top_logprobs_nums else 0
+    if max_k <= 0:
+        values = torch.empty(
+            (scaled_logits.size(0), 0),
+            dtype=_sglang_top_logprobs_values_dtype(),
+            device="cpu",
+        )
+        indices = torch.empty((scaled_logits.size(0), 0), dtype=torch.int32, device="cpu")
+    else:
+        topk_logits, topk_indices = scaled_logits.topk(max_k, dim=-1)
+        values = (topk_logits.float() - log_norm.unsqueeze(-1)).detach().to(
+            device="cpu",
+            dtype=_sglang_top_logprobs_values_dtype(),
+            copy=True,
+        )
+        indices = topk_indices.detach().to(device="cpu", dtype=torch.int32, copy=True)
+    return log_norm, values, indices
+
+
+def _make_sglang_spec_add_output_logprobs_fast_topk(original_fn):
+    @wraps(original_fn)
+    def patched_add_output_logprobs_for_spec_v1(batch, res, logits_output=None):
+        if logits_output is None:
+            logits_output = getattr(res, "logits_output", None)
+        if logits_output is None or getattr(logits_output, "next_token_logits", None) is None:
+            return original_fn(batch, res, logits_output)
+
+        top_logprobs_nums = getattr(batch, "top_logprobs_nums", None)
+        token_ids_logprobs = getattr(batch, "token_ids_logprobs", None) or []
+        if any(token_ids is not None for token_ids in token_ids_logprobs):
+            return original_fn(batch, res, logits_output)
+
+        if hasattr(res, "accept_length_per_req_cpu"):
+            accept_length_per_req_cpu = res.accept_length_per_req_cpu
+        else:
+            accept_length = getattr(res, "accept_length", None)
+            if accept_length is None:
+                return original_fn(batch, res, logits_output)
+            accept_length_per_req_cpu = accept_length.tolist()
+
+        accepted_indices = getattr(res, "accepted_indices", None)
+        next_token_logits = logits_output.next_token_logits
+        if accepted_indices is None or len(accepted_indices) != len(next_token_logits):
+            return original_fn(batch, res, logits_output)
+
+        batch_next_token_ids = getattr(res, "verified_id", None)
+        if batch_next_token_ids is None:
+            return original_fn(batch, res, logits_output)
+
+        sampling_info = getattr(batch, "sampling_info", None)
+        temperatures = getattr(sampling_info, "temperatures", None)
+        spec_info = getattr(batch, "spec_info", None)
+        draft_token_num = int(getattr(spec_info, "draft_token_num", 1) or 1)
+        apply_temperature = True
+        envs = original_fn.__globals__.get("envs")
+        if envs is not None:
+            return_original_logprob = getattr(envs, "SGLANG_RETURN_ORIGINAL_LOGPROB", None)
+            if return_original_logprob is not None and return_original_logprob.get():
+                apply_temperature = False
+        if temperatures is not None:
+            temperatures = temperatures[accepted_indices // draft_token_num]
+
+        num_tokens_per_req = [accept + 1 for accept in accept_length_per_req_cpu]
+        top_logprobs_nums_repeat_interleaved = [
+            num
+            for num, num_tokens in zip(top_logprobs_nums or [], num_tokens_per_req)
+            for _ in range(num_tokens)
+        ]
+        if len(top_logprobs_nums_repeat_interleaved) != len(next_token_logits):
+            return original_fn(batch, res, logits_output)
+
+        if apply_temperature and temperatures is not None:
+            scaled_logits = next_token_logits / temperatures
+        else:
+            scaled_logits = next_token_logits
+        log_norm, top_values, top_indices = _sglang_top_logprobs_from_logits(
+            scaled_logits,
+            top_logprobs_nums_repeat_interleaved,
+            apply_temperature=False,
+        )
+        safe_token_ids = batch_next_token_ids.to(device=scaled_logits.device, dtype=torch.long)
+        sampled_logits = scaled_logits.gather(dim=-1, index=safe_token_ids.unsqueeze(-1)).squeeze(-1)
+        logits_output.next_token_logprobs = sampled_logits.float() - log_norm
+
+        if any(num > 0 for num in top_logprobs_nums_repeat_interleaved):
+            logits_output.next_token_top_logprobs_val = top_values
+            logits_output.next_token_top_logprobs_idx = top_indices
+
+        pt = 0
+        next_token_logprobs = logits_output.next_token_logprobs.detach().to("cpu", copy=True).tolist()
+        verified_ids = batch_next_token_ids.detach().to("cpu", copy=True).tolist()
+        token_top_logprobs_val = logits_output.next_token_top_logprobs_val
+        token_top_logprobs_idx = logits_output.next_token_top_logprobs_idx
+        for req, num_tokens in zip(batch.reqs, num_tokens_per_req, strict=True):
+            for _ in range(num_tokens):
+                if req.return_logprob:
+                    req.output_token_logprobs_val.append(next_token_logprobs[pt])
+                    req.output_token_logprobs_idx.append(verified_ids[pt])
+                    if req.top_logprobs_num > 0:
+                        req.output_top_logprobs_val.append(token_top_logprobs_val[pt])
+                        req.output_top_logprobs_idx.append(token_top_logprobs_idx[pt])
+                pt += 1
+
+    patched_add_output_logprobs_for_spec_v1._verl_patched_top_logprobs_tensor_output = True
+    return patched_add_output_logprobs_for_spec_v1
 
 
 def _make_sglang_detokenize_logprob_tokens_tensor_aware(original_method):
@@ -2059,84 +2193,146 @@ def _sglang_1d_tensor_from_top_logprob_row(row, *, topk: int, dtype: torch.dtype
     return padded
 
 
-def _sglang_normalize_top_logprobs_chunk_tensor(tensor, topk: int) -> torch.Tensor | None:
-    if topk <= 0 or not _is_torch_tensor(tensor):
+def _sglang_pad_2d_tensor(tensor: torch.Tensor, *, topk: int, fill_value: float | int) -> torch.Tensor:
+    rows = int(tensor.size(0))
+    cols = min(int(tensor.size(1)), int(topk))
+    if int(tensor.size(1)) == int(topk):
+        return tensor.contiguous()
+
+    padded = torch.full((rows, topk), fill_value, dtype=tensor.dtype)
+    if cols > 0:
+        padded[:, :cols] = tensor[:, :cols]
+    return padded.contiguous()
+
+
+def _sglang_normalize_top_logprobs_split_payload(payload, topk: int) -> dict[str, torch.Tensor] | None:
+    if topk <= 0 or payload is None:
         return None
-    tensor = tensor.detach().cpu().to(dtype=torch.float32)
+
+    value_dtype = _sglang_top_logprobs_values_dtype()
+    values = None
+    indices = None
+    legacy_tensor = None
+    if isinstance(payload, dict):
+        values = payload.get("values")
+        indices = payload.get("indices")
+        legacy_tensor = payload.get("tensor")
+    elif _is_torch_tensor(payload):
+        legacy_tensor = payload
+
+    if values is not None and indices is not None:
+        if not _is_torch_tensor(values):
+            values = torch.tensor(values, dtype=value_dtype)
+        else:
+            values = values.detach().cpu().to(dtype=value_dtype)
+        if not _is_torch_tensor(indices):
+            indices = torch.tensor(indices, dtype=torch.int32)
+        else:
+            indices = indices.detach().cpu().to(dtype=torch.int32)
+        if values.dim() != 2 or indices.dim() != 2:
+            return None
+        rows = min(int(values.size(0)), int(indices.size(0)))
+        cols = min(int(values.size(1)), int(indices.size(1)), int(topk))
+        if rows <= 0 or cols <= 0:
+            return None
+        values = _sglang_pad_2d_tensor(values[:rows, :cols], topk=topk, fill_value=float("-inf"))
+        indices = _sglang_pad_2d_tensor(indices[:rows, :cols], topk=topk, fill_value=-1)
+        return {"values": values, "indices": indices}
+
+    if not _is_torch_tensor(legacy_tensor):
+        return None
+    tensor = legacy_tensor.detach().cpu()
     if tensor.dim() != 3 or tensor.size(-1) < 2:
         return None
     rows = int(tensor.size(0))
     cols = min(int(tensor.size(1)), int(topk))
     if rows <= 0 or cols <= 0:
         return None
-    if int(tensor.size(1)) == int(topk) and int(tensor.size(-1)) == 2:
-        return tensor.contiguous()
-    normalized = torch.empty((rows, topk, 2), dtype=torch.float32)
-    normalized[..., 0] = float("-inf")
-    normalized[..., 1] = -1.0
-    normalized[:, :cols, :] = tensor[:, :cols, :2]
-    return normalized.contiguous()
+    values = tensor[:, :cols, 0].to(dtype=value_dtype)
+    indices = tensor[:, :cols, 1].to(dtype=torch.int32)
+    values = _sglang_pad_2d_tensor(values, topk=topk, fill_value=float("-inf"))
+    indices = _sglang_pad_2d_tensor(indices, topk=topk, fill_value=-1)
+    return {"values": values, "indices": indices}
 
 
-def _sglang_top_logprobs_chunk_tensor(chunk, topk: int) -> torch.Tensor | None:
+def _sglang_top_logprobs_chunk_tensor(chunk, topk: int) -> dict[str, torch.Tensor] | None:
     if isinstance(chunk, dict) and chunk.get(_VERL_TOP_LOGPROBS_TENSOR_CHUNK_MARKER):
-        return _sglang_normalize_top_logprobs_chunk_tensor(chunk.get("tensor"), topk)
+        return _sglang_normalize_top_logprobs_split_payload(chunk, topk)
     return None
 
 
-def _pack_sglang_output_top_logprobs_tensor(values_rows, indices_rows, topk: int) -> torch.Tensor | None:
+def _pack_sglang_output_top_logprobs_tensor(values_rows, indices_rows, topk: int) -> dict[str, torch.Tensor] | None:
     if topk <= 0 or values_rows is None or indices_rows is None:
         return None
 
-    chunk_tensors = []
+    chunk_payloads = []
     plain_values_rows = []
     plain_indices_rows = []
     for row_idx, values in enumerate(values_rows):
         indices = indices_rows[row_idx] if row_idx < len(indices_rows) else None
-        chunk_tensor = _sglang_top_logprobs_chunk_tensor(values, topk)
-        if chunk_tensor is not None:
-            chunk_tensors.append(chunk_tensor)
+        chunk_payload = _sglang_top_logprobs_chunk_tensor(values, topk)
+        if chunk_payload is not None:
+            chunk_payloads.append(chunk_payload)
             continue
         plain_values_rows.append(values)
         plain_indices_rows.append(indices)
 
-    rows = []
+    value_rows = []
+    index_rows = []
     for values, indices in zip(plain_values_rows, plain_indices_rows):
         value_row = _sglang_1d_tensor_from_top_logprob_row(
             values,
             topk=topk,
-            dtype=torch.float32,
+            dtype=_sglang_top_logprobs_values_dtype(),
             fill_value=float("-inf"),
         )
         index_row = _sglang_1d_tensor_from_top_logprob_row(
             indices,
             topk=topk,
-            dtype=torch.float32,
-            fill_value=-1.0,
+            dtype=torch.int32,
+            fill_value=-1,
         )
-        rows.append(torch.stack((value_row, index_row), dim=-1))
+        value_rows.append(value_row)
+        index_rows.append(index_row)
 
-    tensors = list(chunk_tensors)
-    if rows:
-        tensors.append(torch.stack(rows, dim=0).contiguous())
-    if not tensors:
+    payloads = list(chunk_payloads)
+    if value_rows:
+        payloads.append(
+            {
+                "values": torch.stack(value_rows, dim=0).contiguous(),
+                "indices": torch.stack(index_rows, dim=0).contiguous(),
+            }
+        )
+    if not payloads:
         return None
-    if len(tensors) == 1:
-        return tensors[0].contiguous()
-    return torch.cat(tensors, dim=0).contiguous()
+    if len(payloads) == 1:
+        return {
+            "values": payloads[0]["values"].contiguous(),
+            "indices": payloads[0]["indices"].contiguous(),
+        }
+    return {
+        "values": torch.cat([payload["values"] for payload in payloads], dim=0).contiguous(),
+        "indices": torch.cat([payload["indices"] for payload in payloads], dim=0).contiguous(),
+    }
 
 
 def _sglang_pack_output_top_logprobs_stream_slice(req, start: int):
     values_rows = getattr(req, "output_top_logprobs_val", [])[start:]
     indices_rows = getattr(req, "output_top_logprobs_idx", [])[start:]
-    tensor = _pack_sglang_output_top_logprobs_tensor(
+    payload = _pack_sglang_output_top_logprobs_tensor(
         values_rows,
         indices_rows,
         int(getattr(req, "top_logprobs_num", 0) or 0),
     )
-    if tensor is None:
+    if payload is None:
         return []
-    return [{_VERL_TOP_LOGPROBS_TENSOR_CHUNK_MARKER: True, "tensor": tensor}]
+    return [
+        {
+            _VERL_TOP_LOGPROBS_TENSOR_CHUNK_MARKER: True,
+            "values": payload["values"],
+            "indices": payload["indices"],
+        }
+    ]
 
 
 def _make_sglang_add_logprob_to_meta_info_tensor_output(original_method):
@@ -2264,6 +2460,26 @@ def patch_sglang_top_logprobs_tensor_output() -> None:
         logprob_module.get_top_logprobs_prefill = patched_get_top_logprobs_prefill
         sampler_module.get_top_logprobs = patched_get_top_logprobs
         logits_processor_module.get_top_logprobs_prefill = patched_get_top_logprobs_prefill
+
+    spec_logprob_fn = getattr(logprob_module, "add_output_logprobs_for_spec_v1", None)
+    if spec_logprob_fn is not None and not getattr(
+        spec_logprob_fn,
+        "_verl_patched_top_logprobs_tensor_output",
+        False,
+    ):
+        patched_spec_logprob_fn = _make_sglang_spec_add_output_logprobs_fast_topk(spec_logprob_fn)
+        logprob_module.add_output_logprobs_for_spec_v1 = patched_spec_logprob_fn
+        for module_name in (
+            "sglang.srt.speculative.eagle_worker",
+            "sglang.srt.speculative.multi_layer_eagle_worker",
+            "sglang.srt.speculative.ngram_worker",
+        ):
+            try:
+                spec_worker_module = importlib.import_module(module_name)
+            except Exception:  # noqa: BLE001
+                continue
+            if hasattr(spec_worker_module, "add_output_logprobs_for_spec_v1"):
+                spec_worker_module.add_output_logprobs_for_spec_v1 = patched_spec_logprob_fn
 
     detokenize_logprob = getattr(tokenizer_manager_cls, "detokenize_logprob_tokens", None)
     if detokenize_logprob is not None and not getattr(
