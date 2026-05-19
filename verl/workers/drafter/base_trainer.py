@@ -4,6 +4,7 @@ import os
 import time
 import asyncio
 import random
+import fnmatch
 from collections import deque
 from typing import Optional, List, Any
 from omegaconf import open_dict
@@ -1770,7 +1771,37 @@ class DrafterBaseTrainer:
             trainable_state = self._get_trainable_state_dict()
             if not trainable_state:
                 return None
-            return {k: v.detach().cpu() for k, v in trainable_state.items()}
+            training_cfg = self.config.rollout.drafter.training
+            patterns = training_cfg.get("publish_param_name_patterns", None)
+            if isinstance(patterns, str):
+                patterns = [patterns]
+            if patterns:
+                trainable_state = {
+                    k: v
+                    for k, v in trainable_state.items()
+                    if any(fnmatch.fnmatch(k, pattern) for pattern in patterns)
+                }
+                if not trainable_state:
+                    logger.warning(
+                        "[Rank %s] No drafter parameters matched publish_param_name_patterns=%s",
+                        self.rank,
+                        patterns,
+                    )
+                    return None
+
+            publish_dtype = training_cfg.get("publish_dtype", None)
+            dtype = None
+            if publish_dtype in {"float32", "fp32"}:
+                dtype = torch.float32
+            elif publish_dtype in {"float16", "fp16"}:
+                dtype = torch.float16
+            elif publish_dtype in {"bfloat16", "bf16"}:
+                dtype = torch.bfloat16
+
+            return {
+                k: v.detach().to(dtype=dtype, device="cpu").contiguous() if dtype is not None else v.detach().cpu().contiguous()
+                for k, v in trainable_state.items()
+            }
         finally:
             if is_fsdp_wrapped and not was_on_device:
                 offload_fsdp_model_to_cpu(self.model)

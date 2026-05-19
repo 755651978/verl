@@ -94,6 +94,14 @@ class DrafterTrainingConfig(BaseConfig):
     step: int = 10
     batch_size_per_gpu: int = 4
     training_interval_steps: int = 10
+    publish_interval_steps: int = 0
+    publish_async: bool = False
+    publish_dtype: Optional[str] = None
+    publish_param_name_patterns: Optional[list[str]] = None
+    draft_update_weights_bucket_megabytes: Optional[int] = None
+    draft_update_pause_generation: bool = True
+    draft_update_flush_before: bool = True
+    draft_update_flush_after: bool = True
     sample_last_n_steps: int = 20
     train_batches_per_cycle: int = 4
     lr: float = 1e-6
@@ -146,6 +154,12 @@ class DrafterTrainingConfig(BaseConfig):
             raise ValueError("`logits_coverage_mask_min_ratio` must be in [0, 1] or null.")
         if self.logits_loss_mode not in {"dense_tail", "sparse_restricted"}:
             raise ValueError("`logits_loss_mode` must be either 'dense_tail' or 'sparse_restricted'.")
+        if self.publish_interval_steps < 0:
+            raise ValueError("`publish_interval_steps` must be non-negative.")
+        if self.publish_dtype is not None and self.publish_dtype not in {"float32", "fp32", "float16", "fp16", "bfloat16", "bf16"}:
+            raise ValueError("`publish_dtype` must be one of float32/fp32, float16/fp16, bfloat16/bf16, or null.")
+        if self.draft_update_weights_bucket_megabytes is not None and self.draft_update_weights_bucket_megabytes <= 0:
+            raise ValueError("`draft_update_weights_bucket_megabytes` must be positive or null.")
         if self.logits_sparse_min_intersection < 1:
             raise ValueError("`logits_sparse_min_intersection` must be positive.")
         if (
