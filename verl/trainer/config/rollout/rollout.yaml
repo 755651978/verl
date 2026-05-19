@@ -451,7 +451,7 @@ drafter:
   enable_drafter_training: false
   speculative_algorithm: EAGLE
   model_path: /path/to/drafter/model
-  checkpoint_path: /path/to/drafter/checkpoint
+  checkpoint_path: null
   world_size: 16
   rollout:
     _target_: verl.workers.config.DrafterRolloutConfig
