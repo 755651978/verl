@@ -507,7 +507,7 @@ class ServerAdapter(BaseRollout):
         try:
             if self.device_mesh["infer_tp"].get_local_rank() == 0 and pause_for_speculative_update:
                 ts = time.perf_counter()
-                await self._engine.pause_generation()
+                await self._engine.pause_generation(mode="retract")
                 timing["pause_generation"] += time.perf_counter() - ts
                 generation_paused = True
                 if flush_before_update:

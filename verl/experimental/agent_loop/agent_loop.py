@@ -686,26 +686,38 @@ class AgentLoopWorker:
             prompt_output["attention_mask"] = prompt_output["attention_mask"].unsqueeze(0)
 
         self.tokenizer.padding_side = "right"
-        response_output = self.tokenizer.pad(
-            {"input_ids": output.response_ids},
-            padding="max_length",
-            max_length=self.rollout_config.response_length,
-            return_tensors="pt",
-            return_attention_mask=True,
-        )
-        if response_output["input_ids"].dim() == 1:
-            response_output["input_ids"] = response_output["input_ids"].unsqueeze(0)
-            response_output["attention_mask"] = response_output["attention_mask"].unsqueeze(0)
+        if output.response_ids:
+            response_output = self.tokenizer.pad(
+                {"input_ids": output.response_ids},
+                padding="max_length",
+                max_length=self.rollout_config.response_length,
+                return_tensors="pt",
+                return_attention_mask=True,
+            )
+            if response_output["input_ids"].dim() == 1:
+                response_output["input_ids"] = response_output["input_ids"].unsqueeze(0)
+                response_output["attention_mask"] = response_output["attention_mask"].unsqueeze(0)
+        else:
+            pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+            response_output = {
+                "input_ids": torch.full((1, self.rollout_config.response_length), pad_id, dtype=torch.long),
+                "attention_mask": torch.zeros((1, self.rollout_config.response_length), dtype=torch.long),
+            }
 
-        response_mask_output = self.tokenizer.pad(
-            {"input_ids": output.response_mask},
-            padding="max_length",
-            max_length=self.rollout_config.response_length,
-            return_tensors="pt",
-            return_attention_mask=False,
-        )
-        if response_mask_output["input_ids"].dim() == 1:
-            response_mask_output["input_ids"] = response_mask_output["input_ids"].unsqueeze(0)
+        if output.response_mask:
+            response_mask_output = self.tokenizer.pad(
+                {"input_ids": output.response_mask},
+                padding="max_length",
+                max_length=self.rollout_config.response_length,
+                return_tensors="pt",
+                return_attention_mask=False,
+            )
+            if response_mask_output["input_ids"].dim() == 1:
+                response_mask_output["input_ids"] = response_mask_output["input_ids"].unsqueeze(0)
+        else:
+            response_mask_output = {
+                "input_ids": torch.zeros((1, self.rollout_config.response_length), dtype=torch.long)
+            }
 
         response_logprobs = None
         if output.response_logprobs is not None:

@@ -574,9 +574,9 @@ class HttpServerAdapter(EngineBase):
         """
         return self._make_request("abort_request", {"rid": rid, "abort_all": abort_all})
 
-    def pause_generation(self) -> dict[str, Any]:
+    def pause_generation(self, mode: str = "abort") -> dict[str, Any]:
         """Pause new generation work while keeping the server alive."""
-        return self._make_request("pause_generation", {})
+        return self._make_request("pause_generation", {"mode": mode})
 
     def continue_generation(self) -> dict[str, Any]:
         """Resume generation after a temporary pause."""
@@ -819,9 +819,9 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
     async def available_models(self):
         return await self._make_async_request(endpoint="v1/models", method="GET")
 
-    async def pause_generation(self) -> dict[str, Any]:
+    async def pause_generation(self, mode: str = "abort") -> dict[str, Any]:
         """Pause new generation work while keeping the server alive."""
-        return await self._make_async_request("pause_generation", {})
+        return await self._make_async_request("pause_generation", {"mode": mode})
 
     async def continue_generation(self) -> dict[str, Any]:
         """Resume generation after a temporary pause."""
