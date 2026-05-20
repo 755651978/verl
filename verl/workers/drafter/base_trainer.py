@@ -401,6 +401,9 @@ class DrafterBaseTrainer:
 
         # Track the last pending async checkpoint save future
         self._pending_checkpoint_future = None
+        self._pending_publish_state_dict = None
+        self._pending_publish_step = None
+        self._pending_publish_ready = False
         self.model = None
         self.optimizer = None
         self.lr_scheduler = None
@@ -1799,12 +1802,53 @@ class DrafterBaseTrainer:
                 dtype = torch.bfloat16
 
             return {
-                k: v.detach().to(dtype=dtype, device="cpu").contiguous() if dtype is not None else v.detach().cpu().contiguous()
+                k: (
+                    v.detach().to(dtype=dtype, device="cpu").contiguous()
+                    if dtype is not None
+                    else v.detach().cpu().contiguous()
+                )
                 for k, v in trainable_state.items()
             }
         finally:
             if is_fsdp_wrapped and not was_on_device:
                 offload_fsdp_model_to_cpu(self.model)
+
+    def clear_pending_publish_state_dict(self) -> None:
+        self._pending_publish_state_dict = None
+        self._pending_publish_step = None
+        self._pending_publish_ready = False
+
+    def prepare_model_state_dict_for_publish(self, global_step: Optional[int]) -> bool:
+        """Snapshot trainable drafter weights before cleanup/offload for fast publish."""
+        self.clear_pending_publish_state_dict()
+        step = int(global_step) if global_step is not None else None
+        state_dict = self.get_model_state_dict()
+        self._pending_publish_state_dict = state_dict
+        self._pending_publish_step = step
+        self._pending_publish_ready = True
+        return bool(state_dict)
+
+    def pop_model_state_dict_for_publish(
+        self,
+        global_step: Optional[int],
+    ) -> tuple[bool, Optional[dict[str, torch.Tensor]]]:
+        if not self._pending_publish_ready:
+            return False, None
+
+        step = int(global_step) if global_step is not None else None
+        if self._pending_publish_step != step:
+            logger.warning(
+                "[Rank %s] Drop stale drafter publish snapshot: snapshot_step=%s, requested_step=%s",
+                self.rank,
+                self._pending_publish_step,
+                step,
+            )
+            self.clear_pending_publish_state_dict()
+            return False, None
+
+        state_dict = self._pending_publish_state_dict
+        self.clear_pending_publish_state_dict()
+        return True, state_dict
     
     async def cleanup_training(self, clear_data: bool = True):
         # First set training as inactive to prevent further steps

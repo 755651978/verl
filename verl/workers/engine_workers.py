@@ -897,6 +897,7 @@ class DrafterWorker(Worker):
             self.config.rollout.drafter.enable and self.config.rollout.drafter.enable_drafter_training
         )
         self.training_interval_steps = int(self.config.rollout.drafter.training.get("training_interval_steps", 1))
+        self.publish_interval_steps = int(self.config.rollout.drafter.training.get("publish_interval_steps", 0))
         self.train_steps_per_trigger = int(self.config.rollout.drafter.training.get("step", 100))
 
     def _ensure_process_group_initialized(self):
@@ -1051,6 +1052,7 @@ class DrafterWorker(Worker):
         if self.last_global_step == global_step:
             return
         self.last_global_step = global_step
+        self.trainer.clear_pending_publish_state_dict()
         self.trainer.increment_rl_step(global_step)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -1104,11 +1106,13 @@ class DrafterWorker(Worker):
         with _preserve_process_rng_state(self.device_name):
             result["triggered"] = True
             start_ts = time.time()
+            self.trainer.clear_pending_publish_state_dict()
             success = await self.trainer.activate_training_model()
             if not success:
                 logger.error(
                     f"[DrafterWorker replica={self.replica_rank}] failed to activate trainer at step {self.last_global_step}"
                 )
+                self.trainer.clear_pending_publish_state_dict()
                 await self.trainer.cleanup_training(clear_data=False)
                 result["reason"] = "activation_failed"
                 result["elapsed_sec"] = time.time() - start_ts
@@ -1120,6 +1124,20 @@ class DrafterWorker(Worker):
                     step_ok = await self.trainer.training_step(self.last_global_step)
                     if step_ok:
                         result["successful_steps"] += 1
+                if result["successful_steps"] > 0:
+                    should_prepare_publish = (
+                        self.publish_interval_steps <= 0
+                        or self.last_global_step % self.publish_interval_steps == 0
+                    )
+                    if should_prepare_publish:
+                        snapshot_ts = time.time()
+                        cached = self.trainer.prepare_model_state_dict_for_publish(self.last_global_step)
+                        result["publish_snapshot_cached"] = int(cached)
+                        result["publish_snapshot_elapsed_sec"] = time.time() - snapshot_ts
+                    else:
+                        self.trainer.clear_pending_publish_state_dict()
+                else:
+                    self.trainer.clear_pending_publish_state_dict()
             finally:
                 await self.trainer.cleanup_training(clear_data=result["successful_steps"] > 0)
 
@@ -1140,5 +1158,13 @@ class DrafterWorker(Worker):
             return None
         if self.last_trained_step != self.last_global_step:
             return None
-        weights = self.trainer.get_model_state_dict()
+        has_snapshot, weights = self.trainer.pop_model_state_dict_for_publish(self.last_global_step)
+        if not has_snapshot:
+            logger.warning(
+                "[DrafterWorker replica=%s rank=%s] Missing cached drafter publish snapshot at step %s; skip publish.",
+                self.replica_rank,
+                self.rank,
+                self.last_global_step,
+            )
+            return None
         return weights if self.is_global_publish_leader else None

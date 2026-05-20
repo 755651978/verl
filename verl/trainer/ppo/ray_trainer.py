@@ -1049,6 +1049,8 @@ class RayPPOTrainer:
             "drafter/skip_interval": 0,
             "drafter/no_trainable_batch": 0,
             "drafter/activation_failed": 0,
+            "drafter/publish_snapshot_cached": 0,
+            "drafter/publish_snapshot_elapsed_sec": 0.0,
         }
         if not drafter_train_results:
             return summary
@@ -1083,6 +1085,12 @@ class RayPPOTrainer:
         )
         summary["drafter/activation_failed"] = int(
             any(r.get("reason") == "activation_failed" for r in normalized_results)
+        )
+        summary["drafter/publish_snapshot_cached"] = int(
+            any(bool(r.get("publish_snapshot_cached", False)) for r in normalized_results)
+        )
+        summary["drafter/publish_snapshot_elapsed_sec"] = max(
+            float(r.get("publish_snapshot_elapsed_sec", 0.0)) for r in normalized_results
         )
         return summary
 

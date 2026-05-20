@@ -462,25 +462,12 @@ class ServerAdapter(BaseRollout):
             return
 
         if self.device_mesh["infer_tp"].get_local_rank() == 0:
-            preview = []
-            for name, tensor in list(weights.items())[:5]:
-                tensor_f = tensor.detach().float()
-                preview.append(
-                    {
-                        "name": name,
-                        "shape": tuple(tensor.shape),
-                        "mean": float(tensor_f.mean().item()),
-                        "std": float(tensor_f.std().item()) if tensor_f.numel() > 1 else 0.0,
-                        "absmax": float(tensor_f.abs().max().item()) if tensor_f.numel() > 0 else 0.0,
-                    }
-                )
             logger.warning(
                 "[sglang draft update] enter global_steps=%s num_weights=%s "
-                "disable_draft_model=False disable_target_model=True load_format=%s preview=%s",
+                "disable_draft_model=False disable_target_model=True load_format=%s",
                 global_steps,
                 len(weights),
                 VERL_SGLANG_DRAFT_WEIGHT_LOADER if _supports_sglang_custom_weight_loader() else None,
-                preview,
             )
 
         training_cfg = self.config.drafter.training
