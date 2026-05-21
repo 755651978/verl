@@ -131,6 +131,14 @@ def _get_sglang_draft_runner(worker):
         runner = getattr(worker, attr_name, None)
         if runner is not None:
             return runner
+    for worker_attr in ("draft_worker", "_draft_worker"):
+        draft_worker = getattr(worker, worker_attr, None)
+        if draft_worker is None:
+            continue
+        for runner_attr in ("draft_runner", "model_runner"):
+            runner = getattr(draft_worker, runner_attr, None)
+            if runner is not None:
+                return runner
     return None
 
 
@@ -316,7 +324,7 @@ def _sglang_qwen3_vl_set_eagle3_layers_to_capture(self, layer_ids=None):
 
 
 def patch_sglang_qwen3_vl_eagle3_aux_hidden_capture() -> None:
-    """Backport Qwen3-VL EAGLE3 aux-hidden capture support to SGLang 0.5.9."""
+    """Ensure Qwen3-VL EAGLE3 aux-hidden capture support is available."""
     global _SGLANG_QWEN3_VL_EAGLE3_AUX_HIDDEN_PATCHED
     if _SGLANG_QWEN3_VL_EAGLE3_AUX_HIDDEN_PATCHED:
         return
@@ -1793,6 +1801,8 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
         return hidden_state_offset
 
     accept_lengths = getattr(result, "accept_length_per_req_cpu", None)
+    if accept_lengths is None:
+        accept_lengths = getattr(result, "accept_lens", None)
     if accept_lengths is not None and req_index < len(accept_lengths) and _is_torch_tensor(hidden_states):
         rows = max(int(accept_lengths[req_index]) + 1, 1)
         position_start = max(
@@ -1960,7 +1970,9 @@ def _wrap_sglang_eagle_verify_last_hidden_filter(method):
         result = method(self, *args, **kwargs)
         try:
             logits_output, verify_output = result[0], result[1]
-            accepted_indices = getattr(verify_output, "accepted_indices", None)
+            accepted_indices = getattr(verify_output, "accept_indices", None)
+            if accepted_indices is None:
+                accepted_indices = getattr(verify_output, "accepted_indices", None)
             if accepted_indices is not None:
                 _filter_sglang_drafter_last_hidden_output(logits_output, accepted_indices)
         except Exception as exc:  # noqa: BLE001
@@ -2023,13 +2035,37 @@ def _make_sglang_eagle_verify_full_hidden_patch(original_method):
     else:
         return None
 
-    old_hidden_filter = "        logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]\n"
-    new_hidden_filter = (
-        "        logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]\n"
-        "        _filter_sglang_drafter_last_hidden_output(logits_output, res.accepted_indices)\n"
+    hidden_filter_replacements = (
+        (
+            "        logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]\n",
+            (
+                "        logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]\n"
+                "        _filter_sglang_drafter_last_hidden_output(logits_output, res.accepted_indices)\n"
+            ),
+        ),
+        (
+            """            logits_output.hidden_states = logits_output.hidden_states[
+                res.accept_indices
+            ]
+""",
+            """            logits_output.hidden_states = logits_output.hidden_states[
+                res.accept_indices
+            ]
+            _filter_sglang_drafter_last_hidden_output(logits_output, res.accept_indices)
+""",
+        ),
+        (
+            "        logits_output.hidden_states = logits_output.hidden_states[res.accept_indices]\n",
+            (
+                "        logits_output.hidden_states = logits_output.hidden_states[res.accept_indices]\n"
+                "        _filter_sglang_drafter_last_hidden_output(logits_output, res.accept_indices)\n"
+            ),
+        ),
     )
-    if old_hidden_filter in patched_source:
-        patched_source = patched_source.replace(old_hidden_filter, new_hidden_filter, 1)
+    for old_hidden_filter, new_hidden_filter in hidden_filter_replacements:
+        if old_hidden_filter in patched_source:
+            patched_source = patched_source.replace(old_hidden_filter, new_hidden_filter, 1)
+            break
 
     globals_dict = original_method.__globals__
     globals_dict["logger"] = logger
@@ -2111,6 +2147,7 @@ def _make_sglang_top_logprobs_raw_tensor_output(original_fn):
         top_logprobs_nums,
         stage,
         extend_logprob_pruned_lens_cpu=None,
+        no_copy_to_cpu=False,
     ):
         if not top_logprobs_nums:
             return [], []
@@ -2153,11 +2190,17 @@ def _make_sglang_top_logprobs_raw_tensor_output(original_fn):
             return values, indices
 
         if extend_logprob_pruned_lens_cpu is None:
+            fallback_kwargs = {"extend_logprob_pruned_lens_cpu": extend_logprob_pruned_lens_cpu}
+            try:
+                if "no_copy_to_cpu" in inspect.signature(original_fn).parameters:
+                    fallback_kwargs["no_copy_to_cpu"] = no_copy_to_cpu
+            except (TypeError, ValueError):
+                pass
             return original_fn(
                 logprobs,
                 top_logprobs_nums,
                 stage,
-                extend_logprob_pruned_lens_cpu=extend_logprob_pruned_lens_cpu,
+                **fallback_kwargs,
             )
 
         top_logprobs_val = []
@@ -2401,11 +2444,14 @@ def _pack_sglang_output_top_logprobs_tensor(
     }
 
 
-def _sglang_pack_output_top_logprobs_stream_slice(req, start: int):
+def _sglang_pack_output_top_logprobs_stream_slice(req, start: int, end: int | None = None):
     values_rows = getattr(req, "output_top_logprobs_val", [])
     indices_rows = getattr(req, "output_top_logprobs_idx", [])
     row_start, row_end = _sglang_req_top_logprobs_output_row_bounds(req)
     row_start = max(int(start), row_start)
+    if end is not None:
+        end = int(end)
+        row_end = min(row_end, end) if row_end is not None else end
     payload = _pack_sglang_output_top_logprobs_tensor(
         values_rows,
         indices_rows,
@@ -2466,6 +2512,7 @@ def _make_sglang_add_logprob_to_meta_info_tensor_output(original_method):
 
         meta_info["input_token_logprobs"] = state.input_token_logprobs
         meta_info["output_token_logprobs"] = state.output_token_logprobs
+        meta_info["output_token_logprobs_length"] = len(state.output_token_logprobs)
 
         topk = int(top_logprobs_num or 0)
         if topk > 0:
@@ -2630,8 +2677,10 @@ _SGLANG_HIDDEN_STATES_LIST_OUTPUT_PATTERN = re.compile(
     r"\.cpu\(\)\s*\.clone\(\)\s*\.tolist\(\)",
 )
 _SGLANG_DECODE_REQUEST_LOOP_PATTERN = re.compile(
-    r"(?ms)^(?P<indent>[ \t]+)for i, \(req, next_token_id\) in enumerate\(\s*"
-    r"zip\(batch\.reqs,\s*next_token_ids\)\s*\):\r?\n",
+    r"(?ms)^(?P<indent>[ \t]+)for i, (?:"
+    r"\(req, next_token_id\) in enumerate\(\s*zip\(batch\.reqs,\s*next_token_ids\)\s*\)"
+    r"|req in enumerate\(batch\.reqs\)"
+    r"):\r?\n",
 )
 _SGLANG_DECODE_HIDDEN_STATES_APPEND_PATTERN = re.compile(
     r"(?ms)^(?P<indent>[ \t]+)if\s*(?:\(\s*)?req\.return_hidden_states\s+"
@@ -2657,12 +2706,12 @@ _SGLANG_STREAM_HIDDEN_STATES_PATTERN = re.compile(
 _SGLANG_STREAM_TOP_LOGPROBS_SLICE_PATTERN = re.compile(
     r"(?ms)^(?P<indent>[ \t]+)output_top_logprobs_val\.append\(\r?\n"
     r"(?P=indent)[ \t]+req\.output_top_logprobs_val\[\r?\n"
-    r"(?P=indent)[ \t]+[ \t]+send_output_token_logprobs_offset:\r?\n"
+    r"(?P=indent)[ \t]+[ \t]+send_output_token_logprobs_offset:(?P<end>[A-Za-z_][A-Za-z0-9_]*)?\r?\n"
     r"(?P=indent)[ \t]+\]\r?\n"
     r"(?P=indent)\)\r?\n"
     r"(?P=indent)output_top_logprobs_idx\.append\(\r?\n"
     r"(?P=indent)[ \t]+req\.output_top_logprobs_idx\[\r?\n"
-    r"(?P=indent)[ \t]+[ \t]+send_output_token_logprobs_offset:\r?\n"
+    r"(?P=indent)[ \t]+[ \t]+send_output_token_logprobs_offset:(?P=end)?\r?\n"
     r"(?P=indent)[ \t]+\]\r?\n"
     r"(?P=indent)\)\r?\n",
 )
@@ -2735,24 +2784,28 @@ def _render_sglang_stream_hidden_states(match: re.Match) -> str:
 
 def _render_sglang_stream_top_logprobs_slice(match: re.Match) -> str:
     indent = match.group("indent")
+    end_expr = match.group("end")
+    end_arg = f"{indent}            {end_expr},\n" if end_expr else ""
+    slice_end = end_expr or ""
     return (
         f"{indent}if _sglang_req_requests_top_logprobs_tensor(req) and req.top_logprobs_num > 0:\n"
         f"{indent}    output_top_logprobs_val.append(\n"
         f"{indent}        _sglang_pack_output_top_logprobs_stream_slice(\n"
         f"{indent}            req,\n"
         f"{indent}            send_output_token_logprobs_offset,\n"
+        f"{end_arg}"
         f"{indent}        )\n"
         f"{indent}    )\n"
         f"{indent}    output_top_logprobs_idx.append([])\n"
         f"{indent}else:\n"
         f"{indent}    output_top_logprobs_val.append(\n"
         f"{indent}        req.output_top_logprobs_val[\n"
-        f"{indent}            send_output_token_logprobs_offset:\n"
+        f"{indent}            send_output_token_logprobs_offset:{slice_end}\n"
         f"{indent}        ]\n"
         f"{indent}    )\n"
         f"{indent}    output_top_logprobs_idx.append(\n"
         f"{indent}        req.output_top_logprobs_idx[\n"
-        f"{indent}            send_output_token_logprobs_offset:\n"
+        f"{indent}            send_output_token_logprobs_offset:{slice_end}\n"
         f"{indent}        ]\n"
         f"{indent}    )\n"
     )
@@ -2824,7 +2877,6 @@ def _patch_sglang_decode_hidden_states_source(source: str) -> str | None:
     patched_source, hidden_block_count = _SGLANG_DECODE_HIDDEN_STATES_APPEND_PATTERN.subn(
         _render_sglang_decode_hidden_states_append,
         source,
-        count=1,
     )
     if hidden_block_count <= 0:
         return None
@@ -3276,6 +3328,13 @@ def patch_sglang_scheduler_process_entrypoints() -> None:
             _ORIGINAL_SGLANG_DIRECT_RUN_SCHEDULER_PROCESS = original_run_scheduler_process
             module.run_scheduler_process = _run_direct_scheduler_process_with_verl_patches
         patched_entrypoints.append(module.__name__)
+
+    engine_cls = getattr(sglang.srt.entrypoints.engine, "Engine", None)
+    if engine_cls is not None:
+        run_scheduler_process_func = getattr(engine_cls, "run_scheduler_process_func", None)
+        if not getattr(run_scheduler_process_func, _SCHEDULER_PROCESS_PATCH_ATTR, False):
+            engine_cls.run_scheduler_process_func = staticmethod(_run_scheduler_process_with_verl_patches)
+            patched_entrypoints.append("sglang.srt.entrypoints.engine.Engine.run_scheduler_process_func")
 
     if patched_entrypoints:
         _SGLANG_SCHEDULER_PROCESS_PATCHED = True
