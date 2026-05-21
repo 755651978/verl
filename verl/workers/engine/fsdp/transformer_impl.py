@@ -527,6 +527,9 @@ class FSDPEngine(BaseEngine):
         if self._qat_enabled and not self.engine_config.forward_only:
             module = self._apply_qat(module)
 
+        if self.model_config.get("freeze_vision_tower", False) and hasattr(module, "visual"):
+            module.visual.requires_grad_(False)
+
         # Synchronize all distributed processes before proceeding
         torch.distributed.barrier()
         if self.rank == 0:
