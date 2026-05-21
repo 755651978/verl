@@ -12,7 +12,7 @@ export HCCL_OP_EXPANSION_MOD=AIV
 
 export VERL_SGLANG_PATCHES=eagle_update_weights,hidden_states_tensor_output,npu_eagle_target_sampling,top_logprobs_tensor_output
 
-project_name='verl_grpo_example_dapo_drafter'
+project_name='verl_grpo_example_geo3k_drafter'
 exp_name='qwen3_8b_function_rm_drafter'
 
 gen_tp=2
@@ -29,11 +29,13 @@ python3 -m verl.trainer.main_ppo \
     data.train_files=${TRAIN_FILE} \
     data.val_files=${TEST_FILE} \
     data.train_batch_size=32 \
-    data.max_prompt_length=512 \
-    data.max_response_length=4096 \
+    data.max_prompt_length=1024 \
+    data.max_response_length=2048 \
     data.filter_overlong_prompts=True \
     data.filter_overlong_prompts_workers=256 \
     data.truncation='error' \
+    data.image_key=images \
+    actor_rollout_ref.actor.freeze_vision_tower=True \
     actor_rollout_ref.model.path=${MODEL_PATH} \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
@@ -55,6 +57,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.rollout.name=sglang \
+    +actor_rollout_ref.rollout.engine_kwargs.sglang.mm_attention_backend=ascend_attn \
     +actor_rollout_ref.rollout.engine_kwargs.sglang.log_level=info \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.25 \
     actor_rollout_ref.rollout.n=5 \
@@ -81,7 +84,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.experiment_name=exp_name \
     trainer.n_gpus_per_node=16 \
     trainer.nnodes=1 \
-    trainer.default_local_dir=${CKPTS_DIR}
+    trainer.default_local_dir=${CKPTS_DIR} \
     trainer.save_freq=20 \
     trainer.test_freq=5 \
     trainer.total_epochs=15 $@
