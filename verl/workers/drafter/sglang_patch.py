@@ -58,6 +58,7 @@ _draft_weight_loader: str | None = os.environ.get(_DRAFT_WEIGHT_LOADER_ENV)
 _ORIGINAL_SGLANG_RUN_SCHEDULER_PROCESS = sglang.srt.entrypoints.engine.run_scheduler_process
 _ORIGINAL_SGLANG_DIRECT_RUN_SCHEDULER_PROCESS = None
 _SGLANG_EAGLE_UPDATE_PATCHED = False
+_SGLANG_QWEN3_VL_EAGLE3_AUX_HIDDEN_PATCHED = False
 _SGLANG_NPU_EAGLE_SAMPLING_PATCHED = False
 _SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED = False
 _SGLANG_EAGLE_VERIFY_HIDDEN_STATES_PATCHED = False
@@ -241,6 +242,123 @@ def patch_sglang_eagle_update_weights_from_tensor() -> None:
     if patched_classes:
         _SGLANG_EAGLE_UPDATE_PATCHED = True
         logger.info("Patched SGLang EAGLE routed weight update for %s", ", ".join(patched_classes))
+
+
+def _sglang_qwen3_vl_forward_supports_aux_hidden(forward_method) -> bool:
+    try:
+        source = inspect.getsource(forward_method)
+    except (OSError, TypeError):
+        return False
+    return "aux_hidden_states" in source and "self.logits_processor" in source
+
+
+def _make_sglang_qwen3_vl_eagle3_forward_patch(original_forward):
+    try:
+        source = inspect.getsource(original_forward)
+    except (OSError, TypeError):
+        return None
+
+    source = textwrap.dedent(source)
+    old_block = """        if self.pp_group.is_last_rank:
+            if not get_embedding:
+                return self.logits_processor(
+                    input_ids,
+                    hidden_states,
+                    self.lm_head,
+                    forward_batch,
+                )
+"""
+    new_block = """        aux_hidden_states = None
+        if getattr(self, "capture_aux_hidden_states", False):
+            hidden_states, aux_hidden_states = hidden_states
+
+        if self.pp_group.is_last_rank:
+            if not get_embedding:
+                return self.logits_processor(
+                    input_ids,
+                    hidden_states,
+                    self.lm_head,
+                    forward_batch,
+                    aux_hidden_states,
+                )
+"""
+    if old_block not in source:
+        return None
+
+    patched_source = source.replace(old_block, new_block, 1)
+    namespace = {}
+    exec(  # noqa: S102
+        "from __future__ import annotations\n" + patched_source,
+        original_forward.__globals__,
+        namespace,
+    )
+    patched_forward = wraps(original_forward)(namespace[original_forward.__name__])
+    patched_forward._verl_patched_qwen3_vl_eagle3_aux_hidden = True
+    return patched_forward
+
+
+def _sglang_qwen3_vl_get_embed_and_head(self):
+    return self.model.embed_tokens.weight, self.lm_head.weight
+
+
+def _sglang_qwen3_vl_set_eagle3_layers_to_capture(self, layer_ids=None):
+    self.capture_aux_hidden_states = True
+    self.model.capture_aux_hidden_states = True
+    if layer_ids is None:
+        num_layers = int(getattr(self.config, "num_hidden_layers"))
+        self.model.layers_to_capture = [
+            2,
+            num_layers // 2,
+            num_layers - 3,
+        ]
+    else:
+        self.model.layers_to_capture = [int(val) + 1 for val in layer_ids]
+
+
+def patch_sglang_qwen3_vl_eagle3_aux_hidden_capture() -> None:
+    """Backport Qwen3-VL EAGLE3 aux-hidden capture support to SGLang 0.5.9."""
+    global _SGLANG_QWEN3_VL_EAGLE3_AUX_HIDDEN_PATCHED
+    if _SGLANG_QWEN3_VL_EAGLE3_AUX_HIDDEN_PATCHED:
+        return
+
+    try:
+        qwen3_vl_module = importlib.import_module("sglang.srt.models.qwen3_vl")
+        qwen3_vl_cls = getattr(qwen3_vl_module, "Qwen3VLForConditionalGeneration")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Skip SGLang Qwen3-VL EAGLE3 aux-hidden patch: %s", exc)
+        return
+
+    original_forward = getattr(qwen3_vl_cls, "forward", None)
+    if original_forward is None:
+        logger.debug("Skip SGLang Qwen3-VL EAGLE3 aux-hidden patch: forward missing")
+        return
+
+    already_supported = hasattr(qwen3_vl_cls, "set_eagle3_layers_to_capture") and (
+        getattr(original_forward, "_verl_patched_qwen3_vl_eagle3_aux_hidden", False)
+        or _sglang_qwen3_vl_forward_supports_aux_hidden(original_forward)
+    )
+    if already_supported:
+        _SGLANG_QWEN3_VL_EAGLE3_AUX_HIDDEN_PATCHED = True
+        return
+
+    if not getattr(original_forward, "_verl_patched_qwen3_vl_eagle3_aux_hidden", False):
+        patched_forward = _make_sglang_qwen3_vl_eagle3_forward_patch(original_forward)
+        if patched_forward is None:
+            raise RuntimeError(
+                "Failed to backport SGLang Qwen3-VL EAGLE3 aux-hidden forward path. "
+                "The Qwen3-VL forward source layout is not compatible with this patch."
+            )
+        qwen3_vl_cls.forward = patched_forward
+
+    if not hasattr(qwen3_vl_cls, "get_embed_and_head"):
+        qwen3_vl_cls.get_embed_and_head = _sglang_qwen3_vl_get_embed_and_head
+    if not hasattr(qwen3_vl_cls, "set_eagle3_layers_to_capture"):
+        qwen3_vl_cls.set_eagle3_layers_to_capture = (
+            _sglang_qwen3_vl_set_eagle3_layers_to_capture
+        )
+
+    _SGLANG_QWEN3_VL_EAGLE3_AUX_HIDDEN_PATCHED = True
+    logger.warning("SGLang Qwen3-VL EAGLE3 aux-hidden capture patch active")
 
 
 def _is_sglang_npu_backend() -> bool:
@@ -3073,6 +3191,10 @@ def patch_sglang_hidden_states_tensor_output() -> None:
 
 
 def _apply_selected_sglang_patches() -> bool:
+    selected_patches = _selected_sglang_patches()
+    if selected_patches != set():
+        patch_sglang_qwen3_vl_eagle3_aux_hidden_capture()
+
     patchers = (
         ("eagle_update_weights", patch_sglang_eagle_update_weights_from_tensor),
         ("npu_eagle_target_sampling", patch_sglang_npu_eagle_target_sampling),
