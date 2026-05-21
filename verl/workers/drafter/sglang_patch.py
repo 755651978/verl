@@ -257,7 +257,77 @@ def _sglang_qwen3_vl_forward_supports_aux_hidden(forward_method) -> bool:
         source = inspect.getsource(forward_method)
     except (OSError, TypeError):
         return False
-    return "aux_hidden_states" in source and "self.logits_processor" in source
+    call_start = source.find("return self.logits_processor(")
+    if call_start < 0:
+        return False
+    open_idx = source.find("(", call_start)
+    close_idx = _find_matching_paren(source, open_idx)
+    if close_idx is None:
+        return False
+    call_source = source[call_start : close_idx + 1]
+    return "hidden_states, aux_hidden_states" in source and "aux_hidden_states" in call_source
+
+
+def _find_matching_paren(source: str, open_idx: int) -> int | None:
+    depth = 0
+    in_string = False
+    string_quote = ""
+    triple_quoted = False
+    escaped = False
+    idx = open_idx
+    while idx < len(source):
+        ch = source[idx]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif triple_quoted and source.startswith(string_quote * 3, idx):
+                in_string = False
+                idx += 2
+            elif not triple_quoted and ch == string_quote:
+                in_string = False
+        else:
+            if ch in {"'", '"'}:
+                string_quote = ch
+                triple_quoted = source.startswith(ch * 3, idx)
+                in_string = True
+                if triple_quoted:
+                    idx += 2
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return idx
+        idx += 1
+    return None
+
+
+def _append_aux_hidden_arg_to_logits_processor_call(source: str) -> str | None:
+    call_marker = "return self.logits_processor("
+    call_start = source.find(call_marker)
+    if call_start < 0:
+        return None
+
+    open_idx = source.find("(", call_start)
+    close_idx = _find_matching_paren(source, open_idx)
+    if close_idx is None:
+        return None
+
+    call_source = source[call_start : close_idx + 1]
+    if "aux_hidden_states" in call_source:
+        return source
+
+    if "\n" not in call_source:
+        return source[:close_idx] + ", aux_hidden_states" + source[close_idx:]
+
+    close_line_start = source.rfind("\n", 0, close_idx) + 1
+    close_indent = source[close_line_start:close_idx]
+    if close_indent.strip():
+        return None
+    arg_indent = close_indent + "    "
+    return source[:close_idx] + f"{arg_indent}aux_hidden_states,\n{close_indent}" + source[close_idx:]
 
 
 def _make_sglang_qwen3_vl_eagle3_forward_patch(original_forward):
@@ -267,33 +337,21 @@ def _make_sglang_qwen3_vl_eagle3_forward_patch(original_forward):
         return None
 
     source = textwrap.dedent(source)
-    old_block = """        if self.pp_group.is_last_rank:
-            if not get_embedding:
-                return self.logits_processor(
-                    input_ids,
-                    hidden_states,
-                    self.lm_head,
-                    forward_batch,
-                )
-"""
-    new_block = """        aux_hidden_states = None
-        if getattr(self, "capture_aux_hidden_states", False):
-            hidden_states, aux_hidden_states = hidden_states
+    if "hidden_states, aux_hidden_states" not in source:
+        last_rank_match = re.search(r"^(\s*)if self\.pp_group\.is_last_rank:", source, re.MULTILINE)
+        if last_rank_match is None:
+            return None
+        indent = last_rank_match.group(1)
+        aux_block = (
+            f'{indent}aux_hidden_states = None\n'
+            f'{indent}if getattr(self, "capture_aux_hidden_states", False):\n'
+            f"{indent}    hidden_states, aux_hidden_states = hidden_states\n\n"
+        )
+        source = source[: last_rank_match.start()] + aux_block + source[last_rank_match.start() :]
 
-        if self.pp_group.is_last_rank:
-            if not get_embedding:
-                return self.logits_processor(
-                    input_ids,
-                    hidden_states,
-                    self.lm_head,
-                    forward_batch,
-                    aux_hidden_states,
-                )
-"""
-    if old_block not in source:
+    patched_source = _append_aux_hidden_arg_to_logits_processor_call(source)
+    if patched_source is None or patched_source == source:
         return None
-
-    patched_source = source.replace(old_block, new_block, 1)
     namespace = {}
     exec(  # noqa: S102
         "from __future__ import annotations\n" + patched_source,
@@ -341,15 +399,20 @@ def patch_sglang_qwen3_vl_eagle3_aux_hidden_capture() -> None:
         logger.debug("Skip SGLang Qwen3-VL EAGLE3 aux-hidden patch: forward missing")
         return
 
-    already_supported = hasattr(qwen3_vl_cls, "set_eagle3_layers_to_capture") and (
+    forward_supports_aux_hidden = (
         getattr(original_forward, "_verl_patched_qwen3_vl_eagle3_aux_hidden", False)
         or _sglang_qwen3_vl_forward_supports_aux_hidden(original_forward)
+    )
+    already_supported = (
+        forward_supports_aux_hidden
+        and hasattr(qwen3_vl_cls, "get_embed_and_head")
+        and hasattr(qwen3_vl_cls, "set_eagle3_layers_to_capture")
     )
     if already_supported:
         _SGLANG_QWEN3_VL_EAGLE3_AUX_HIDDEN_PATCHED = True
         return
 
-    if not getattr(original_forward, "_verl_patched_qwen3_vl_eagle3_aux_hidden", False):
+    if not forward_supports_aux_hidden:
         patched_forward = _make_sglang_qwen3_vl_eagle3_forward_patch(original_forward)
         if patched_forward is None:
             raise RuntimeError(
