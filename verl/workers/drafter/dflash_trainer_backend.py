@@ -277,7 +277,7 @@ class DFlashTrainerBackend:
             mask_token_id=mask_token_id,
             architectures=["DFlashDraftModel"],
         )
-    
+
     def _load_state_file(self, path: str) -> dict:
         if path.endswith(".safetensors"):
             with safe_open(path, framework="pt", device="cpu") as f:
@@ -385,8 +385,8 @@ class DFlashTrainerBackend:
             if configured_num_target_layers == target_num_hidden_layers:
                 num_context_layers = int(self.config.rollout.drafter.training.get("dflash_num_target_layers", 5))
             else:
-                # Backward compatibility for older locally generated configs that used
-                # num_target_layers as the number of concatenated hidden-state tensors.
+                # Backward compatibility for older local configs that used
+                # num_target_layers as the concatenated hidden-state count.
                 num_context_layers = configured_num_target_layers
         if target_layer_ids is None:
             target_layer_ids = build_target_layer_ids(int(num_context_layers), target_num_hidden_layers)

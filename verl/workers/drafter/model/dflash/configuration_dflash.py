@@ -8,9 +8,10 @@ from transformers import PretrainedConfig
 class DFlashConfig(PretrainedConfig):
     """Configuration for the DFlash draft model.
 
-    DFlash consumes multiple target hidden-state layers. Those layers are
-    concatenated and projected into the draft model hidden size, so the config
-    needs both draft-side dimensions and target-side hidden metadata.
+    DFlash consumes selected target hidden-state layers. ``num_target_layers``
+    follows the upstream DFlash meaning: the total number of layers in the
+    target model. ``num_context_layers`` is the number of selected target hidden
+    states concatenated before the context projection.
     """
 
     model_type = "dflash"
@@ -26,8 +27,8 @@ class DFlashConfig(PretrainedConfig):
         rms_norm_eps: float = 1e-6,
         max_position_embeddings: int = 32768,
         rope_theta: float = 10000.0,
-        num_target_layers: int = 5,
-        num_context_layers: Optional[int] = None,
+        num_target_layers: int = 36,
+        num_context_layers: Optional[int] = 5,
         target_hidden_size: int = 4096,
         target_num_hidden_layers: int = 36,
         target_layer_ids: Optional[list[int]] = None,

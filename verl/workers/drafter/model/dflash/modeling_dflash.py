@@ -220,10 +220,10 @@ class DFlashDraftModel(PreTrainedModel):
         self.config = config
         self.hidden_size = config.hidden_size
         self.num_layers = config.num_hidden_layers
-        self.num_target_layers = int(getattr(config, "num_target_layers", 5))
+        target_num_hidden = int(getattr(config, "target_num_hidden_layers", getattr(config, "num_target_layers", 36)))
+        self.num_target_layers = int(getattr(config, "num_target_layers", target_num_hidden))
         self.target_hidden_size = getattr(config, "target_hidden_size", config.hidden_size)
         self.mask_token_id = getattr(config, "mask_token_id", config.vocab_size - 1)
-        target_num_hidden = int(getattr(config, "target_num_hidden_layers", self.num_target_layers))
         self.target_layer_ids = getattr(config, "target_layer_ids", None)
         self.num_context_layers = getattr(config, "num_context_layers", None)
         if self.target_layer_ids is not None:
@@ -232,7 +232,7 @@ class DFlashDraftModel(PreTrainedModel):
                 self.num_context_layers = len(self.target_layer_ids)
         else:
             if self.num_context_layers is None:
-                self.num_context_layers = self.num_target_layers
+                self.num_context_layers = self.num_target_layers if self.num_target_layers != target_num_hidden else 5
             self.target_layer_ids = build_target_layer_ids(int(self.num_context_layers), target_num_hidden)
         self.num_context_layers = int(self.num_context_layers)
         if len(self.target_layer_ids) != self.num_context_layers:
