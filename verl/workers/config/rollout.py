@@ -102,6 +102,7 @@ class DrafterTrainingConfig(BaseConfig):
     draft_update_pause_generation: bool = True
     draft_update_flush_before: bool = True
     draft_update_flush_after: bool = True
+    save_full_drafter_checkpoint: bool = False
     sample_last_n_steps: int = 20
     train_batches_per_cycle: int = 4
     lr: float = 1e-6

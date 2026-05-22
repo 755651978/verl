@@ -5,7 +5,9 @@ import time
 import asyncio
 import random
 import fnmatch
+import shutil
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, List, Any
 from omegaconf import open_dict
 from contextlib import contextmanager, nullcontext
@@ -401,6 +403,8 @@ class DrafterBaseTrainer:
 
         # Track the last pending async checkpoint save future
         self._pending_checkpoint_future = None
+        self._pending_full_checkpoint_future = None
+        self._full_checkpoint_executor = None
         self._pending_publish_state_dict = None
         self._pending_publish_step = None
         self._pending_publish_ready = False
@@ -615,6 +619,84 @@ class DrafterBaseTrainer:
 
         return trainable_state_dict
 
+    def _get_full_export_state_dict(self) -> dict[str, torch.Tensor]:
+        """Get a complete CPU state dict for offline drafter export.
+
+        Unlike `_get_trainable_state_dict`, this keeps frozen parameters and
+        persistent buffers such as vocab mappings. It is intentionally not used
+        by hot publish.
+        """
+        if isinstance(self.model, FSDP) or (self.training_device_mesh is not None and dist.is_initialized()):
+            full_state_dict = get_fsdp_full_state_dict(self.model, offload_to_cpu=True, rank0_only=True)
+        else:
+            full_state_dict = self.model.state_dict()
+        if not full_state_dict:
+            return {}
+        return {
+            name: tensor.detach().cpu().contiguous()
+            for name, tensor in full_state_dict.items()
+            if isinstance(tensor, torch.Tensor)
+        }
+
+    def _is_checkpoint_leader(self) -> bool:
+        return self.rollout_dp_rank == 0 and self._get_sp_local_rank() == 0
+
+    def _should_save_full_drafter_checkpoint(self, is_final: bool) -> bool:
+        training_cfg = self.config.rollout.drafter.training
+        return bool(is_final and training_cfg.get("save_full_drafter_checkpoint", False))
+
+    def _copy_drafter_config_files(self, output_dir: str) -> None:
+        spec_model_path = self.config.rollout.drafter.model_path
+        if not spec_model_path or not os.path.isdir(spec_model_path):
+            return
+        for filename in ("config.json", "generation_config.json"):
+            src = os.path.join(spec_model_path, filename)
+            dst = os.path.join(output_dir, filename)
+            if os.path.exists(src):
+                try:
+                    shutil.copy2(src, dst)
+                except OSError as exc:
+                    logger.warning("Failed to copy drafter %s to full checkpoint: %s", filename, exc)
+
+    def _save_full_export_checkpoint_async(self, checkpoint_path: str, step: int, is_final: bool = False):
+        if not self._should_save_full_drafter_checkpoint(is_final):
+            return None
+        if self._pending_full_checkpoint_future is not None:
+            if not self._pending_full_checkpoint_future.done():
+                logger.warning(
+                    "[Rank %s] Previous full drafter checkpoint save is still running; skip step=%s",
+                    self.rank,
+                    step,
+                )
+                return None
+            try:
+                self._pending_full_checkpoint_future.result()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Previous full drafter checkpoint save failed: %s", exc)
+            self._pending_full_checkpoint_future = None
+
+        model_state_dict = self._get_full_export_state_dict()
+        if not self._is_checkpoint_leader() or not model_state_dict:
+            return None
+
+        export_dir = os.path.join(checkpoint_path, "full_drafter")
+        output_path = os.path.join(export_dir, "pytorch_model.bin")
+        metadata_path = os.path.join(export_dir, "metadata.json")
+
+        def _write_full_checkpoint():
+            os.makedirs(export_dir, exist_ok=True)
+            torch.save(model_state_dict, output_path)
+            with open(metadata_path, "w", encoding="utf-8") as f:
+                json.dump({"step": step, "format": "full_drafter_export"}, f, indent=2)
+            self._copy_drafter_config_files(export_dir)
+
+        if self._full_checkpoint_executor is None:
+            self._full_checkpoint_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="drafter-full-ckpt")
+        future = self._full_checkpoint_executor.submit(_write_full_checkpoint)
+        self._pending_full_checkpoint_future = future
+        logger.info("[Rank %s] Scheduled full drafter checkpoint export to %s", self.rank, export_dir)
+        return future
+
     
     def _save_checkpoint_async(self, step: int, is_final: bool = False):
         """Asynchronously save checkpoint using DCP's async_save.
@@ -639,6 +721,7 @@ class DrafterBaseTrainer:
         optimizer_state_dict = self.optimizer.state_dict() if self.optimizer and is_checkpoint_leader else {}
 
         state_dict = {"model": model_state_dict, "optimizer": optimizer_state_dict, "step": step}
+        self._save_full_export_checkpoint_async(checkpoint_path, step, is_final=is_final)
 
         if is_fsdp_wrapped:
             if is_checkpoint_leader and model_state_dict:
@@ -1865,6 +1948,14 @@ class DrafterBaseTrainer:
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"Pending checkpoint save failed: {e}")
             self._pending_checkpoint_future = None
+        if self._pending_full_checkpoint_future is not None:
+            logger.debug(f"[Rank {self.rank}] Waiting for pending full drafter checkpoint save to complete...")
+            try:
+                await asyncio.wrap_future(self._pending_full_checkpoint_future)
+                logger.debug(f"[Rank {self.rank}] Pending full drafter checkpoint save completed")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"Pending full drafter checkpoint save failed: {e}")
+            self._pending_full_checkpoint_future = None
 
         # Save final checkpoint and wait for it to complete
         if self.checkpoint_dir and self.model is not None and self.training_steps > 0:
@@ -1877,6 +1968,13 @@ class DrafterBaseTrainer:
                     logger.info(f"[Rank {self.rank}] Final checkpoint save completed")
                 except Exception as e:  # noqa: BLE001
                     logger.warning(f"Final checkpoint save failed: {e}")
+            if self._pending_full_checkpoint_future is not None:
+                try:
+                    await asyncio.wrap_future(self._pending_full_checkpoint_future)
+                    logger.info(f"[Rank {self.rank}] Final full drafter checkpoint save completed")
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"Final full drafter checkpoint save failed: {e}")
+                self._pending_full_checkpoint_future = None
 
         if self.optimizer is not None:
             try:
@@ -1964,6 +2062,9 @@ class DrafterBaseTrainer:
         if clear_data:
             self.collected_data.clear()
             self.data_buffer.clear()  # Clear the cross-step data buffer
+        if self._full_checkpoint_executor is not None:
+            self._full_checkpoint_executor.shutdown(wait=False)
+            self._full_checkpoint_executor = None
         if device_name != "cpu" and hasattr(self.device_module, "empty_cache"):
             if hasattr(self.device_module, "synchronize"):
                 self.device_module.synchronize()

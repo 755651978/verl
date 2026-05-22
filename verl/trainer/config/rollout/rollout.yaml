@@ -480,6 +480,7 @@ drafter:
     draft_update_pause_generation: true
     draft_update_flush_before: true
     draft_update_flush_after: true
+    save_full_drafter_checkpoint: false
     sample_last_n_steps: 20
     train_batches_per_cycle: 4
     lr: 1e-6
