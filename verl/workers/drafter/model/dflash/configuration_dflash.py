@@ -27,6 +27,7 @@ class DFlashConfig(PretrainedConfig):
         max_position_embeddings: int = 32768,
         rope_theta: float = 10000.0,
         num_target_layers: int = 5,
+        num_context_layers: Optional[int] = None,
         target_hidden_size: int = 4096,
         target_num_hidden_layers: int = 36,
         target_layer_ids: Optional[list[int]] = None,
@@ -45,6 +46,7 @@ class DFlashConfig(PretrainedConfig):
         self.max_position_embeddings = max_position_embeddings
         self.rope_theta = rope_theta
         self.num_target_layers = num_target_layers
+        self.num_context_layers = num_context_layers
         self.target_hidden_size = target_hidden_size
         self.target_num_hidden_layers = target_num_hidden_layers
         self.target_layer_ids = target_layer_ids

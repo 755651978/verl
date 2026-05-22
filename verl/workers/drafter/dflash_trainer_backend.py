@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from safetensors import safe_open
 from transformers import AutoConfig
 
-from .model.dflash import DFlashConfig, DFlashDraftModel
+from .model.dflash import DFlashConfig, DFlashDraftModel, build_target_layer_ids
 from .model.dflash.flex_attention import compile_friendly_create_block_mask
 from .model.target.target_head import TargetHead
 from verl.utils.torch_functional import (
@@ -55,6 +55,8 @@ class DFlashTrainingModel(nn.Module):
     package because it contains training-only behavior: anchor sampling, block
     mask construction, label gathering, loss weighting, and metrics.
     """
+
+    _no_split_modules = ["DFlashDecoderLayer"]
 
     def __init__(self, draft_model: DFlashDraftModel, block_size: int = 16, num_anchors: int = 512, loss_decay_gamma: float = 7.0):
         super().__init__()
@@ -250,9 +252,13 @@ class DFlashTrainerBackend:
         target_text_config = getattr(target_hf_config, "text_config", target_hf_config)
         hidden_size_cfg = training_cfg.get("dflash_hidden_size", None)
         hidden_size = int(hidden_size_cfg if hidden_size_cfg is not None else target_text_config.hidden_size)
-        num_target_layers = int(training_cfg.get("dflash_num_target_layers", 5))
+        num_context_layers = int(training_cfg.get("dflash_num_target_layers", 5))
+        target_num_hidden_layers = int(getattr(target_text_config, "num_hidden_layers", 36))
         mask_token_id_cfg = training_cfg.get("dflash_mask_token_id", None)
         mask_token_id = int(mask_token_id_cfg if mask_token_id_cfg is not None else target_text_config.vocab_size - 1)
+        target_layer_ids = training_cfg.get("dflash_target_layer_ids", None)
+        if target_layer_ids is None:
+            target_layer_ids = build_target_layer_ids(num_context_layers, target_num_hidden_layers)
         return DFlashConfig(
             hidden_size=hidden_size,
             intermediate_size=int(getattr(target_text_config, "intermediate_size", hidden_size * 4)),
@@ -263,10 +269,11 @@ class DFlashTrainerBackend:
             rms_norm_eps=float(getattr(target_text_config, "rms_norm_eps", 1e-6)),
             max_position_embeddings=int(getattr(target_text_config, "max_position_embeddings", 32768)),
             rope_theta=float(getattr(target_text_config, "rope_theta", 10000.0)),
-            num_target_layers=num_target_layers,
+            num_target_layers=target_num_hidden_layers,
+            num_context_layers=num_context_layers,
             target_hidden_size=int(target_text_config.hidden_size),
-            target_num_hidden_layers=int(getattr(target_text_config, "num_hidden_layers", 36)),
-            target_layer_ids=training_cfg.get("dflash_target_layer_ids", None),
+            target_num_hidden_layers=target_num_hidden_layers,
+            target_layer_ids=target_layer_ids,
             mask_token_id=mask_token_id,
             architectures=["DFlashDraftModel"],
         )
@@ -276,8 +283,8 @@ class DFlashTrainerBackend:
             with safe_open(path, framework="pt", device="cpu") as f:
                 return {key: f.get_tensor(key) for key in f.keys()}
         return torch.load(path, map_location="cpu", weights_only=True)
-    
-    def _load_draft_checkpoint(self, draft_model: DFlashDraftModel, model_path: str) -> None:
+
+    def _load_draft_state_dict(self, model_path: str) -> dict[str, torch.Tensor]:
         state_dict: dict[str, torch.Tensor] = {}
         index_paths = glob.glob(os.path.join(model_path, "*.index.json"))
         if index_paths:
@@ -296,7 +303,9 @@ class DFlashTrainerBackend:
                 state_dict = self._load_state_file(pytorch_path)
             else:
                 raise FileNotFoundError(f"No model index, model.safetensors or pytorch_model.bin found in {model_path}")
+        return state_dict
 
+    def _normalize_draft_state_dict(self, state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         key_remap = {
             "fc.weight": "context_proj.weight",
             "hidden_norm.weight": "context_norm.weight",
@@ -311,6 +320,110 @@ class DFlashTrainerBackend:
                     break
             normalized_key = key_remap.get(normalized_key, normalized_key)
             normalized_state[normalized_key] = value
+        return normalized_state
+
+    def _infer_num_context_layers_from_state(self, normalized_state: dict[str, torch.Tensor], target_hidden_size: int) -> int | None:
+        context_proj = normalized_state.get("context_proj.weight")
+        if context_proj is None:
+            return None
+        if context_proj.ndim != 2:
+            raise ValueError(f"DFlash context_proj.weight must be rank-2, got shape {tuple(context_proj.shape)}")
+        input_dim = int(context_proj.shape[1])
+        if input_dim % int(target_hidden_size) != 0:
+            raise ValueError(
+                f"DFlash context_proj.weight input dim {input_dim} is not divisible by "
+                f"target_hidden_size={target_hidden_size}"
+            )
+        return input_dim // int(target_hidden_size)
+
+    def _normalize_dflash_config(
+        self,
+        drafter_config: DFlashConfig,
+        target_hf_config,
+        normalized_state: dict[str, torch.Tensor] | None,
+        spec_model_path: str,
+    ) -> DFlashConfig:
+        target_text_config = getattr(target_hf_config, "text_config", target_hf_config)
+        target_hidden_size = int(
+            getattr(target_text_config, "hidden_size", None)
+            or getattr(drafter_config, "target_hidden_size")
+        )
+        target_num_hidden_layers = int(
+            getattr(target_text_config, "num_hidden_layers", None)
+            or getattr(drafter_config, "target_num_hidden_layers", 36)
+        )
+
+        nested_dflash_config = getattr(drafter_config, "dflash_config", None)
+        nested_target_layer_ids = None
+        if isinstance(nested_dflash_config, dict):
+            nested_target_layer_ids = nested_dflash_config.get("target_layer_ids")
+
+        target_layer_ids = getattr(drafter_config, "target_layer_ids", None)
+        if target_layer_ids is None and nested_target_layer_ids is not None:
+            target_layer_ids = nested_target_layer_ids
+        if target_layer_ids is not None:
+            target_layer_ids = [int(layer_id) for layer_id in target_layer_ids]
+
+        state_num_context_layers = None
+        if normalized_state is not None:
+            state_num_context_layers = self._infer_num_context_layers_from_state(normalized_state, target_hidden_size)
+
+        ids_num_context_layers = len(target_layer_ids) if target_layer_ids is not None else None
+        configured_num_target_layers = int(getattr(drafter_config, "num_target_layers", target_num_hidden_layers))
+        configured_num_context_layers = getattr(drafter_config, "num_context_layers", None)
+        if configured_num_context_layers is not None:
+            configured_num_context_layers = int(configured_num_context_layers)
+
+        if state_num_context_layers is not None and ids_num_context_layers is not None and state_num_context_layers != ids_num_context_layers:
+            raise ValueError(
+                f"DFlash checkpoint/config mismatch in {spec_model_path}: context_proj.weight implies "
+                f"{state_num_context_layers} context layers, but target_layer_ids has {ids_num_context_layers} entries"
+            )
+
+        num_context_layers = state_num_context_layers or ids_num_context_layers or configured_num_context_layers
+        if num_context_layers is None:
+            if configured_num_target_layers == target_num_hidden_layers:
+                num_context_layers = int(self.config.rollout.drafter.training.get("dflash_num_target_layers", 5))
+            else:
+                # Backward compatibility for older locally generated configs that used
+                # num_target_layers as the number of concatenated hidden-state tensors.
+                num_context_layers = configured_num_target_layers
+        if target_layer_ids is None:
+            target_layer_ids = build_target_layer_ids(int(num_context_layers), target_num_hidden_layers)
+        if len(target_layer_ids) != int(num_context_layers):
+            raise ValueError(
+                f"DFlash expected {num_context_layers} target layer ids, got {len(target_layer_ids)} "
+                f"in {spec_model_path}"
+            )
+
+        if configured_num_target_layers != target_num_hidden_layers or configured_num_context_layers != int(num_context_layers):
+            logger.warning(
+                "Normalizing DFlash training config: num_target_layers=%s->%s "
+                "num_context_layers=%s->%s (state_context_layers=%s target_layer_ids=%s model_path=%s)",
+                configured_num_target_layers,
+                target_num_hidden_layers,
+                configured_num_context_layers,
+                num_context_layers,
+                state_num_context_layers,
+                target_layer_ids,
+                spec_model_path,
+            )
+
+        drafter_config.num_target_layers = target_num_hidden_layers
+        drafter_config.num_context_layers = int(num_context_layers)
+        drafter_config.target_hidden_size = target_hidden_size
+        drafter_config.target_num_hidden_layers = target_num_hidden_layers
+        drafter_config.target_layer_ids = target_layer_ids
+        return drafter_config
+
+    def _load_draft_checkpoint(
+        self,
+        draft_model: DFlashDraftModel,
+        model_path: str,
+        normalized_state: dict[str, torch.Tensor] | None = None,
+    ) -> None:
+        if normalized_state is None:
+            normalized_state = self._normalize_draft_state_dict(self._load_draft_state_dict(model_path))
 
         model_state = draft_model.state_dict()
         filtered_state: dict[str, torch.Tensor] = {}
@@ -322,6 +435,11 @@ class DFlashTrainerBackend:
                 continue
             if tuple(model_state[key].shape) != tuple(value.shape):
                 mismatched.append((key, tuple(value.shape), tuple(model_state[key].shape)))
+                if key == "context_proj.weight":
+                    raise ValueError(
+                        "DFlash context_proj.weight shape mismatch after config normalization: "
+                        f"checkpoint={tuple(value.shape)} model={tuple(model_state[key].shape)}"
+                    )
                 continue
             filtered_state[key] = value
 
@@ -341,18 +459,22 @@ class DFlashTrainerBackend:
         spec_model_path = self.config.rollout.drafter.model_path
         config_path = os.path.join(spec_model_path, "config.json")
         target_hf_config = self._get_target_hf_config()
+        normalized_state = None
 
         if config_path and os.path.exists(config_path):
             drafter_config = DFlashConfig.from_dflash_pretrained(spec_model_path)
+            if spec_model_path and os.path.exists(spec_model_path):
+                normalized_state = self._normalize_draft_state_dict(self._load_draft_state_dict(spec_model_path))
         else:
             drafter_config = self._build_fallback_config(target_hf_config)
 
         if not isinstance(drafter_config, DFlashConfig):
             raise TypeError(f"DFlash config is not a DFlashConfig: {type(drafter_config)}")
+        drafter_config = self._normalize_dflash_config(drafter_config, target_hf_config, normalized_state, spec_model_path)
 
         if spec_model_path and os.path.exists(spec_model_path) and os.path.exists(config_path):
             draft_model = DFlashDraftModel(deepcopy(drafter_config))
-            self._load_draft_checkpoint(draft_model, spec_model_path)
+            self._load_draft_checkpoint(draft_model, spec_model_path, normalized_state=normalized_state)
         else:
             draft_model = DFlashDraftModel(deepcopy(drafter_config))
         draft_model.load_embedding(target_model_path)
@@ -379,8 +501,8 @@ class DFlashTrainerBackend:
         max_window = int(self.config.rollout.drafter.training.get("dflash_max_window", 512))
         pad_id = int(getattr(model_config, "pad_token_id", 0) or 0)
         h_dim = int(getattr(model_config, "target_hidden_size", model_config.hidden_size))
-        num_target_layers = int(getattr(model_config, "num_target_layers", 5))
-        expected_hidden_dim = h_dim * num_target_layers
+        num_context_layers = int(getattr(model_config, "num_context_layers", getattr(model_config, "num_target_layers", 5)))
+        expected_hidden_dim = h_dim * num_context_layers
 
         for item in items:
             ids = item["input_ids"].to(device, non_blocking=True)
@@ -390,7 +512,7 @@ class DFlashTrainerBackend:
             if full_h.size(-1) < expected_hidden_dim:
                 raise ValueError(
                     f"DFlash expected at least {expected_hidden_dim} hidden dims "
-                    f"({num_target_layers} target layers of size {h_dim}), got {full_h.size(-1)}"
+                    f"({num_context_layers} context layers of size {h_dim}), got {full_h.size(-1)}"
                 )
             
             if item.get("loss_mask") is not None:
@@ -429,8 +551,8 @@ class DFlashTrainerBackend:
 
         draft_model = model.module if hasattr(model, "module") else model
         hidden_states = batch["hidden_states"]
-        num_target_layers = draft_model.draft_model.num_target_layers
-        per_layer_dim = hidden_states.shape[-1] // num_target_layers
+        num_context_layers = draft_model.draft_model.num_context_layers
+        per_layer_dim = hidden_states.shape[-1] // num_context_layers
         hidden_states_list = list(hidden_states.split(per_layer_dim, dim=-1))
 
         loss, accuracy, loss_pp, acc_pp, count_pp = model(

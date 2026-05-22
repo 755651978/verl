@@ -220,23 +220,34 @@ class DFlashDraftModel(PreTrainedModel):
         self.config = config
         self.hidden_size = config.hidden_size
         self.num_layers = config.num_hidden_layers
-        self.num_target_layers = getattr(config, "num_target_layers", 5)
+        self.num_target_layers = int(getattr(config, "num_target_layers", 5))
         self.target_hidden_size = getattr(config, "target_hidden_size", config.hidden_size)
         self.mask_token_id = getattr(config, "mask_token_id", config.vocab_size - 1)
-        target_num_hidden = getattr(config, "target_num_hidden_layers", 36)
+        target_num_hidden = int(getattr(config, "target_num_hidden_layers", self.num_target_layers))
         self.target_layer_ids = getattr(config, "target_layer_ids", None)
-        if self.target_layer_ids is None:
-            self.target_layer_ids = build_target_layer_ids(self.num_target_layers, target_num_hidden)
-
-        self.context_proj = nn.Linear(self.num_target_layers * self.target_hidden_size, self.hidden_size, bias=False)
+        self.num_context_layers = getattr(config, "num_context_layers", None)
+        if self.target_layer_ids is not None:
+            self.target_layer_ids = [int(layer_id) for layer_id in self.target_layer_ids]
+            if self.num_context_layers is None:
+                self.num_context_layers = len(self.target_layer_ids)
+        else:
+            if self.num_context_layers is None:
+                self.num_context_layers = self.num_target_layers
+            self.target_layer_ids = build_target_layer_ids(int(self.num_context_layers), target_num_hidden)
+        self.num_context_layers = int(self.num_context_layers)
+        if len(self.target_layer_ids) != self.num_context_layers:
+            raise ValueError(
+                f"DFlash expected {self.num_context_layers} target layer ids, got {len(self.target_layer_ids)}"
+            )
+        self.context_proj = nn.Linear(self.num_context_layers * self.target_hidden_size, self.hidden_size, bias=False)
         self.context_norm = DFlashRMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([DFlashDecoderLayer(config) for _ in range(self.num_layers)])
         self.final_norm = DFlashRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def extract_context_feature(self, all_hidden_states: list[torch.Tensor]) -> torch.Tensor:
-        if len(all_hidden_states) != self.num_target_layers:
-            raise ValueError(f"DFlash expected {self.num_target_layers} hidden-state tensors, got {len(all_hidden_states)}")
+        if len(all_hidden_states) != self.num_context_layers:
+            raise ValueError(f"DFlash expected {self.num_context_layers} hidden-state tensors, got {len(all_hidden_states)}")
         concatenated = torch.cat(all_hidden_states, dim=-1).to(self.context_proj.weight.dtype)
         return self.context_norm(self.context_proj(concatenated))
 
