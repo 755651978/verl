@@ -113,6 +113,7 @@ class RLHFDataset(Dataset):
         self.return_full_prompt = config.get("return_full_prompt", False)
         self.truncation = config.get("truncation", "error")
         self.filter_overlong_prompts = config.get("filter_overlong_prompts", True)
+        self.filter_overlong_prompts_batch_size = config.get("filter_overlong_prompts_batch_size", 1024)
         self.apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})
 
         self.tool_config_path = config.get("tool_config_path", None)
@@ -190,21 +191,63 @@ class RLHFDataset(Dataset):
             prompt_key = self.prompt_key
             image_key = self.image_key
             video_key = self.video_key
+            prompt_len_key = "__verl_prompt_length_for_filter__"
+            while prompt_len_key in dataframe.column_names:
+                prompt_len_key = f"_{prompt_len_key}"
+
+            def get_apply_kwargs():
+                apply_kwargs = dict(**self.apply_chat_template_kwargs)
+                if self.tool_schemas is not None:
+                    apply_kwargs["tools"] = self.tool_schemas
+                apply_kwargs.pop("tokenize", None)
+                apply_kwargs.pop("return_dict", None)
+                apply_kwargs.pop("return_tensors", None)
+                return apply_kwargs
+
+            def apply_chat_template_batched(template_owner, messages_list, apply_kwargs):
+                if not messages_list:
+                    return []
+                try:
+                    rendered = template_owner.apply_chat_template(
+                        messages_list,
+                        add_generation_prompt=True,
+                        tokenize=False,
+                        **apply_kwargs,
+                    )
+                    if isinstance(rendered, str):
+                        if len(messages_list) == 1:
+                            return [rendered]
+                        raise TypeError("batched apply_chat_template unexpectedly returned a string")
+                    return list(rendered)
+                except Exception:
+                    return [
+                        template_owner.apply_chat_template(
+                            messages,
+                            add_generation_prompt=True,
+                            tokenize=False,
+                            **apply_kwargs,
+                        )
+                        for messages in messages_list
+                    ]
+
+            def batch_to_docs(batch):
+                batch_size = len(batch[prompt_key])
+                return [{key: values[i] for key, values in batch.items()} for i in range(batch_size)]
 
             if processor is not None:
-                from verl.utils.dataset.vision_utils import process_image, process_video
 
-                def doc2len(doc) -> int:
+                def doc2len(doc, raw_prompt: Optional[str] = None) -> int:
                     try:
-                        messages = self._build_messages(doc, key=self.prompt_key)
-                        # pass tool schemas if available so the processor can format prompts
-                        apply_kwargs = dict(**self.apply_chat_template_kwargs)
-                        if self.tool_schemas is not None:
-                            apply_kwargs["tools"] = self.tool_schemas
+                        from verl.utils.dataset.vision_utils import process_image, process_video
 
-                        raw_prompt = self.processor.apply_chat_template(
-                            messages, add_generation_prompt=True, tokenize=False, **apply_kwargs
-                        )
+                        if raw_prompt is None:
+                            messages = self._build_messages(doc, key=self.prompt_key)
+                            raw_prompt = self.processor.apply_chat_template(
+                                messages,
+                                add_generation_prompt=True,
+                                tokenize=False,
+                                **get_apply_kwargs(),
+                            )
                         if image_key in doc and doc[image_key]:
                             images = [
                                 process_image(image, image_patch_size=self.image_patch_size) for image in doc[image_key]
@@ -250,33 +293,168 @@ class RLHFDataset(Dataset):
                         traceback.print_exc()
                         return self.max_prompt_length + 1
 
+                def get_image_token_count(height: int, width: int) -> Optional[int]:
+                    if hasattr(processor, "_get_num_multimodal_tokens"):
+                        try:
+                            mm_data = processor._get_num_multimodal_tokens(image_sizes=[(height, width)])
+                            num_tokens = getattr(mm_data, "num_image_tokens", None)
+                            if num_tokens is None and isinstance(mm_data, dict):
+                                num_tokens = mm_data.get("num_image_tokens")
+                            if num_tokens:
+                                return max(int(num_tokens[0]), 1)
+                        except Exception:
+                            pass
+
+                    image_processor = getattr(processor, "image_processor", None)
+                    if image_processor is None or not hasattr(image_processor, "get_number_of_image_patches"):
+                        return None
+
+                    try:
+                        num_patches = image_processor.get_number_of_image_patches(height, width, {})
+                        merge_size = int(getattr(image_processor, "merge_size", 1) or 1)
+                        return max(int(num_patches) // max(merge_size * merge_size, 1), 1)
+                    except Exception:
+                        return None
+
+                def expand_image_tokens(raw_prompt: str, images: list[Image.Image]) -> Optional[str]:
+                    image_token = getattr(processor, "image_token", None)
+                    if not image_token:
+                        return None
+
+                    expanded_prompt = raw_prompt
+                    placeholder = "<|verl_image_placeholder|>"
+                    while placeholder in expanded_prompt:
+                        placeholder = f"_{placeholder}"
+                    for image in images:
+                        width, height = image.size
+                        num_image_tokens = get_image_token_count(height=height, width=width)
+                        if num_image_tokens is None or image_token not in expanded_prompt:
+                            return None
+                        expanded_prompt = expanded_prompt.replace(image_token, placeholder * num_image_tokens, 1)
+
+                    return expanded_prompt.replace(placeholder, image_token)
+
+                def batch_doc2len(batch) -> dict[str, list[int]]:
+                    from verl.utils.dataset.vision_utils import process_image
+
+                    docs = batch_to_docs(batch)
+                    lengths = [self.max_prompt_length + 1] * len(docs)
+                    apply_kwargs = get_apply_kwargs()
+
+                    messages_list = []
+                    message_indices = []
+                    for i, doc in enumerate(docs):
+                        try:
+                            messages_list.append(self._build_messages(doc, key=self.prompt_key))
+                            message_indices.append(i)
+                        except Exception:
+                            print("Error processing one of the samples, skipping...")
+                            traceback.print_exc()
+
+                    raw_prompts = apply_chat_template_batched(processor, messages_list, apply_kwargs)
+
+                    tokenization_indices = []
+                    prompts_to_tokenize = []
+                    for i, raw_prompt in zip(message_indices, raw_prompts, strict=True):
+                        doc = docs[i]
+                        has_images = image_key in doc and bool(doc[image_key])
+                        has_videos = video_key in doc and bool(doc[video_key])
+                        if has_videos:
+                            lengths[i] = doc2len(doc, raw_prompt=raw_prompt)
+                            continue
+
+                        prompt_to_tokenize = raw_prompt
+                        if has_images:
+                            try:
+                                images = [
+                                    process_image(image, image_patch_size=self.image_patch_size)
+                                    for image in doc[image_key]
+                                ]
+                                prompt_to_tokenize = expand_image_tokens(raw_prompt, images)
+                            except Exception:
+                                prompt_to_tokenize = None
+
+                            if prompt_to_tokenize is None:
+                                lengths[i] = doc2len(doc, raw_prompt=raw_prompt)
+                                continue
+
+                        tokenization_indices.append(i)
+                        prompts_to_tokenize.append(prompt_to_tokenize)
+
+                    if prompts_to_tokenize:
+                        try:
+                            tokenized = processor.tokenizer(
+                                text=prompts_to_tokenize,
+                                add_special_tokens=False,
+                                return_attention_mask=False,
+                            )["input_ids"]
+                            for i, input_ids in zip(tokenization_indices, tokenized, strict=True):
+                                lengths[i] = len(input_ids)
+                        except Exception:
+                            for i, prompt_to_tokenize in zip(tokenization_indices, prompts_to_tokenize, strict=True):
+                                try:
+                                    input_ids = processor.tokenizer(
+                                        text=prompt_to_tokenize,
+                                        add_special_tokens=False,
+                                        return_attention_mask=False,
+                                    )["input_ids"]
+                                    lengths[i] = len(input_ids)
+                                except Exception:
+                                    print("Error processing one of the samples, skipping...")
+                                    traceback.print_exc()
+
+                    return {prompt_len_key: lengths}
+
             else:
 
-                def doc2len(doc) -> int:
+                def batch_doc2len(batch) -> dict[str, list[int]]:
+                    conversations = batch[prompt_key]
+                    apply_kwargs = get_apply_kwargs()
                     try:
-                        apply_kwargs = dict(**self.apply_chat_template_kwargs)
-                        if self.tool_schemas is not None:
-                            apply_kwargs["tools"] = self.tool_schemas
-
-                        # Keep explicit tokenization to avoid transformers version default changes.
-                        apply_kwargs.pop("tokenize", None)
-                        apply_kwargs.pop("return_dict", None)
-                        apply_kwargs.pop("return_tensors", None)
-
-                        tokenized_prompt = tokenizer.apply_chat_template(
-                            doc[prompt_key], add_generation_prompt=True, tokenize=True, **apply_kwargs
-                        )
-                        return len(normalize_token_ids(tokenized_prompt))
+                        raw_prompts = apply_chat_template_batched(tokenizer, conversations, apply_kwargs)
+                        tokenized_prompts = tokenizer(
+                            raw_prompts,
+                            add_special_tokens=False,
+                            return_attention_mask=False,
+                        )["input_ids"]
+                        lengths = [len(normalize_token_ids(input_ids)) for input_ids in tokenized_prompts]
                     except Exception:
-                        print("Error processing one of the samples, skipping...")
-                        traceback.print_exc()
-                        return self.max_prompt_length + 1
+                        lengths = []
+                        for messages in conversations:
+                            try:
+                                raw_prompt = tokenizer.apply_chat_template(
+                                    messages,
+                                    add_generation_prompt=True,
+                                    tokenize=False,
+                                    **apply_kwargs,
+                                )
+                                tokenized_prompt = tokenizer(
+                                    raw_prompt,
+                                    add_special_tokens=False,
+                                    return_attention_mask=False,
+                                )["input_ids"]
+                                lengths.append(len(normalize_token_ids(tokenized_prompt)))
+                            except Exception:
+                                print("Error processing one of the samples, skipping...")
+                                traceback.print_exc()
+                                lengths.append(self.max_prompt_length + 1)
 
+                    return {prompt_len_key: lengths}
+
+            dataframe = dataframe.map(
+                batch_doc2len,
+                batched=True,
+                batch_size=self.filter_overlong_prompts_batch_size,
+                num_proc=self.num_workers,
+                desc="Computing prompt lengths for filtering",
+            )
             dataframe = dataframe.filter(
-                lambda doc: doc2len(doc) <= self.max_prompt_length,
+                lambda prompt_length: prompt_length <= self.max_prompt_length,
+                input_columns=[prompt_len_key],
                 num_proc=self.num_workers,
                 desc=f"Filtering prompts longer than {self.max_prompt_length} tokens",
             )
+            dataframe = dataframe.remove_columns([prompt_len_key])
 
             print(f"filter dataset len: {len(dataframe)}")
         return dataframe
