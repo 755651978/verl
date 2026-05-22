@@ -1868,38 +1868,45 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
         accept_lengths = getattr(result, "accept_lens", None)
     if accept_lengths is not None and req_index < len(accept_lengths) and _is_torch_tensor(hidden_states):
         rows = max(int(accept_lengths[req_index]) + 1, 1)
+
+        if hidden_states.dim() == 3 and req_index < int(hidden_states.shape[0]):
+            rows = min(rows, int(hidden_states.shape[1]))
+            if rows <= 0:
+                return hidden_state_offset
+            position_start = max(
+                len(getattr(req, "origin_input_ids", []) or [])
+                + len(getattr(req, "output_ids", []) or [])
+                - rows,
+                0,
+            )
+            chunk = hidden_states[req_index, :rows]
+            chunk = _sglang_concat_last_hidden_for_drafter(
+                req,
+                logits_output,
+                chunk,
+                _slice_sglang_drafter_last_hidden_output(logits_output, (req_index, slice(0, rows))),
+            )
+            _append_sglang_hidden_state_chunk_with_budget(
+                req,
+                chunk,
+                position_start=position_start,
+                batch=batch,
+            )
+            return hidden_state_offset + rows
+
+        num_requests = len(accept_lengths)
+        total_hidden = int(hidden_states.shape[0])
+        per_req_alloc = total_hidden // num_requests if num_requests > 0 else total_hidden
+        rows = min(rows, max(per_req_alloc, 1))
         position_start = max(
             len(getattr(req, "origin_input_ids", []) or [])
             + len(getattr(req, "output_ids", []) or [])
             - rows,
             0,
         )
-
-        if hidden_states.dim() == 3 and req_index < int(hidden_states.shape[0]):
-            if int(hidden_states.shape[1]) >= rows:
-                chunk = hidden_states[req_index, :rows]
-                chunk = _sglang_concat_last_hidden_for_drafter(
-                    req,
-                    logits_output,
-                    chunk,
-                    _slice_sglang_drafter_last_hidden_output(logits_output, (req_index, slice(0, rows))),
-                )
-                _append_sglang_hidden_state_chunk_with_budget(
-                    req,
-                    chunk,
-                    position_start=position_start,
-                    batch=batch,
-                )
-                return hidden_state_offset + rows
-            if getattr(req, "return_hidden_states", False):
-                raise RuntimeError(
-                    "SGLang EAGLE verify hidden states are incomplete for accepted tokens: "
-                    f"shape={tuple(hidden_states.shape)}, req_index={req_index}, required_rows={rows}."
-                )
-
-        expected_rows = sum(max(int(accept_len) + 1, 1) for accept_len in accept_lengths)
+        expected_rows = num_requests * per_req_alloc
         end = hidden_state_offset + rows
-        has_expected_rows = int(hidden_states.shape[0]) >= expected_rows and end <= int(hidden_states.shape[0])
+        has_expected_rows = total_hidden >= expected_rows and end <= total_hidden
         if hidden_states.dim() >= 2 and has_expected_rows:
             chunk = hidden_states[hidden_state_offset:end]
             chunk = _sglang_concat_last_hidden_for_drafter(
