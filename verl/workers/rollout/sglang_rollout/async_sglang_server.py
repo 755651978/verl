@@ -78,6 +78,22 @@ _VERL_TOP_LOGPROBS_OUTPUT_ROW_START_PARAM = "_verl_top_logprobs_output_row_start
 _VERL_TOP_LOGPROBS_OUTPUT_ROW_END_PARAM = "_verl_top_logprobs_output_row_end"
 
 
+def _drafter_uses_eagle_last_hidden(drafter_cfg) -> bool:
+    """Whether drafter training needs the extra final target hidden state."""
+    if not getattr(drafter_cfg, "enable", False):
+        return False
+    algorithm = str(getattr(drafter_cfg, "speculative_algorithm", "") or "").upper()
+    training_cfg = getattr(drafter_cfg, "training", None)
+    if training_cfg is None:
+        return False
+    return bool(
+        algorithm == "EAGLE3"
+        and getattr(drafter_cfg, "enable_drafter_training", False)
+        and getattr(training_cfg, "collect_hidden_states_from_sgl", False)
+        and not getattr(training_cfg, "use_logits", False)
+    )
+
+
 def _env_flag_enabled(name: str, default: bool = False) -> bool:
     raw_value = os.getenv(name)
     if raw_value is None:
@@ -748,11 +764,7 @@ class SGLangHttpServer:
         # drafter
         return_last_hidden_for_drafter = False
         if self.config.drafter.enable:
-            return_last_hidden_for_drafter = bool(
-                self.config.drafter.enable_drafter_training
-                and self.config.drafter.training.collect_hidden_states_from_sgl
-                and not self.config.drafter.training.use_logits
-            )
+            return_last_hidden_for_drafter = _drafter_uses_eagle_last_hidden(self.config.drafter)
             args["speculative_algorithm"] = self.config.drafter.speculative_algorithm
             args["cuda_graph_max_bs"] = 32
             args["speculative_draft_model_path"] = self.config.drafter.model_path
@@ -1037,7 +1049,7 @@ class SGLangHttpServer:
                     )
                 request.update({"return_logprob": True})
                 request.update({"top_logprobs_num": self.config.drafter.training.logits_topk})
-            else:
+            elif _drafter_uses_eagle_last_hidden(self.config.drafter):
                 custom_params[_VERL_DRAFTER_RETURN_LAST_HIDDEN_PARAM] = True
             sampling_params["custom_params"] = custom_params
 
