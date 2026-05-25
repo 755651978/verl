@@ -54,27 +54,13 @@ if __name__ == "__main__":
         r"The final answer MUST BE put in \boxed{}."
     )
 
-    def normalize_images(images):
-        if images is None:
-            return []
-        if isinstance(images, str):
-            images = [images]
-
-        normalized_images = []
-        for image in images:
-            if isinstance(image, str):
-                normalized_images.append({"image": image})
-            else:
-                normalized_images.append(image)
-        return normalized_images
-
     # add a row to each data item that represents a unique id
     def make_map_fn(split):
         def process_fn(example, idx):
             problem = example.pop("problem")
             prompt = problem + " " + instruction_following
             answer = example.pop("answer")
-            images = normalize_images(example.pop("images"))
+            images = example.pop("images")
 
             data = {
                 "data_source": data_source,
