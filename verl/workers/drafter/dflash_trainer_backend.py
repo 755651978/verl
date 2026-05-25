@@ -61,6 +61,7 @@ class DFlashTrainingModel(nn.Module):
     def __init__(self, draft_model: DFlashDraftModel, block_size: int = 16, num_anchors: int = 512, loss_decay_gamma: float = 7.0):
         super().__init__()
         self.draft_model = draft_model
+        self.config = draft_model.config
         self.block_size = block_size
         self.num_anchors = num_anchors
         self.loss_decay_gamma = loss_decay_gamma

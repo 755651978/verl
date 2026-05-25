@@ -72,6 +72,7 @@ _VERL_HIDDEN_STATE_FRONT_TOKENS_PARAM = "_verl_hidden_state_front_tokens_per_sam
 _VERL_HIDDEN_STATE_PROMPT_LEN_PARAM = "_verl_prompt_len"
 _VERL_DRAFTER_RETURN_LAST_HIDDEN_ENV = "VERL_SGLANG_DRAFTER_RETURN_LAST_HIDDEN"
 _VERL_DRAFTER_RETURN_LAST_HIDDEN_PARAM = "_verl_drafter_return_last_hidden"
+_VERL_DFLASH_RETURN_AUX_HIDDEN_PARAM = "_verl_dflash_return_aux_hidden"
 _VERL_TOP_LOGPROBS_TENSOR_PARAM = "_verl_top_logprobs_tensor_output"
 _VERL_OUTPUT_TOP_LOGPROBS_TENSOR_KEY = "_verl_output_top_logprobs_tensor"
 _VERL_TOP_LOGPROBS_OUTPUT_ROW_START_PARAM = "_verl_top_logprobs_output_row_start"
@@ -88,6 +89,22 @@ def _drafter_uses_eagle_last_hidden(drafter_cfg) -> bool:
         return False
     return bool(
         algorithm == "EAGLE3"
+        and getattr(drafter_cfg, "enable_drafter_training", False)
+        and getattr(training_cfg, "collect_hidden_states_from_sgl", False)
+        and not getattr(training_cfg, "use_logits", False)
+    )
+
+
+def _drafter_uses_dflash_aux_hidden(drafter_cfg) -> bool:
+    """Whether drafter training needs DFlash target-layer aux hidden states."""
+    if not getattr(drafter_cfg, "enable", False):
+        return False
+    algorithm = str(getattr(drafter_cfg, "speculative_algorithm", "") or "").upper()
+    training_cfg = getattr(drafter_cfg, "training", None)
+    if training_cfg is None:
+        return False
+    return bool(
+        algorithm == "DFLASH"
         and getattr(drafter_cfg, "enable_drafter_training", False)
         and getattr(training_cfg, "collect_hidden_states_from_sgl", False)
         and not getattr(training_cfg, "use_logits", False)
@@ -1049,6 +1066,8 @@ class SGLangHttpServer:
                     )
                 request.update({"return_logprob": True})
                 request.update({"top_logprobs_num": self.config.drafter.training.logits_topk})
+            elif _drafter_uses_dflash_aux_hidden(self.config.drafter):
+                custom_params[_VERL_DFLASH_RETURN_AUX_HIDDEN_PARAM] = True
             elif _drafter_uses_eagle_last_hidden(self.config.drafter):
                 custom_params[_VERL_DRAFTER_RETURN_LAST_HIDDEN_PARAM] = True
             sampling_params["custom_params"] = custom_params
@@ -1143,6 +1162,11 @@ class SGLangHttpServer:
                     target_logprobs_position_end = target_logprobs_position_start + int(target_logprobs.size(0))
 
             hidden_states_data = meta_info.pop("hidden_states", [])
+            hidden_states_raw_type = type(hidden_states_data).__name__
+            try:
+                hidden_states_raw_len = len(hidden_states_data)
+            except TypeError:
+                hidden_states_raw_len = None
             hidden_states_list = []
             hidden_states_metadata = []
             for hs in _iter_hidden_state_chunks(hidden_states_data):
@@ -1235,7 +1259,14 @@ class SGLangHttpServer:
                     "replica_rank": self.replica_rank,
                 }
             else:
-                logger.warning("[SGLangHttpServer] No valid hidden states returned for drafter sample collection")
+                logger.warning(
+                    "[SGLangHttpServer] No valid hidden states returned for drafter sample collection: "
+                    "meta_keys=%s hidden_raw_type=%s hidden_raw_len=%s algorithm=%s",
+                    sorted(meta_info.keys()),
+                    hidden_states_raw_type,
+                    hidden_states_raw_len,
+                    self.config.drafter.speculative_algorithm,
+                )
 
             force_alignment_log = (
                 not has_hidden_states

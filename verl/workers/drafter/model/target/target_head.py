@@ -1,5 +1,6 @@
 import glob
 import json
+import logging
 import os
 from typing import Optional
 
@@ -8,6 +9,9 @@ import torch.nn as nn
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import AutoConfig
+
+
+logger = logging.getLogger(__name__)
 
 
 class TargetHead(nn.Module):
@@ -72,16 +76,46 @@ class TargetHead(nn.Module):
 
         with open(index_json_path, "r") as f:
             index_json = json.load(f)
-        ckpt_file = index_json["weight_map"][lm_head_key]
+
+        weight_map = index_json["weight_map"]
+        candidate_keys = [
+            lm_head_key,
+            "model.lm_head.weight",
+            "base_model.model.lm_head.weight",
+            "model.embed_tokens.weight",
+            "embed_tokens.weight",
+            "base_model.model.model.embed_tokens.weight",
+        ]
+        selected_key = next((key for key in candidate_keys if key in weight_map), None)
+        if selected_key is None:
+            available = list(weight_map.keys())
+            raise KeyError(
+                f"Cannot find target lm_head or tied embedding weight in {self.model_path}. "
+                f"Tried {candidate_keys}. Available keys sample: {available[:20]}"
+            )
+        if selected_key != lm_head_key:
+            logger.warning(
+                "Target lm_head key %s not found in %s; using %s as target head weight.",
+                lm_head_key,
+                self.model_path,
+                selected_key,
+            )
+
+        ckpt_file = weight_map[selected_key]
 
         if ckpt_file.endswith(".safetensors"):
             with safe_open(
                 os.path.join(self.model_path, ckpt_file), framework="pt"
             ) as f:
-                lm_head = f.get_tensor(lm_head_key)
+                lm_head = f.get_tensor(selected_key)
         else:
             state_dict = torch.load(os.path.join(self.model_path, ckpt_file))
-            lm_head = state_dict[lm_head_key]
+            lm_head = state_dict[selected_key]
+        if tuple(lm_head.shape) != tuple(self.fc.weight.shape):
+            raise ValueError(
+                f"Target head weight shape mismatch for {selected_key}: "
+                f"checkpoint={tuple(lm_head.shape)} expected={tuple(self.fc.weight.shape)}"
+            )
         self.fc.weight.copy_(lm_head)
 
     def freeze_weights(self):

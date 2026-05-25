@@ -62,6 +62,7 @@ _SGLANG_QWEN3_VL_EAGLE3_AUX_HIDDEN_PATCHED = False
 _SGLANG_NPU_EAGLE_SAMPLING_PATCHED = False
 _SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED = False
 _SGLANG_EAGLE_VERIFY_HIDDEN_STATES_PATCHED = False
+_SGLANG_DFLASH_VERIFY_HIDDEN_STATES_PATCHED = False
 _SGLANG_DRAFTER_LAST_HIDDEN_OUTPUT_PATCHED = False
 _SGLANG_TOP_LOGPROBS_TENSOR_OUTPUT_PATCHED = False
 _SGLANG_SCHEDULER_PROCESS_PATCHED = False
@@ -81,6 +82,7 @@ _VERL_HIDDEN_STATE_METADATA_MARKER = "__verl_hidden_state_metadata__"
 _VERL_HIDDEN_STATES_STREAM_FINAL_ATTR = "_verl_hidden_states_stream_final"
 _VERL_DRAFTER_RETURN_LAST_HIDDEN_PARAM = "_verl_drafter_return_last_hidden"
 _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR = "_verl_drafter_last_hidden_states"
+_VERL_DFLASH_RETURN_AUX_HIDDEN_PARAM = "_verl_dflash_return_aux_hidden"
 _VERL_TOP_LOGPROBS_TENSOR_PARAM = "_verl_top_logprobs_tensor_output"
 _VERL_OUTPUT_TOP_LOGPROBS_TENSOR_KEY = "_verl_output_top_logprobs_tensor"
 _VERL_TOP_LOGPROBS_TENSOR_CHUNK_MARKER = "__verl_top_logprobs_tensor_chunk__"
@@ -1566,6 +1568,77 @@ def _sglang_forward_batch_requests_last_hidden_for_drafter(forward_batch) -> boo
     return False
 
 
+def _sglang_req_requests_dflash_aux_hidden(req) -> bool:
+    return _custom_flag_enabled(
+        _sglang_req_custom_params(req).get(_VERL_DFLASH_RETURN_AUX_HIDDEN_PARAM, False)
+    )
+
+
+def _sglang_forward_batch_requests_dflash_aux_hidden(forward_batch) -> bool:
+    for req in getattr(forward_batch, "reqs", []) or []:
+        if (
+            getattr(req, "return_hidden_states", False)
+            and _sglang_req_requests_dflash_aux_hidden(req)
+        ):
+            return True
+    return False
+
+
+def _sglang_dflash_should_return_verify_hidden(batch) -> bool:
+    return _sglang_forward_batch_requests_dflash_aux_hidden(batch)
+
+
+def _sglang_dflash_restore_verify_hidden(batch, logits_output, next_target_hidden) -> None:
+    if not _sglang_dflash_should_return_verify_hidden(batch):
+        return
+    dflash_hidden_states = _normalize_sglang_dflash_aux_hidden_states(next_target_hidden)
+    if dflash_hidden_states is None:
+        logger.warning(
+            "SGLang DFlash verify hidden states requested but unavailable: "
+            "next_target_hidden_type=%s output_hidden_type=%s",
+            type(next_target_hidden).__name__,
+            type(getattr(logits_output, "hidden_states", None)).__name__,
+        )
+        return
+    logits_output.hidden_states = dflash_hidden_states
+    setattr(logits_output, "_verl_dflash_aux_hidden_states", True)
+
+
+def _normalize_sglang_dflash_aux_hidden_states(aux_hidden_states):
+    if aux_hidden_states is None:
+        return None
+
+    if _is_torch_tensor(aux_hidden_states):
+        if aux_hidden_states.dim() <= 2:
+            return aux_hidden_states
+        if aux_hidden_states.dim() == 3:
+            first_dim = int(aux_hidden_states.shape[0])
+            second_dim = int(aux_hidden_states.shape[1])
+            # SGLang aux hidden is commonly [num_layers, rows, hidden].
+            # DFlash training expects [rows, num_layers * hidden].
+            if first_dim <= 64 and second_dim > first_dim:
+                return aux_hidden_states.permute(1, 0, 2).reshape(second_dim, -1)
+            return aux_hidden_states.reshape(first_dim, -1)
+        return aux_hidden_states.reshape(aux_hidden_states.shape[0], -1)
+
+    if isinstance(aux_hidden_states, (list, tuple)):
+        tensors = [tensor for tensor in aux_hidden_states if _is_torch_tensor(tensor)]
+        if not tensors:
+            return None
+        if len(tensors) == 1:
+            return _normalize_sglang_dflash_aux_hidden_states(tensors[0])
+        base_shape = tuple(tensors[0].shape[:-1])
+        if all(tuple(tensor.shape[:-1]) == base_shape for tensor in tensors):
+            return torch.cat(tensors, dim=-1)
+        try:
+            stacked = torch.stack(tensors, dim=0)
+        except Exception:  # noqa: BLE001
+            return None
+        return _normalize_sglang_dflash_aux_hidden_states(stacked)
+
+    return None
+
+
 def _sglang_concat_last_hidden_for_drafter(req, logits_output, hidden_chunk, last_hidden_chunk):
     if not _sglang_req_requests_last_hidden_for_drafter(req):
         return hidden_chunk
@@ -1829,6 +1902,14 @@ def _append_sglang_hidden_state_chunk_with_budget(
 def _append_sglang_prefill_hidden_states(req, logits_output, hidden_state_offset: int, extend_input_len: int, batch=None) -> int:
     hidden_states = getattr(logits_output, "hidden_states", None)
     if hidden_states is None:
+        if getattr(req, "return_hidden_states", False) and not getattr(req, "_verl_logged_missing_prefill_hidden_states", False):
+            logger.warning(
+                "SGLang did not return prefill hidden states for drafter collection: "
+                "request_dflash_aux=%s logits_output_type=%s",
+                _sglang_req_requests_dflash_aux_hidden(req),
+                type(logits_output).__name__,
+            )
+            setattr(req, "_verl_logged_missing_prefill_hidden_states", True)
         return hidden_state_offset
 
     try:
@@ -1861,13 +1942,47 @@ def _append_sglang_prefill_hidden_states(req, logits_output, hidden_state_offset
 def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: int, hidden_state_offset: int, batch=None) -> int:
     hidden_states = getattr(logits_output, "hidden_states", None)
     if hidden_states is None:
+        if getattr(req, "return_hidden_states", False) and not getattr(req, "_verl_logged_missing_decode_hidden_states", False):
+            logger.warning(
+                "SGLang did not return decode hidden states for drafter collection: "
+                "request_dflash_aux=%s logits_output_type=%s",
+                _sglang_req_requests_dflash_aux_hidden(req),
+                type(logits_output).__name__,
+            )
+            setattr(req, "_verl_logged_missing_decode_hidden_states", True)
         return hidden_state_offset
 
     accept_lengths = getattr(result, "accept_length_per_req_cpu", None)
     if accept_lengths is None:
         accept_lengths = getattr(result, "accept_lens", None)
+    if accept_lengths is None:
+        accept_lengths = getattr(result, "num_correct_drafts_per_req_cpu", None)
     if accept_lengths is not None and req_index < len(accept_lengths) and _is_torch_tensor(hidden_states):
         rows = max(int(accept_lengths[req_index]) + 1, 1)
+
+        if getattr(logits_output, "_verl_dflash_aux_hidden_states", False):
+            end = hidden_state_offset + rows
+            total_hidden = int(hidden_states.shape[0])
+            if hidden_states.dim() >= 2 and end <= total_hidden:
+                position_start = max(
+                    len(getattr(req, "origin_input_ids", []) or [])
+                    + len(getattr(req, "output_ids", []) or [])
+                    - rows,
+                    0,
+                )
+                _append_sglang_hidden_state_chunk_with_budget(
+                    req,
+                    hidden_states[hidden_state_offset:end],
+                    position_start=position_start,
+                    batch=batch,
+                )
+                return end
+            if getattr(req, "return_hidden_states", False):
+                raise RuntimeError(
+                    "SGLang DFlash verify hidden states are incomplete for accepted tokens: "
+                    f"shape={tuple(hidden_states.shape)}, req_index={req_index}, "
+                    f"offset={hidden_state_offset}, required_rows={rows}."
+                )
 
         if hidden_states.dim() == 3 and req_index < int(hidden_states.shape[0]):
             rows = min(rows, int(hidden_states.shape[1]))
@@ -3138,6 +3253,7 @@ def _make_sglang_drafter_last_hidden_forward_patch(original_method):
             return_last_hidden = True
         else:
             return_last_hidden = _sglang_forward_batch_requests_last_hidden_for_drafter(logits_metadata)
+        return_dflash_aux_hidden = _sglang_forward_batch_requests_dflash_aux_hidden(logits_metadata)
 
         output = original_method(
             self,
@@ -3148,6 +3264,18 @@ def _make_sglang_drafter_last_hidden_forward_patch(original_method):
             aux_hidden_states,
             hidden_states_before_norm,
         )
+        if return_dflash_aux_hidden:
+            dflash_hidden_states = _normalize_sglang_dflash_aux_hidden_states(aux_hidden_states)
+            if dflash_hidden_states is None:
+                logger.warning(
+                    "SGLang DFlash aux hidden states requested but unavailable: "
+                    "aux_type=%s output_hidden_type=%s",
+                    type(aux_hidden_states).__name__,
+                    type(getattr(output, "hidden_states", None)).__name__,
+                )
+            else:
+                output.hidden_states = dflash_hidden_states
+                setattr(output, "_verl_dflash_aux_hidden_states", True)
         if return_last_hidden and getattr(output, "hidden_states", None) is not None and hidden_states is not None:
             setattr(output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, hidden_states)
         return output
@@ -3258,10 +3386,73 @@ def patch_sglang_drafter_last_hidden_output() -> None:
         )
 
 
+def _get_sglang_dflash_verify_arg(args, kwargs, index: int, name: str):
+    if name in kwargs:
+        return kwargs[name]
+    if index < len(args):
+        return args[index]
+    return None
+
+
+def _make_sglang_dflash_verify_hidden_states_patch(original_method):
+    @wraps(original_method)
+    def patched_verify(self, *args, **kwargs):
+        result = original_method(self, *args, **kwargs)
+        batch = _get_sglang_dflash_verify_arg(args, kwargs, 0, "batch")
+        logits_output = _get_sglang_dflash_verify_arg(args, kwargs, 1, "logits_output")
+        if batch is None or logits_output is None:
+            return result
+
+        try:
+            next_target_hidden = result[2]
+        except (IndexError, TypeError):
+            if _sglang_dflash_should_return_verify_hidden(batch):
+                logger.warning(
+                    "SGLang DFlash verify hidden states requested but verify returned unexpected result: %s",
+                    type(result).__name__,
+                )
+            return result
+
+        _sglang_dflash_restore_verify_hidden(batch, logits_output, next_target_hidden)
+        return result
+
+    patched_verify._verl_patched_dflash_verify_hidden_states = True
+    return patched_verify
+
+
+def patch_sglang_dflash_verify_hidden_states() -> None:
+    """Restore DFlash verify hidden states for VERL drafter sample collection."""
+    global _SGLANG_DFLASH_VERIFY_HIDDEN_STATES_PATCHED
+    if _SGLANG_DFLASH_VERIFY_HIDDEN_STATES_PATCHED:
+        return
+
+    try:
+        module = importlib.import_module("sglang.srt.speculative.dflash_info")
+        verify_cls = getattr(module, "DFlashVerifyInput")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Skip SGLang DFlash verify hidden-state patch: %s", exc)
+        return
+
+    original_method = getattr(verify_cls, "verify", None)
+    if original_method is None:
+        logger.debug("Skip SGLang DFlash verify hidden-state patch: DFlashVerifyInput.verify missing")
+        return
+    if getattr(original_method, "_verl_patched_dflash_verify_hidden_states", False):
+        _SGLANG_DFLASH_VERIFY_HIDDEN_STATES_PATCHED = True
+        return
+
+    patched_method = _make_sglang_dflash_verify_hidden_states_patch(original_method)
+
+    setattr(verify_cls, "verify", patched_method)
+    _SGLANG_DFLASH_VERIFY_HIDDEN_STATES_PATCHED = True
+    logger.warning("SGLang DFlash verify hidden-state patch active")
+
+
 def patch_sglang_hidden_states_tensor_output() -> None:
     """Return SGLang hidden-state chunks as CPU tensors instead of Python lists."""
     global _SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED
     patch_sglang_eagle_verify_hidden_states_full()
+    patch_sglang_dflash_verify_hidden_states()
     patch_sglang_drafter_last_hidden_output()
     if _SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED:
         return
