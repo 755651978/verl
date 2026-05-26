@@ -458,6 +458,7 @@ drafter:
     spec_steps: 3
     spec_topk: 1
     spec_verify_tokens: 3
+    cuda_graph_max_bs: null
   training:
     _target_: verl.workers.config.DrafterTrainingConfig
     collect_hidden_states_from_sgl: false

@@ -44,7 +44,7 @@ from sglang.srt.managers.tokenizer_manager import ServerStatus
 from sglang.srt.utils import MultiprocessingSerializer
 
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.device import get_visible_devices_keyword
+from verl.utils.device import get_device_name, get_visible_devices_keyword
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.utils.profiler import DistProfiler, build_sglang_profiler_args
 from verl.workers.drafter.sglang_patch import install_sglang_verl_patches
@@ -77,6 +77,7 @@ _VERL_TOP_LOGPROBS_TENSOR_PARAM = "_verl_top_logprobs_tensor_output"
 _VERL_OUTPUT_TOP_LOGPROBS_TENSOR_KEY = "_verl_output_top_logprobs_tensor"
 _VERL_TOP_LOGPROBS_OUTPUT_ROW_START_PARAM = "_verl_top_logprobs_output_row_start"
 _VERL_TOP_LOGPROBS_OUTPUT_ROW_END_PARAM = "_verl_top_logprobs_output_row_end"
+_SGLANG_MEMORY_SAVER_CUDA_GRAPH_ENV = "SGLANG_MEMORY_SAVER_CUDA_GRAPH"
 
 
 def _drafter_uses_eagle_last_hidden(drafter_cfg) -> bool:
@@ -109,6 +110,22 @@ def _drafter_uses_dflash_aux_hidden(drafter_cfg) -> bool:
         and getattr(training_cfg, "collect_hidden_states_from_sgl", False)
         and not getattr(training_cfg, "use_logits", False)
     )
+
+
+def _drafter_cuda_graph_memory_saver_enabled(config) -> bool:
+    return bool(
+        get_device_name() == "cuda"
+        and getattr(getattr(config, "drafter", None), "enable", False)
+        and getattr(config, "free_cache_engine", False)
+    )
+
+
+def _with_drafter_cuda_graph_tag(config, tags: list[str]) -> list[str]:
+    if not _drafter_cuda_graph_memory_saver_enabled(config) or "cuda_graph" in tags:
+        return tags
+    if "weights" not in tags:
+        return tags
+    return [*tags, "cuda_graph"]
 
 
 def _env_flag_enabled(name: str, default: bool = False) -> bool:
@@ -783,7 +800,9 @@ class SGLangHttpServer:
         if self.config.drafter.enable:
             return_last_hidden_for_drafter = _drafter_uses_eagle_last_hidden(self.config.drafter)
             args["speculative_algorithm"] = self.config.drafter.speculative_algorithm
-            args["cuda_graph_max_bs"] = 32
+            cuda_graph_max_bs = getattr(self.config.drafter.rollout, "cuda_graph_max_bs", None)
+            if cuda_graph_max_bs is not None:
+                args["cuda_graph_max_bs"] = cuda_graph_max_bs
             args["speculative_draft_model_path"] = self.config.drafter.model_path
             args["speculative_num_steps"] = self.config.drafter.rollout.spec_steps
             args["speculative_eagle_topk"] = self.config.drafter.rollout.spec_topk
@@ -793,6 +812,8 @@ class SGLangHttpServer:
 
             args["enable_weights_cpu_backup"] = True
             args["enable_draft_weights_cpu_backup"] = True
+            if _drafter_cuda_graph_memory_saver_enabled(self.config) and not self.config.enforce_eager:
+                os.environ.setdefault(_SGLANG_MEMORY_SAVER_CUDA_GRAPH_ENV, "1")
         os.environ[_VERL_DRAFTER_RETURN_LAST_HIDDEN_ENV] = (
             "1" if return_last_hidden_for_drafter else "0"
         )
@@ -872,7 +893,9 @@ class SGLangHttpServer:
             raise ValueError(f"wake_up not support rollout_mode {self.rollout_mode}")
         elif self.rollout_mode == RolloutMode.COLOCATED:
             # Directly call engine to wake up without sync weights.
-            obj = ResumeMemoryOccupationReqInput(tags=["kv_cache", "weights"])
+            obj = ResumeMemoryOccupationReqInput(
+                tags=_with_drafter_cuda_graph_tag(self.config, ["kv_cache", "weights"])
+            )
             await self.tokenizer_manager.resume_memory_occupation(obj, None)
             await self.tokenizer_manager.flush_cache()
         elif self.rollout_mode == RolloutMode.STANDALONE:
@@ -898,6 +921,7 @@ class SGLangHttpServer:
             tags = ["kv_cache"]
         else:
             tags = ["kv_cache", "weights"]
+        tags = _with_drafter_cuda_graph_tag(self.config, tags)
 
         if self.rollout_mode == RolloutMode.HYBRID:
             obj = ReleaseMemoryOccupationReqInput(tags=tags)

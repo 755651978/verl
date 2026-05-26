@@ -78,6 +78,7 @@ class DrafterRolloutConfig(BaseConfig):
     spec_steps: int = 3
     spec_topk: int = 1
     spec_verify_tokens: int = 3
+    cuda_graph_max_bs: Optional[int] = None
 
 
 @dataclass

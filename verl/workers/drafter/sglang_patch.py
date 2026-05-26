@@ -52,6 +52,7 @@ _DRAFTER_RETURN_LAST_HIDDEN_ENV = "VERL_SGLANG_DRAFTER_RETURN_LAST_HIDDEN"
 _TOP_LOGPROBS_VALUES_DTYPE_ENV = "VERL_SGLANG_TOP_LOGPROBS_VALUES_DTYPE"
 _DISABLE_SGLANG_PATCH_ENV = "VERL_DISABLE_SGLANG_PATCH"
 _SGLANG_PATCHES_ENV = "VERL_SGLANG_PATCHES"
+_SGLANG_MEMORY_SAVER_CUDA_GRAPH_ENV = "SGLANG_MEMORY_SAVER_CUDA_GRAPH"
 
 _target_weight_loader: str | None = os.environ.get(_TARGET_WEIGHT_LOADER_ENV)
 _draft_weight_loader: str | None = os.environ.get(_DRAFT_WEIGHT_LOADER_ENV)
@@ -65,6 +66,7 @@ _SGLANG_EAGLE_VERIFY_HIDDEN_STATES_PATCHED = False
 _SGLANG_DFLASH_VERIFY_HIDDEN_STATES_PATCHED = False
 _SGLANG_DRAFTER_LAST_HIDDEN_OUTPUT_PATCHED = False
 _SGLANG_TOP_LOGPROBS_TENSOR_OUTPUT_PATCHED = False
+_SGLANG_EAGLE_DRAFT_CUDA_GRAPH_MEMORY_SAVER_PATCHED = False
 _SGLANG_SCHEDULER_PROCESS_PATCHED = False
 _SCHEDULER_PROCESS_PATCH_ATTR = "_verl_patched_scheduler_process"
 _SGLANG_TOP_K_ALL = 1 << 30
@@ -73,6 +75,7 @@ _SGLANG_PATCH_NAMES = {
     "npu_eagle_target_sampling",
     "hidden_states_tensor_output",
     "top_logprobs_tensor_output",
+    "eagle_draft_cuda_graph_memory_saver",
 }
 _VERL_DRAFTER_HIDDEN_WINDOW_PARAM = "_verl_drafter_hidden_state_window"
 _VERL_HIDDEN_STATE_FRONT_TOKENS_PARAM = "_verl_hidden_state_front_tokens_per_sample"
@@ -624,6 +627,82 @@ def _triton_ascend_available() -> bool:
 
 def _sglang_npu_eagle_top_k_renorm_fast_path_enabled() -> bool:
     return _env_flag_enabled(_EAGLE_TOP_K_RENORM_FAST_PATH_ENV, default=False)
+
+
+def _make_sglang_eagle_draft_cuda_graph_memory_saver_patch(original_method):
+    @wraps(original_method)
+    def patched_capture_graph(self, graph, pool, stream, run_once_fn):
+        model_runner = getattr(self, "model_runner", None)
+        server_args = getattr(model_runner, "server_args", None)
+        if (
+            not torch.cuda.is_available()
+            or not getattr(server_args, "enable_memory_saver", False)
+            or not _env_flag_enabled(_SGLANG_MEMORY_SAVER_CUDA_GRAPH_ENV, default=False)
+        ):
+            return original_method(self, graph, pool, stream, run_once_fn)
+
+        try:
+            from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
+            from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Skip EAGLE draft cuda graph memory saver capture: %s", exc)
+            return original_method(self, graph, pool, stream, run_once_fn)
+
+        try:
+            memory_saver_adapter = TorchMemorySaverAdapter.create(enable=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Fallback to original EAGLE draft cuda graph capture: %s", exc)
+            return original_method(self, graph, pool, stream, run_once_fn)
+        if not memory_saver_adapter.enabled:
+            return original_method(self, graph, pool, stream, run_once_fn)
+        with memory_saver_adapter.cuda_graph(
+            tag=GPU_MEMORY_TYPE_CUDA_GRAPH,
+            cuda_graph=graph,
+            pool=pool,
+            stream=stream,
+        ):
+            return run_once_fn()
+
+    patched_capture_graph._verl_patched_eagle_draft_cuda_graph_memory_saver = True
+    return patched_capture_graph
+
+
+def patch_sglang_eagle_draft_cuda_graph_memory_saver() -> None:
+    global _SGLANG_EAGLE_DRAFT_CUDA_GRAPH_MEMORY_SAVER_PATCHED
+    if _SGLANG_EAGLE_DRAFT_CUDA_GRAPH_MEMORY_SAVER_PATCHED:
+        return
+    if _is_sglang_npu_backend():
+        logger.debug("Skip SGLang EAGLE draft cuda graph memory saver patch on NPU backend.")
+        return
+
+    patched_targets = []
+    for module_name, class_name in (
+        ("sglang.srt.speculative.eagle_draft_cuda_graph_runner", "EAGLEDraftCudaGraphRunner"),
+        ("sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner", "EAGLEDraftExtendCudaGraphRunner"),
+    ):
+        try:
+            runner_cls = getattr(importlib.import_module(module_name), class_name)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "Skip SGLang EAGLE draft cuda graph memory saver patch for %s.%s: %s",
+                module_name,
+                class_name,
+                exc,
+            )
+            continue
+        original_method = getattr(runner_cls, "_capture_graph", None)
+        if original_method is None or getattr(
+            original_method,
+            "_verl_patched_eagle_draft_cuda_graph_memory_saver",
+            False,
+        ):
+            continue
+        runner_cls._capture_graph = _make_sglang_eagle_draft_cuda_graph_memory_saver_patch(original_method)
+        patched_targets.append(f"{module_name}.{class_name}._capture_graph")
+
+    if patched_targets:
+        _SGLANG_EAGLE_DRAFT_CUDA_GRAPH_MEMORY_SAVER_PATCHED = True
+        logger.warning("Patched SGLang EAGLE draft cuda graph memory saver for %s", ", ".join(patched_targets))
 
 
 def _sglang_verl_patches_disabled() -> bool:
@@ -3511,6 +3590,7 @@ def _apply_selected_sglang_patches() -> bool:
     patchers = (
         ("eagle_update_weights", patch_sglang_eagle_update_weights_from_tensor),
         ("npu_eagle_target_sampling", patch_sglang_npu_eagle_target_sampling),
+        ("eagle_draft_cuda_graph_memory_saver", patch_sglang_eagle_draft_cuda_graph_memory_saver),
         ("hidden_states_tensor_output", patch_sglang_hidden_states_tensor_output),
         ("top_logprobs_tensor_output", patch_sglang_top_logprobs_tensor_output),
     )

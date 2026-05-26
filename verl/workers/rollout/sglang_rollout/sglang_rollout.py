@@ -62,6 +62,17 @@ VERL_SGLANG_DRAFT_WEIGHT_LOADER = (
 _DISABLE_SPECULATIVE_WEIGHT_SYNC_GUARD_ENV = "VERL_DISABLE_SGLANG_SPECULATIVE_WEIGHT_SYNC_GUARD"
 
 
+def _with_drafter_cuda_graph_tag(config, tags: list[str]) -> list[str]:
+    if (
+        device_name != "cuda"
+        or not getattr(getattr(config, "drafter", None), "enable", False)
+        or "weights" not in tags
+        or "cuda_graph" in tags
+    ):
+        return tags
+    return [*tags, "cuda_graph"]
+
+
 def _is_sglang_eagle_draft_model(model) -> bool:
     config = getattr(model, "config", None)
     class_name = type(model).__name__.lower()
@@ -341,6 +352,7 @@ class ServerAdapter(BaseRollout):
         """
         await self._init_server_adapter()
         if self.device_mesh["infer_tp"].get_local_rank() == 0 and self.config.free_cache_engine:
+            tags = _with_drafter_cuda_graph_tag(self.config, tags)
             await self._engine.resume_memory_occupation(tags=tags)
 
     async def release(self):
@@ -356,6 +368,7 @@ class ServerAdapter(BaseRollout):
                 tags = ["kv_cache"]
             else:
                 tags = ["kv_cache", "weights"]
+            tags = _with_drafter_cuda_graph_tag(self.config, tags)
             await self._engine.release_memory_occupation(tags=tags)
     # todo: add update_weights for sglang + drafter to prevent oom
     async def update_weights(
