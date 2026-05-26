@@ -65,6 +65,27 @@ class DFlashTrainingModel(nn.Module):
         self.block_size = block_size
         self.num_anchors = num_anchors
         self.loss_decay_gamma = loss_decay_gamma
+        self._tensor_template_cache: dict[tuple, torch.Tensor] = {}
+
+    def _cached_arange(self, name: str, length: int, device: torch.device, *, view_shape: tuple[int, ...] | None = None):
+        key = (name, int(length), device.type, device.index, view_shape)
+        cached = self._tensor_template_cache.get(key)
+        if cached is None or cached.device != device:
+            cached = torch.arange(int(length), device=device)
+            if view_shape is not None:
+                cached = cached.view(*view_shape)
+            self._tensor_template_cache[key] = cached
+        return cached
+
+    def _cached_decay_weights(self, device: torch.device):
+        gamma = float(self.loss_decay_gamma or 0.0)
+        key = ("decay_weights", self.block_size, gamma, device.type, device.index)
+        cached = self._tensor_template_cache.get(key)
+        if cached is None or cached.device != device:
+            k = self._cached_arange("decay_positions", self.block_size, device, view_shape=(1, 1, -1))
+            cached = torch.exp(-(k - 1).clamp(min=0).float() / gamma)
+            self._tensor_template_cache[key] = cached
+        return cached
 
     def _sample_anchor_positions(self, seq_len: int, loss_mask: torch.Tensor, device: torch.device):
         bsz = loss_mask.shape[0]
@@ -76,7 +97,7 @@ class DFlashTrainingModel(nn.Module):
 
         valid = loss_mask[:, : max_anchor + 1] > 0.5
         valid_counts = valid.sum(dim=1)
-        indices = torch.arange(max_anchor + 1, device=device).unsqueeze(0).expand(bsz, -1)
+        indices = self._cached_arange("anchor_indices", max_anchor + 1, device).unsqueeze(0).expand(bsz, -1)
         masked_indices = torch.where(valid, indices, seq_len + 1)
         random_vals = torch.rand(bsz, max_anchor + 1, device=device)
         random_vals = torch.where(valid, random_vals, 2.0)
@@ -89,14 +110,14 @@ class DFlashTrainingModel(nn.Module):
                 [selected, torch.zeros(bsz, self.num_anchors - take_n, dtype=torch.long, device=device)],
                 dim=1,
             )
-        keep_mask = torch.arange(self.num_anchors, device=device).unsqueeze(0) < valid_counts.unsqueeze(1).clamp(max=self.num_anchors)
+        keep_mask = self._cached_arange("anchor_keep", self.num_anchors, device).unsqueeze(0) < valid_counts.unsqueeze(1).clamp(max=self.num_anchors)
         return torch.where(keep_mask, selected, 0), keep_mask
 
     def _create_position_ids(self, anchor_positions: torch.Tensor, seq_len: int):
         bsz = anchor_positions.shape[0]
         device = anchor_positions.device
-        context_position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
-        offsets = torch.arange(self.block_size, device=device).view(1, 1, -1)
+        context_position_ids = self._cached_arange("context_positions", seq_len, device).unsqueeze(0).expand(bsz, -1)
+        offsets = self._cached_arange("block_offsets", self.block_size, device, view_shape=(1, 1, -1))
         draft_position_ids = anchor_positions.unsqueeze(-1) + offsets
         return context_position_ids, draft_position_ids.view(bsz, -1)
 
@@ -110,9 +131,11 @@ class DFlashTrainingModel(nn.Module):
             dtype=torch.long,
             device=device,
         )
-        block_starts = (torch.arange(n_blocks, device=device) * self.block_size).unsqueeze(0).expand(bsz, -1)
+        block_starts = (
+            self._cached_arange("block_starts", n_blocks, device) * self.block_size
+        ).unsqueeze(0).expand(bsz, -1)
         anchor_tokens = torch.gather(input_ids, 1, anchor_positions.clamp(0, seq_len - 1))
-        batch_idx = torch.arange(bsz, device=device).unsqueeze(1).expand(bsz, n_blocks)
+        batch_idx = self._cached_arange("batch_indices", bsz, device).unsqueeze(1).expand(bsz, n_blocks)
         noise_ids[batch_idx, block_starts] = torch.where(
             block_keep_mask,
             anchor_tokens,
@@ -151,7 +174,7 @@ class DFlashTrainingModel(nn.Module):
         )
         logits = F.linear(draft_hidden, lm_head_weight)
 
-        label_offsets = torch.arange(self.block_size, device=device).view(1, 1, -1)
+        label_offsets = self._cached_arange("label_offsets", self.block_size, device, view_shape=(1, 1, -1))
         label_indices = anchor_positions.unsqueeze(-1) + label_offsets
         valid_label_mask = label_indices < seq_len
         safe_label_indices = label_indices.clamp(max=seq_len - 1)
@@ -159,15 +182,14 @@ class DFlashTrainingModel(nn.Module):
 
         weight_mask = block_keep_mask.unsqueeze(-1).expand(-1, -1, self.block_size).float()
         weight_mask = weight_mask * valid_label_mask.float()
-        pos_in_block = torch.arange(self.block_size, device=device).view(1, 1, -1)
+        pos_in_block = self._cached_arange("pos_in_block", self.block_size, device, view_shape=(1, 1, -1))
         weight_mask = weight_mask * (pos_in_block > 0).float()
         original_loss_mask = torch.gather(loss_mask.unsqueeze(1).expand(-1, n_blocks, -1), 2, safe_label_indices)
         weight_mask = weight_mask * original_loss_mask
         binary_eval_mask = weight_mask.view(-1)
 
         if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
-            k = torch.arange(self.block_size, device=device).view(1, 1, -1)
-            decay_weights = torch.exp(-(k - 1).clamp(min=0).float() / self.loss_decay_gamma)
+            decay_weights = self._cached_decay_weights(device)
             weight_mask = weight_mask * decay_weights
 
         flat_logits = logits.view(-1, logits.size(-1))
