@@ -416,11 +416,25 @@ class DrafterBaseTrainer:
         self._target_lm_head_weight_step = None
         self._frozen_param_names = {"model.embed_tokens.weight"}
 
-        # Ulysses Sequence Parallelism configuration
-        self.ulysses_sequence_parallel_size = min(
-            int(self.config.rollout.get("tensor_model_parallel_size", 1)),
-            self.training_group_world_size,
-        )
+        # Ulysses Sequence Parallelism configuration. EAGLE/EAGLE3 can slice
+        # token-wise training tensors by the rollout TP size, but DFlash anchor
+        # sampling needs full local sequences and does not implement SP loss yet.
+        rollout_tp_size = int(self.config.rollout.get("tensor_model_parallel_size", 1))
+        if self.backend.model_type == "dflash":
+            self.ulysses_sequence_parallel_size = 1
+            if rollout_tp_size > 1 and self.training_group_world_size > 1:
+                logger.info(
+                    "[Rank %s] Disable Ulysses SP for DFlash drafter training: "
+                    "rollout_tp=%s training_group_world_size=%s",
+                    self.rank,
+                    rollout_tp_size,
+                    self.training_group_world_size,
+                )
+        else:
+            self.ulysses_sequence_parallel_size = min(
+                rollout_tp_size,
+                self.training_group_world_size,
+            )
         self.use_ulysses_sp = self.training_group_world_size > 1 and self.ulysses_sequence_parallel_size > 1
         setattr(self.backend, "use_ulysses_sp", self.use_ulysses_sp)
         self.use_native_dp_sp = self.training_group_world_size > 1 and self.dp_group_world_size > 1
