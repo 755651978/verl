@@ -50,6 +50,8 @@ _EAGLE_LINEAR_TRITON_DEBUG_ENV = "VERL_SGLANG_NPU_EAGLE_LINEAR_TRITON_DEBUG"
 _EAGLE_TOP_K_RENORM_FAST_PATH_ENV = "VERL_SGLANG_NPU_EAGLE_TOP_K_RENORM_FAST_PATH"
 _DRAFTER_RETURN_LAST_HIDDEN_ENV = "VERL_SGLANG_DRAFTER_RETURN_LAST_HIDDEN"
 _TOP_LOGPROBS_VALUES_DTYPE_ENV = "VERL_SGLANG_TOP_LOGPROBS_VALUES_DTYPE"
+_NPU_MEMORY_SLEEP_DEBUG_ENV = "VERL_SGLANG_NPU_MEMORY_SLEEP_DEBUG"
+_NPU_MEMORY_SLEEP_STRICT_ENV = "VERL_SGLANG_NPU_MEMORY_SLEEP_STRICT"
 _DISABLE_SGLANG_PATCH_ENV = "VERL_DISABLE_SGLANG_PATCH"
 _SGLANG_PATCHES_ENV = "VERL_SGLANG_PATCHES"
 _SGLANG_MEMORY_SAVER_CUDA_GRAPH_ENV = "SGLANG_MEMORY_SAVER_CUDA_GRAPH"
@@ -67,6 +69,7 @@ _SGLANG_DFLASH_VERIFY_HIDDEN_STATES_PATCHED = False
 _SGLANG_DRAFTER_LAST_HIDDEN_OUTPUT_PATCHED = False
 _SGLANG_TOP_LOGPROBS_TENSOR_OUTPUT_PATCHED = False
 _SGLANG_EAGLE_DRAFT_CUDA_GRAPH_MEMORY_SAVER_PATCHED = False
+_SGLANG_NPU_MEMORY_SLEEP_PATCHED = False
 _SGLANG_SCHEDULER_PROCESS_PATCHED = False
 _SCHEDULER_PROCESS_PATCH_ATTR = "_verl_patched_scheduler_process"
 _SGLANG_TOP_K_ALL = 1 << 30
@@ -76,6 +79,7 @@ _SGLANG_PATCH_NAMES = {
     "hidden_states_tensor_output",
     "top_logprobs_tensor_output",
     "eagle_draft_cuda_graph_memory_saver",
+    "npu_memory_sleep",
 }
 _VERL_DRAFTER_HIDDEN_WINDOW_PARAM = "_verl_drafter_hidden_state_window"
 _VERL_HIDDEN_STATE_FRONT_TOKENS_PARAM = "_verl_hidden_state_front_tokens_per_sample"
@@ -703,6 +707,272 @@ def patch_sglang_eagle_draft_cuda_graph_memory_saver() -> None:
     if patched_targets:
         _SGLANG_EAGLE_DRAFT_CUDA_GRAPH_MEMORY_SAVER_PATCHED = True
         logger.warning("Patched SGLang EAGLE draft cuda graph memory saver for %s", ", ".join(patched_targets))
+
+
+def _sglang_npu_memory_sleep_debug_enabled() -> bool:
+    return _env_flag_enabled(_NPU_MEMORY_SLEEP_DEBUG_ENV, default=False)
+
+
+def _sglang_npu_memory_sleep_strict_enabled() -> bool:
+    return _env_flag_enabled(_NPU_MEMORY_SLEEP_STRICT_ENV, default=False)
+
+
+def _npu_memory_snapshot() -> dict[str, Any]:
+    if not _is_sglang_npu_backend() or not hasattr(torch, "npu"):
+        return {}
+
+    snapshot: dict[str, Any] = {}
+    for name in ("memory_allocated", "memory_reserved", "max_memory_allocated", "max_memory_reserved"):
+        fn = getattr(torch.npu, name, None)
+        if callable(fn):
+            try:
+                snapshot[name] = int(fn())
+            except Exception:  # noqa: BLE001
+                pass
+
+    try:
+        free_bytes, total_bytes = torch.npu.mem_get_info()
+        snapshot["mem_get_info_free"] = int(free_bytes)
+        snapshot["mem_get_info_total"] = int(total_bytes)
+        snapshot["mem_get_info_used"] = int(total_bytes) - int(free_bytes)
+    except Exception:  # noqa: BLE001
+        pass
+
+    return snapshot
+
+
+def _format_memory_snapshot(snapshot: dict[str, Any]) -> dict[str, float]:
+    gib = 1024**3
+    return {key: round(value / gib, 3) for key, value in snapshot.items() if isinstance(value, int)}
+
+
+def _npu_device_synchronize() -> None:
+    try:
+        device_module = torch.get_device_module()
+    except Exception:  # noqa: BLE001
+        device_module = getattr(torch, "npu", None)
+    synchronize = getattr(device_module, "synchronize", None)
+    if callable(synchronize):
+        synchronize()
+
+
+def _npu_empty_device_cache() -> None:
+    try:
+        device_module = torch.get_device_module()
+    except Exception:  # noqa: BLE001
+        device_module = getattr(torch, "npu", None)
+    empty_cache = getattr(device_module, "empty_cache", None)
+    if callable(empty_cache):
+        empty_cache()
+
+
+def _sglang_scheduler_rank_info(scheduler) -> dict[str, Any]:
+    fields = (
+        "tp_rank",
+        "pp_rank",
+        "dp_rank",
+        "attn_tp_rank",
+        "attn_cp_rank",
+        "attn_dp_rank",
+        "node_rank",
+    )
+    return {field: getattr(scheduler, field, None) for field in fields if hasattr(scheduler, field)}
+
+
+def _sglang_memory_saver_info(adapter) -> dict[str, Any]:
+    info = {
+        "adapter_type": f"{type(adapter).__module__}.{type(adapter).__name__}" if adapter is not None else None,
+        "adapter_enabled": None,
+    }
+    try:
+        info["adapter_enabled"] = bool(getattr(adapter, "enabled", False))
+    except Exception as exc:  # noqa: BLE001
+        info["adapter_enabled_error"] = f"{type(exc).__name__}: {exc}"
+
+    try:
+        torch_memory_saver = importlib.import_module("torch_memory_saver")
+        info["torch_memory_saver_file"] = getattr(torch_memory_saver, "__file__", None)
+        tms = getattr(torch_memory_saver, "torch_memory_saver", None)
+        info["torch_memory_saver_type"] = f"{type(tms).__module__}.{type(tms).__name__}" if tms is not None else None
+    except Exception as exc:  # noqa: BLE001
+        info["torch_memory_saver_error"] = f"{type(exc).__name__}: {exc}"
+
+    return info
+
+
+def _log_sglang_npu_sleep(stage: str, scheduler, tags: list[str], *, force: bool = False) -> None:
+    if not force and not _sglang_npu_memory_sleep_debug_enabled():
+        return
+    logger.warning(
+        "SGLang NPU memory sleep %s rank=%s tags=%s offload_tags=%s tms=%s mem_gib=%s",
+        stage,
+        _sglang_scheduler_rank_info(scheduler),
+        tags,
+        sorted(getattr(scheduler, "offload_tags", set())),
+        _sglang_memory_saver_info(getattr(scheduler, "memory_saver_adapter", None)),
+        _format_memory_snapshot(_npu_memory_snapshot()),
+    )
+
+
+def _resolve_sglang_memory_sleep_symbols():
+    constants = importlib.import_module("sglang.srt.constants")
+    io_struct = importlib.import_module("sglang.srt.managers.io_struct")
+    update_mixin = importlib.import_module("sglang.srt.managers.scheduler_update_weights_mixin")
+    return {
+        "all": list(getattr(constants, "GPU_MEMORY_ALL_TYPES")),
+        "kv_cache": getattr(constants, "GPU_MEMORY_TYPE_KV_CACHE"),
+        "weights": getattr(constants, "GPU_MEMORY_TYPE_WEIGHTS"),
+        "cuda_graph": getattr(constants, "GPU_MEMORY_TYPE_CUDA_GRAPH"),
+        "release_output": getattr(io_struct, "ReleaseMemoryOccupationReqOutput"),
+        "resume_output": getattr(io_struct, "ResumeMemoryOccupationReqOutput"),
+        "export_static_state": getattr(update_mixin, "_export_static_state"),
+        "import_static_state": getattr(update_mixin, "_import_static_state"),
+    }
+
+
+def _sglang_scheduler_is_idle(scheduler) -> bool:
+    is_fully_idle = getattr(scheduler, "is_fully_idle", None)
+    if callable(is_fully_idle):
+        return bool(is_fully_idle())
+    is_no_request = getattr(scheduler, "_is_no_request", None)
+    if callable(is_no_request):
+        return bool(is_no_request())
+    return True
+
+
+def _normalize_sglang_memory_tags(raw_tags, all_tags: list[str]) -> list[str]:
+    if raw_tags is None or len(raw_tags) == 0:
+        return list(all_tags)
+    return list(raw_tags)
+
+
+def _make_sglang_npu_memory_sleep_release_patch(original_method):
+    @wraps(original_method)
+    def patched_release_memory_occupation(self, recv_req):
+        if not _is_sglang_npu_backend():
+            return original_method(self, recv_req)
+
+        symbols = _resolve_sglang_memory_sleep_symbols()
+        tags = _normalize_sglang_memory_tags(getattr(recv_req, "tags", None), symbols["all"])
+        assert _sglang_scheduler_is_idle(self), "release_memory_occupation should be called only when server is idle."
+
+        adapter = getattr(self, "memory_saver_adapter", None)
+        adapter_enabled = bool(getattr(adapter, "enabled", False)) if adapter is not None else False
+        if not adapter_enabled:
+            message = (
+                "SGLang NPU memory sleep found disabled torch_memory_saver adapter. "
+                f"rank={_sglang_scheduler_rank_info(self)} info={_sglang_memory_saver_info(adapter)}"
+            )
+            if _sglang_npu_memory_sleep_strict_enabled():
+                raise RuntimeError(message)
+            logger.warning(message)
+
+        for tag in tags:
+            self.offload_tags.add(tag)
+
+        _npu_device_synchronize()
+        _log_sglang_npu_sleep("release:start", self, tags)
+
+        if symbols["kv_cache"] in tags:
+            getattr(adapter, "pause")(symbols["kv_cache"])
+            _npu_device_synchronize()
+            _log_sglang_npu_sleep("release:after_pause_kv_cache", self, tags)
+            self.flush_cache()
+            _npu_device_synchronize()
+            _npu_empty_device_cache()
+            _npu_device_synchronize()
+            _log_sglang_npu_sleep("release:after_flush_kv_cache", self, tags)
+
+        if symbols["weights"] in tags:
+            self.stashed_model_static_state = symbols["export_static_state"](self.tp_worker.model_runner.model)
+            torch.distributed.barrier(self.tp_cpu_group)
+            getattr(adapter, "pause")(symbols["weights"])
+            _npu_device_synchronize()
+            _npu_empty_device_cache()
+            _npu_device_synchronize()
+            _log_sglang_npu_sleep("release:after_pause_weights", self, tags)
+
+        if symbols["cuda_graph"] in tags:
+            getattr(adapter, "pause")(symbols["cuda_graph"])
+            _npu_device_synchronize()
+            _npu_empty_device_cache()
+            _npu_device_synchronize()
+            _log_sglang_npu_sleep("release:after_pause_cuda_graph", self, tags)
+
+        return symbols["release_output"]()
+
+    patched_release_memory_occupation._verl_patched_npu_memory_sleep = True
+    return patched_release_memory_occupation
+
+
+def _make_sglang_npu_memory_sleep_resume_patch(original_method):
+    @wraps(original_method)
+    def patched_resume_memory_occupation(self, recv_req):
+        if not _is_sglang_npu_backend():
+            return original_method(self, recv_req)
+
+        symbols = _resolve_sglang_memory_sleep_symbols()
+        tags = _normalize_sglang_memory_tags(getattr(recv_req, "tags", None), symbols["all"])
+        adapter = getattr(self, "memory_saver_adapter", None)
+
+        for tag in tags:
+            if tag in self.offload_tags:
+                self.offload_tags.remove(tag)
+
+        _log_sglang_npu_sleep("resume:start", self, tags)
+
+        if symbols["cuda_graph"] in tags:
+            getattr(adapter, "resume")(symbols["cuda_graph"])
+            _npu_device_synchronize()
+            _log_sglang_npu_sleep("resume:after_cuda_graph", self, tags)
+
+        if symbols["weights"] in tags:
+            getattr(adapter, "resume")(symbols["weights"])
+            _npu_device_synchronize()
+            torch.distributed.barrier(self.tp_cpu_group)
+            if hasattr(self, "stashed_model_static_state"):
+                symbols["import_static_state"](self.tp_worker.model_runner.model, self.stashed_model_static_state)
+                del self.stashed_model_static_state
+            _npu_device_synchronize()
+            _log_sglang_npu_sleep("resume:after_weights", self, tags)
+
+        if symbols["kv_cache"] in tags:
+            getattr(adapter, "resume")(symbols["kv_cache"])
+            _npu_device_synchronize()
+            _log_sglang_npu_sleep("resume:after_kv_cache", self, tags)
+
+        return symbols["resume_output"]()
+
+    patched_resume_memory_occupation._verl_patched_npu_memory_sleep = True
+    return patched_resume_memory_occupation
+
+
+def patch_sglang_npu_memory_sleep() -> None:
+    global _SGLANG_NPU_MEMORY_SLEEP_PATCHED
+    if _SGLANG_NPU_MEMORY_SLEEP_PATCHED or not _is_sglang_npu_backend():
+        return
+
+    try:
+        module = importlib.import_module("sglang.srt.managers.scheduler_update_weights_mixin")
+        mixin_cls = getattr(module, "SchedulerUpdateWeightsMixin")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Skip SGLang NPU memory sleep patch: %s", exc)
+        return
+
+    patched_methods = []
+    for method_name, patch_factory in (
+        ("release_memory_occupation", _make_sglang_npu_memory_sleep_release_patch),
+        ("resume_memory_occupation", _make_sglang_npu_memory_sleep_resume_patch),
+    ):
+        original_method = getattr(mixin_cls, method_name, None)
+        if original_method is None or getattr(original_method, "_verl_patched_npu_memory_sleep", False):
+            continue
+        setattr(mixin_cls, method_name, patch_factory(original_method))
+        patched_methods.append(method_name)
+
+    if patched_methods:
+        _SGLANG_NPU_MEMORY_SLEEP_PATCHED = True
+        logger.warning("Patched SGLang NPU memory sleep for %s", ", ".join(patched_methods))
 
 
 def _sglang_verl_patches_disabled() -> bool:
@@ -3590,6 +3860,7 @@ def _apply_selected_sglang_patches() -> bool:
     patchers = (
         ("eagle_update_weights", patch_sglang_eagle_update_weights_from_tensor),
         ("npu_eagle_target_sampling", patch_sglang_npu_eagle_target_sampling),
+        ("npu_memory_sleep", patch_sglang_npu_memory_sleep),
         ("eagle_draft_cuda_graph_memory_saver", patch_sglang_eagle_draft_cuda_graph_memory_saver),
         ("hidden_states_tensor_output", patch_sglang_hidden_states_tensor_output),
         ("top_logprobs_tensor_output", patch_sglang_top_logprobs_tensor_output),
