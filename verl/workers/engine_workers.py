@@ -23,6 +23,7 @@ from itertools import chain
 from typing import Optional
 
 import numpy as np
+import ray
 import torch
 import torch.distributed as dist
 from codetiming import Timer
@@ -766,16 +767,45 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             "weight": weight,
         }
 
+    @staticmethod
+    def _materialize_draft_weights_payload(weights):
+        if isinstance(weights, dict) and "weights_ref" in weights:
+            weights_ref = weights["weights_ref"]
+            if isinstance(weights_ref, ray.ObjectRef):
+                return ray.get(weights_ref), True
+            return weights_ref, True
+        if isinstance(weights, ray.ObjectRef):
+            return ray.get(weights), True
+        return weights, False
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     async def update_draft_weights(self, weights: dict[str, torch.Tensor], global_steps: int = None):
         if not self.config.rollout.drafter.enable:
             return
+        materialize_ts = time.perf_counter()
+        weights, used_ref = self._materialize_draft_weights_payload(weights)
+        if used_ref:
+            logger.warning(
+                "[drafter publish materialize] async=False global_steps=%s elapsed_sec=%.3f num_weights=%s",
+                global_steps,
+                time.perf_counter() - materialize_ts,
+                len(weights) if weights else 0,
+            )
         await self.rollout.update_draft_weights(weights, global_steps=global_steps)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_draft_weights_async(self, weights: dict[str, torch.Tensor], global_steps: int = None):
         if not self.config.rollout.drafter.enable:
             return
+        materialize_ts = time.perf_counter()
+        weights, used_ref = self._materialize_draft_weights_payload(weights)
+        if used_ref:
+            logger.warning(
+                "[drafter publish materialize] async=True global_steps=%s elapsed_sec=%.3f num_weights=%s",
+                global_steps,
+                time.perf_counter() - materialize_ts,
+                len(weights) if weights else 0,
+            )
         await self.rollout.update_draft_weights(weights, global_steps=global_steps)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -1211,4 +1241,23 @@ class DrafterWorker(Worker):
                 self.last_global_step,
             )
             return None
-        return weights if self.is_global_publish_leader else None
+        if not self.is_global_publish_leader:
+            return None
+
+        tensor_count = 0
+        total_bytes = 0
+        largest_bytes = 0
+        for tensor in weights.values():
+            if not torch.is_tensor(tensor):
+                continue
+            tensor_bytes = tensor.numel() * tensor.element_size()
+            tensor_count += 1
+            total_bytes += tensor_bytes
+            largest_bytes = max(largest_bytes, tensor_bytes)
+
+        return {
+            "weights_ref": ray.put(weights),
+            "payload_tensors": tensor_count,
+            "payload_mib": total_bytes / (1024 * 1024),
+            "largest_tensor_mib": largest_bytes / (1024 * 1024),
+        }

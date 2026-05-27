@@ -1003,6 +1003,21 @@ class RayPPOTrainer:
         mib = 1024 * 1024
         return tensor_count, total_bytes / mib, largest_bytes / mib
 
+    @staticmethod
+    def _resolve_drafter_publish_payload(
+        published_payload: Any,
+    ) -> tuple[Any, int, float, float, int]:
+        if isinstance(published_payload, dict) and "weights_ref" in published_payload:
+            return (
+                published_payload,
+                int(published_payload.get("payload_tensors", 0)),
+                float(published_payload.get("payload_mib", 0.0)),
+                float(published_payload.get("largest_tensor_mib", 0.0)),
+                1,
+            )
+        tensor_count, payload_mib, largest_mib = RayPPOTrainer._summarize_tensor_payload(published_payload)
+        return published_payload, tensor_count, payload_mib, largest_mib, 0
+
     def _should_publish_drafter_weights(self, drafter_trained: bool) -> bool:
         if not drafter_trained or not self.use_drafter or self.drafter_wg is None:
             return False
@@ -1906,24 +1921,25 @@ class RayPPOTrainer:
                                     )
                                     try:
                                         if drafter_weights is not None:
-                                            tensor_count, payload_mib, largest_mib = self._summarize_tensor_payload(
-                                                drafter_weights
+                                            publish_payload, tensor_count, payload_mib, largest_mib, used_ref = (
+                                                self._resolve_drafter_publish_payload(drafter_weights)
                                             )
                                             metrics["drafter/publish_payload_tensors"] = tensor_count
                                             metrics["drafter/publish_payload_mib"] = payload_mib
                                             metrics["drafter/publish_largest_tensor_mib"] = largest_mib
+                                            metrics["drafter/publish_payload_ref"] = used_ref
                                             training_cfg = self.config.actor_rollout_ref.rollout.drafter.training
                                             publish_call_ts = time.perf_counter()
                                             if bool(training_cfg.get("publish_async", False)):
                                                 self._pending_drafter_publish_refs = (
                                                     self.actor_rollout_wg.update_draft_weights_async(
-                                                        drafter_weights, global_steps=self.global_steps
+                                                        publish_payload, global_steps=self.global_steps
                                                     )
                                                 )
                                                 metrics["drafter/publish_async"] = 1
                                             else:
                                                 self.actor_rollout_wg.update_draft_weights(
-                                                    drafter_weights, global_steps=self.global_steps
+                                                    publish_payload, global_steps=self.global_steps
                                                 )
                                                 metrics["drafter/publish_async"] = 0
                                             metrics["drafter/publish_update_call_elapsed_sec"] = (
@@ -1935,6 +1951,7 @@ class RayPPOTrainer:
                                             metrics["drafter/publish_payload_tensors"] = 0
                                             metrics["drafter/publish_payload_mib"] = 0.0
                                             metrics["drafter/publish_largest_tensor_mib"] = 0.0
+                                            metrics["drafter/publish_payload_ref"] = 0
                                             metrics["drafter/publish_update_call_elapsed_sec"] = 0.0
                                     finally:
                                         del drafter_weights
@@ -1949,6 +1966,7 @@ class RayPPOTrainer:
                                 metrics["drafter/publish_payload_tensors"] = 0
                                 metrics["drafter/publish_payload_mib"] = 0.0
                                 metrics["drafter/publish_largest_tensor_mib"] = 0.0
+                                metrics["drafter/publish_payload_ref"] = 0
                                 metrics["drafter/publish_update_call_elapsed_sec"] = 0.0
 
                     # Log rollout generations if enabled
