@@ -1156,6 +1156,19 @@ class RayPPOTrainer:
             "training_optimizer_elapsed_sec",
             "training_total_elapsed_sec",
             "training_timed_steps",
+            "training_activation_build_model_elapsed_sec",
+            "training_activation_load_model_elapsed_sec",
+            "training_activation_load_optimizer_elapsed_sec",
+            "training_activation_target_to_device_elapsed_sec",
+            "training_activation_apply_target_lm_head_elapsed_sec",
+            "training_cleanup_pending_checkpoint_wait_elapsed_sec",
+            "training_cleanup_final_checkpoint_elapsed_sec",
+            "training_cleanup_zero_grad_elapsed_sec",
+            "training_cleanup_barrier_elapsed_sec",
+            "training_cleanup_offload_model_elapsed_sec",
+            "training_cleanup_offload_optimizer_elapsed_sec",
+            "training_cleanup_target_to_cpu_elapsed_sec",
+            "training_cleanup_empty_cache_elapsed_sec",
         ):
             summary[f"drafter/{raw_key}"] = max(float(r.get(raw_key, 0.0)) for r in normalized_results)
         return summary

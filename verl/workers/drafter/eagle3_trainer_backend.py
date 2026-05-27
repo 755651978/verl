@@ -19,6 +19,15 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 device_name = get_device_name()
 
 
+class _SyncedTargetHead(torch.nn.Module):
+    def __init__(self, hidden_size: int, vocab_size: int):
+        super().__init__()
+        self.fc = torch.nn.Linear(hidden_size, vocab_size, bias=False)
+
+    def forward(self, hidden_states):
+        return self.fc(hidden_states)
+
+
 def _scatter_topk_logprobs_with_tail(logprobs: torch.Tensor, indices: torch.Tensor, vocab_size: int) -> torch.Tensor:
     dense_logprob_view = torch.full(
         (logprobs.size(0), vocab_size),
@@ -496,7 +505,7 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
         use_logits = training_cfg.get("use_logits", False)
         if not use_logits:
             target_device = torch.device(f"{device_name}:{get_device_id()}") if device_name != "cpu" else torch.device("cpu")
-            self.target_model = self._build_target_model(target_model_path).to(target_device).eval()
+            self.target_model = self._build_target_model(target_model_path, target_hf_config).to(target_device).eval()
             for param in self.target_model.parameters():
                 param.requires_grad_(False)
 
@@ -531,10 +540,26 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
                 f"but draft_vocab_size is {drafter_module.draft_vocab_size}"
             )
 
-    def _build_target_model(self, target_model_path: str):
+    def _build_target_model(self, target_model_path: str, target_hf_config=None):
         """
         构建主模型，先实现根据last_hidden_states构建主模型线性层，直接使用主模型后续看要不要实现
         """
+        synced_shape = getattr(self, "_initial_target_lm_head_shape", None)
+        if synced_shape is not None and len(synced_shape) == 2:
+            vocab_size, hidden_size = int(synced_shape[0]), int(synced_shape[1])
+            expected_hidden = getattr(target_hf_config, "hidden_size", hidden_size)
+            if int(expected_hidden) != hidden_size:
+                raise ValueError(
+                    "Synced target lm_head hidden size mismatch: "
+                    f"synced={hidden_size}, target_config={expected_hidden}"
+                )
+            logger.warning(
+                "[drafter target lm_head] build synced target head shape=(%s, %s) without loading full checkpoint",
+                vocab_size,
+                hidden_size,
+            )
+            return _SyncedTargetHead(hidden_size=hidden_size, vocab_size=vocab_size)
+
         target_head = TargetHead.from_pretrained(
             model_path=target_model_path,
         )

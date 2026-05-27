@@ -526,6 +526,15 @@ class DrafterBaseTrainer:
         """build draft model"""
         logger.info(f"[Rank {self.rollout_dp_rank}] Building drafter model...")
         # A. 实例化模型（委托给backend）
+        pending_target_weight = self._pending_target_lm_head_weight
+        if (
+            getattr(self.backend, "model_type", None) == "eagle3"
+            and torch.is_tensor(pending_target_weight)
+            and pending_target_weight.dim() == 2
+        ):
+            setattr(self.backend, "_initial_target_lm_head_shape", tuple(pending_target_weight.shape))
+        else:
+            setattr(self.backend, "_initial_target_lm_head_shape", None)
         raw_model, drafter_model_config = self.backend.build_model()
         raw_model.to(self.runtime_device)
 
@@ -784,7 +793,9 @@ class DrafterBaseTrainer:
 
             if self.model is None:
                 logger.info("Draft Model not initialized, calling build_draft_model during activation...")
+                build_ts = time.perf_counter()
                 self._build_draft_model()
+                self._add_training_timing("activation_build_model", time.perf_counter() - build_ts)
 
             # 只有当配置了 offload 或者当前模型不在 CUDA 上时执行加载
             first_param = next(self.model.parameters(), None)
@@ -792,19 +803,27 @@ class DrafterBaseTrainer:
 
             if self.is_offload_param or not is_on_cuda:
                 # 调用工具将 FSDP 分片移动到 GPU
+                load_model_ts = time.perf_counter()
                 load_fsdp_model_to_gpu(self.model)
+                self._add_training_timing("activation_load_model", time.perf_counter() - load_model_ts)
                 logger.debug("Loaded drafter model to GPU for training")
             
             if self.optimizer is not None:
                 # 获取 device_id,否则在多卡环境优化器状态可能全部挤在 cuda:0 导致 OOM
                 current_dev_id = get_device_id()
+                load_optimizer_ts = time.perf_counter()
                 load_fsdp_optimizer(optimizer=self.optimizer, device_id=current_dev_id)
+                self._add_training_timing("activation_load_optimizer", time.perf_counter() - load_optimizer_ts)
                 logger.debug("Loaded drafter optimizer to GPU for training")
 
             target_model = getattr(self.backend, "target_model", None)
             if target_model is not None:
+                target_to_device_ts = time.perf_counter()
                 target_model.to(self.runtime_device)
+                self._add_training_timing("activation_target_to_device", time.perf_counter() - target_to_device_ts)
+            apply_target_ts = time.perf_counter()
             self._apply_pending_target_lm_head_weight()
+            self._add_training_timing("activation_apply_target_lm_head", time.perf_counter() - apply_target_ts)
 
             # 先标记初始化完成，然后开启 active 开关，确保训练循环不会读到中间状态
             self._training_initialized = True
@@ -2146,6 +2165,7 @@ class DrafterBaseTrainer:
         self._training_active = False
 
         # Wait for any pending async checkpoint save to complete
+        checkpoint_wait_ts = time.perf_counter()
         if self._pending_checkpoint_future is not None:
             logger.debug(f"[Rank {self.rank}] Waiting for pending checkpoint save to complete...")
             try:
@@ -2164,8 +2184,10 @@ class DrafterBaseTrainer:
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"Pending full drafter checkpoint save failed: {e}")
             self._pending_full_checkpoint_future = None
+        self._add_training_timing("cleanup_pending_checkpoint_wait", time.perf_counter() - checkpoint_wait_ts)
 
         # Save final checkpoint and wait for it to complete
+        final_checkpoint_ts = time.perf_counter()
         if self.checkpoint_dir and self.model is not None and self.training_steps > 0:
             final_ckpt_step = self.current_rl_step if self.current_rl_step > 0 else self.training_steps
             final_future = self._save_checkpoint_async(final_ckpt_step, is_final=True)
@@ -2183,14 +2205,18 @@ class DrafterBaseTrainer:
                 except Exception as e:  # noqa: BLE001
                     logger.warning(f"Final full drafter checkpoint save failed: {e}")
                 self._pending_full_checkpoint_future = None
+        self._add_training_timing("cleanup_final_checkpoint", time.perf_counter() - final_checkpoint_ts)
 
         if self.optimizer is not None:
             try:
+                cleanup_zero_grad_ts = time.perf_counter()
                 self.optimizer.zero_grad(set_to_none=True)
+                self._add_training_timing("cleanup_zero_grad", time.perf_counter() - cleanup_zero_grad_ts)
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Failed to clear drafter gradients during cleanup: {e}")
 
         # Clean up distributed resources gracefully
+        cleanup_barrier_ts = time.perf_counter()
         sp_group = self._get_sp_group()
         dp_group = self._get_dp_group()
         if sp_group is not None and self._get_sp_world_size() > 1:
@@ -2245,17 +2271,22 @@ class DrafterBaseTrainer:
                         pass  # Ignore barrier errors during cleanup
             except Exception as e:
                 logger.debug(f"Process group cleanup error (expected): {e}")
+        self._add_training_timing("cleanup_barrier", time.perf_counter() - cleanup_barrier_ts)
 
         if self.model is not None:
             try:
+                offload_model_ts = time.perf_counter()
                 offload_fsdp_model_to_cpu(self.model)
+                self._add_training_timing("cleanup_offload_model", time.perf_counter() - offload_model_ts)
                 logger.debug("Offloaded drafter model to CPU after training")
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Failed to offload drafter model during cleanup: {e}")
 
         if self.optimizer is not None:
             try:
+                offload_optimizer_ts = time.perf_counter()
                 offload_fsdp_optimizer(self.optimizer)
+                self._add_training_timing("cleanup_offload_optimizer", time.perf_counter() - offload_optimizer_ts)
                 logger.debug("Offloaded drafter optimizer state to CPU after training")
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Failed to offload drafter optimizer during cleanup: {e}")
@@ -2263,7 +2294,9 @@ class DrafterBaseTrainer:
         target_model = getattr(self.backend, "target_model", None)
         if target_model is not None:
             try:
+                target_to_cpu_ts = time.perf_counter()
                 target_model.to("cpu")
+                self._add_training_timing("cleanup_target_to_cpu", time.perf_counter() - target_to_cpu_ts)
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Failed to offload drafter target model during cleanup: {e}")
         
@@ -2274,9 +2307,11 @@ class DrafterBaseTrainer:
             self._full_checkpoint_executor.shutdown(wait=False)
             self._full_checkpoint_executor = None
         if device_name != "cpu" and hasattr(self.device_module, "empty_cache"):
+            empty_cache_ts = time.perf_counter()
             if hasattr(self.device_module, "synchronize"):
                 self.device_module.synchronize()
             self.device_module.empty_cache()
+            self._add_training_timing("cleanup_empty_cache", time.perf_counter() - empty_cache_ts)
         self._training_initialized = False
         self._last_ckpt_step = -1
         self.training_steps = 0
