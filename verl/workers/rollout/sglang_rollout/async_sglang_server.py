@@ -44,7 +44,7 @@ from sglang.srt.managers.tokenizer_manager import ServerStatus
 from sglang.srt.utils import MultiprocessingSerializer
 
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.device import get_device_name, get_visible_devices_keyword
+from verl.utils.device import get_visible_devices_keyword
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.utils.profiler import DistProfiler, build_sglang_profiler_args
 from verl.workers.drafter.sglang_patch import install_sglang_verl_patches
@@ -73,11 +73,6 @@ _VERL_HIDDEN_STATE_PROMPT_LEN_PARAM = "_verl_prompt_len"
 _VERL_DRAFTER_RETURN_LAST_HIDDEN_ENV = "VERL_SGLANG_DRAFTER_RETURN_LAST_HIDDEN"
 _VERL_DRAFTER_RETURN_LAST_HIDDEN_PARAM = "_verl_drafter_return_last_hidden"
 _VERL_DFLASH_RETURN_AUX_HIDDEN_PARAM = "_verl_dflash_return_aux_hidden"
-_VERL_TOP_LOGPROBS_TENSOR_PARAM = "_verl_top_logprobs_tensor_output"
-_VERL_OUTPUT_TOP_LOGPROBS_TENSOR_KEY = "_verl_output_top_logprobs_tensor"
-_VERL_TOP_LOGPROBS_OUTPUT_ROW_START_PARAM = "_verl_top_logprobs_output_row_start"
-_VERL_TOP_LOGPROBS_OUTPUT_ROW_END_PARAM = "_verl_top_logprobs_output_row_end"
-_SGLANG_MEMORY_SAVER_CUDA_GRAPH_ENV = "SGLANG_MEMORY_SAVER_CUDA_GRAPH"
 
 
 def _drafter_uses_eagle_last_hidden(drafter_cfg) -> bool:
@@ -110,22 +105,6 @@ def _drafter_uses_dflash_aux_hidden(drafter_cfg) -> bool:
         and getattr(training_cfg, "collect_hidden_states_from_sgl", False)
         and not getattr(training_cfg, "use_logits", False)
     )
-
-
-def _drafter_cuda_graph_memory_saver_enabled(config) -> bool:
-    return bool(
-        get_device_name() == "cuda"
-        and getattr(getattr(config, "drafter", None), "enable", False)
-        and getattr(config, "free_cache_engine", False)
-    )
-
-
-def _with_drafter_cuda_graph_tag(config, tags: list[str]) -> list[str]:
-    if not _drafter_cuda_graph_memory_saver_enabled(config) or "cuda_graph" in tags:
-        return tags
-    if "weights" not in tags:
-        return tags
-    return [*tags, "cuda_graph"]
 
 
 def _env_flag_enabled(name: str, default: bool = False) -> bool:
@@ -398,74 +377,6 @@ def _top_logprobs_to_tensor(top_logprobs: list, topk: int) -> Optional[torch.Ten
     if not rows:
         return None
     return torch.tensor(rows, dtype=torch.float32)
-
-
-def _normalize_output_top_logprobs_tensor(output_top_logprobs: Any, topk: int) -> Optional[torch.Tensor]:
-    if topk <= 0 or output_top_logprobs is None:
-        return None
-
-    if isinstance(output_top_logprobs, dict):
-        values = output_top_logprobs.get("values")
-        indices = output_top_logprobs.get("indices")
-        if values is None or indices is None:
-            return None
-        if not torch.is_tensor(values):
-            values = torch.tensor(values, dtype=torch.float32)
-        else:
-            values = values.detach().cpu().to(dtype=torch.float32)
-        if not torch.is_tensor(indices):
-            indices = torch.tensor(indices, dtype=torch.float32)
-        else:
-            indices = indices.detach().cpu().to(dtype=torch.float32)
-        if values.dim() != 2 or indices.dim() != 2:
-            return None
-        rows = min(values.size(0), indices.size(0))
-        cols = min(values.size(1), indices.size(1), topk)
-        if rows <= 0 or cols <= 0:
-            return None
-        values = values[:rows, :cols]
-        indices = indices[:rows, :cols]
-        tensor = torch.empty((rows, topk, 2), dtype=torch.float32)
-        tensor[..., 0] = float("-inf")
-        tensor[..., 1] = -1.0
-        tensor[:, :cols, 0] = values
-        tensor[:, :cols, 1] = indices
-        return tensor
-
-    if not torch.is_tensor(output_top_logprobs):
-        return None
-
-    tensor = output_top_logprobs.detach().cpu().to(dtype=torch.float32)
-    if tensor.dim() != 3 or tensor.size(-1) < 2:
-        return None
-
-    rows = tensor.size(0)
-    cols = min(tensor.size(1), topk)
-    if rows <= 0 or cols <= 0:
-        return None
-
-    if tensor.size(1) == topk and tensor.size(-1) == 2:
-        return tensor.contiguous()
-
-    normalized = torch.empty((rows, topk, 2), dtype=torch.float32)
-    normalized[..., 0] = float("-inf")
-    normalized[..., 1] = -1.0
-    normalized[:, :cols, :] = tensor[:, :cols, :2]
-    return normalized.contiguous()
-
-
-def _output_top_logprobs_output_row_start(output_top_logprobs: Any) -> Optional[int]:
-    if not isinstance(output_top_logprobs, dict):
-        return None
-    for key in ("output_row_start", "row_start"):
-        value = output_top_logprobs.get(key)
-        if value is None:
-            continue
-        try:
-            return max(int(value), 0)
-        except (TypeError, ValueError):
-            return None
-    return None
 
 
 def _crop_target_logprobs_to_position_window(
@@ -812,8 +723,6 @@ class SGLangHttpServer:
 
             args["enable_weights_cpu_backup"] = True
             args["enable_draft_weights_cpu_backup"] = True
-            if _drafter_cuda_graph_memory_saver_enabled(self.config) and not self.config.enforce_eager:
-                os.environ.setdefault(_SGLANG_MEMORY_SAVER_CUDA_GRAPH_ENV, "1")
         os.environ[_VERL_DRAFTER_RETURN_LAST_HIDDEN_ENV] = (
             "1" if return_last_hidden_for_drafter else "0"
         )
@@ -893,9 +802,7 @@ class SGLangHttpServer:
             raise ValueError(f"wake_up not support rollout_mode {self.rollout_mode}")
         elif self.rollout_mode == RolloutMode.COLOCATED:
             # Directly call engine to wake up without sync weights.
-            obj = ResumeMemoryOccupationReqInput(
-                tags=_with_drafter_cuda_graph_tag(self.config, ["kv_cache", "weights"])
-            )
+            obj = ResumeMemoryOccupationReqInput(tags=["kv_cache", "weights"])
             await self.tokenizer_manager.resume_memory_occupation(obj, None)
             await self.tokenizer_manager.flush_cache()
         elif self.rollout_mode == RolloutMode.STANDALONE:
@@ -921,8 +828,6 @@ class SGLangHttpServer:
             tags = ["kv_cache"]
         else:
             tags = ["kv_cache", "weights"]
-        tags = _with_drafter_cuda_graph_tag(self.config, tags)
-
         if self.rollout_mode == RolloutMode.HYBRID:
             obj = ReleaseMemoryOccupationReqInput(tags=tags)
             await self.tokenizer_manager.release_memory_occupation(obj, None)
@@ -1084,18 +989,6 @@ class SGLangHttpServer:
             if front_hidden_tokens is not None:
                 custom_params[_VERL_HIDDEN_STATE_FRONT_TOKENS_PARAM] = int(front_hidden_tokens)
             if self.config.drafter.training.use_logits:
-                custom_params[_VERL_TOP_LOGPROBS_TENSOR_PARAM] = True
-                # EAGLE-style drafter training uses hidden[k] + token[k+1]
-                # to predict token[k+2]. The first decode top-k row predicts
-                # token[k+1], so it is an alignment anchor only and does not
-                # enter the loss. Keep SGLang top-k rows within the same front
-                # window as hidden states.
-                custom_params[_VERL_TOP_LOGPROBS_OUTPUT_ROW_START_PARAM] = 1
-                if front_hidden_tokens is not None:
-                    custom_params[_VERL_TOP_LOGPROBS_OUTPUT_ROW_END_PARAM] = max(
-                        int(front_hidden_tokens),
-                        1,
-                    )
                 request.update({"return_logprob": True})
                 request.update({"top_logprobs_num": self.config.drafter.training.logits_topk})
             elif _drafter_uses_dflash_aux_hidden(self.config.drafter):
@@ -1176,17 +1069,9 @@ class SGLangHttpServer:
             if collect_target_logprobs:
                 logits_topk = int(self.config.drafter.training.logits_topk)
                 target_logprobs_position_start = max(len(prompt_ids) - 1, 0)
-                output_top_tensor = meta_info.pop(_VERL_OUTPUT_TOP_LOGPROBS_TENSOR_KEY, None)
-                target_logprobs = _normalize_output_top_logprobs_tensor(output_top_tensor, logits_topk)
-                if target_logprobs is not None:
-                    output_row_start = _output_top_logprobs_output_row_start(output_top_tensor)
-                    if output_row_start is not None:
-                        target_logprobs_position_start = max(len(prompt_ids) - 1, 0) + output_row_start
-                    output_top_len = int(target_logprobs.size(0))
-                if target_logprobs is None:
-                    output_top = output.get("meta_info", {}).get("output_top_logprobs", [])
-                    output_top_len = len(output_top) if output_top else None
-                    target_logprobs = _top_logprobs_to_tensor(output_top, logits_topk)
+                output_top = output.get("meta_info", {}).get("output_top_logprobs", [])
+                output_top_len = len(output_top) if output_top else None
+                target_logprobs = _top_logprobs_to_tensor(output_top, logits_topk)
                 if target_logprobs is None:
                     logger.warning("Failed to convert output top_logprobs to tensor; skip target_logprobs collection")
                     target_logprobs_position_start = None
