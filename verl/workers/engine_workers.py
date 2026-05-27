@@ -70,6 +70,7 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 DRAFTER_OWNER_ROUTE_MESH = "drafter_owner_route"
+DRAFTER_TARGET_SYNC_MESH = "drafter_target_sync"
 
 
 def _resolve_drafter_init_backend(device_name: str) -> str:
@@ -741,7 +742,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             logger.warning("Unable to find actor lm_head.weight or tied model.embed_tokens.weight for drafter sync")
             return None
 
-        weight = selected_weight.detach().cpu().to(torch.bfloat16).contiguous()
+        weight = selected_weight.detach().to(device="cpu", dtype=torch.bfloat16).contiguous()
         logger.warning(
             "[actor lm_head export] name=%s shape=%s dtype=%s",
             selected_name,
@@ -969,6 +970,11 @@ class DrafterWorker(Worker):
             dp_rank=owner_route_rank,
             is_collect=owner_route_collect,
         )
+        self._register_dispatch_collect_info(
+            mesh_name=DRAFTER_TARGET_SYNC_MESH,
+            dp_rank=0,
+            is_collect=True,
+        )
         self._training_group_initialized = True
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -1056,7 +1062,7 @@ class DrafterWorker(Worker):
         self.trainer.clear_pending_publish_state_dict()
         self.trainer.increment_rl_step(global_step)
 
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    @register(dispatch_mode=make_nd_compute_dispatch_fn(mesh_name=DRAFTER_TARGET_SYNC_MESH))
     def sync_target_lm_head_weight(self, payload: Optional[dict], global_step: Optional[int] = None):
         if not self.enable_drafter:
             return {"accepted": False, "applied": False, "reason": "disabled"}

@@ -76,6 +76,7 @@ from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_pad
 
 
 _POLICY_MODEL_NON_TENSOR_KEYS = {"multi_modal_inputs", "pad_token_id"}
+_DRAFTER_TARGET_SYNC_MESH = "drafter_target_sync"
 
 
 def _select_policy_model_batch(batch: DataProto) -> DataProto:
@@ -1016,12 +1017,29 @@ class RayPPOTrainer:
             )
         return non_null_payloads[0]
 
+    def _build_drafter_target_lm_head_sync_args(self, payload: dict[str, torch.Tensor]) -> tuple[list[Any], list[Any]]:
+        target_sync_mapping = self.drafter_wg._dispatch_info.get(_DRAFTER_TARGET_SYNC_MESH)
+        if target_sync_mapping is None:
+            target_sync_mapping = self.drafter_wg._query_dispatch_info(_DRAFTER_TARGET_SYNC_MESH)
+            self.drafter_wg._dispatch_info[_DRAFTER_TARGET_SYNC_MESH] = target_sync_mapping
+
+        target_sync_bucket_count = max(int(dp_rank) for dp_rank in target_sync_mapping) + 1
+        payload_buckets = [None for _ in range(target_sync_bucket_count)]
+        global_step_buckets = [None for _ in range(target_sync_bucket_count)]
+        payload_buckets[0] = payload
+        global_step_buckets[0] = self.global_steps
+        return payload_buckets, global_step_buckets
+
     def _sync_drafter_target_lm_head(self) -> int:
         payload = self._get_actor_lm_head_payload()
         if payload is None:
             return 0
 
-        sync_results = self.drafter_wg.sync_target_lm_head_weight(payload, global_step=self.global_steps) or []
+        payload_buckets, global_step_buckets = self._build_drafter_target_lm_head_sync_args(payload)
+        sync_results = self.drafter_wg.sync_target_lm_head_weight(
+            payload_buckets,
+            global_step=global_step_buckets,
+        ) or []
         accepted = [
             result
             for result in sync_results
