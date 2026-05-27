@@ -1143,7 +1143,6 @@ class DrafterWorker(Worker):
             result["triggered"] = True
             start_ts = time.time()
             self.trainer.clear_pending_publish_state_dict()
-            self.trainer.reset_training_timing_stats()
             activation_ts = time.time()
             success = await self.trainer.activate_training_model()
             result["activation_elapsed_sec"] = time.time() - activation_ts
@@ -1191,7 +1190,6 @@ class DrafterWorker(Worker):
             if result["trained"]:
                 self.last_trained_step = self.last_global_step
             result["elapsed_sec"] = time.time() - start_ts
-            result.update(self.trainer.get_training_timing_stats())
             return result
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)

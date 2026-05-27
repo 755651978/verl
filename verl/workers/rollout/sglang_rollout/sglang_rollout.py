@@ -461,12 +461,28 @@ class ServerAdapter(BaseRollout):
         if not self.config.drafter.enable or not weights:
             return
 
+        total_ts = time.perf_counter()
+        payload_tensors = 0
+        payload_bytes = 0
+        largest_tensor_bytes = 0
+        for tensor in weights.values():
+            if not torch.is_tensor(tensor):
+                continue
+            tensor_bytes = tensor.numel() * tensor.element_size()
+            payload_tensors += 1
+            payload_bytes += tensor_bytes
+            largest_tensor_bytes = max(largest_tensor_bytes, tensor_bytes)
+
         if self.device_mesh["infer_tp"].get_local_rank() == 0:
             logger.warning(
                 "[sglang draft update] enter global_steps=%s num_weights=%s "
+                "payload_tensors=%s payload_mib=%.2f largest_tensor_mib=%.2f "
                 "disable_draft_model=False disable_target_model=True load_format=%s",
                 global_steps,
                 len(weights),
+                payload_tensors,
+                payload_bytes / (1024 * 1024),
+                largest_tensor_bytes / (1024 * 1024),
                 VERL_SGLANG_DRAFT_WEIGHT_LOADER if _supports_sglang_custom_weight_loader() else None,
             )
 
@@ -546,7 +562,7 @@ class ServerAdapter(BaseRollout):
                 logger.warning(
                     "[sglang draft update] done global_steps=%s buckets=%s bucket_mb=%s "
                     "pause_generation=%s flush_before=%s flush_after=%s server_global_steps_set=%s "
-                    "timing=%s",
+                    "payload_mib=%.2f total_elapsed_sec=%.3f timing=%s",
                     global_steps,
                     bucket_idx,
                     int(draft_bucket_mb),
@@ -554,6 +570,8 @@ class ServerAdapter(BaseRollout):
                     flush_before_update,
                     flush_after_update,
                     global_steps is not None,
+                    payload_bytes / (1024 * 1024),
+                    time.perf_counter() - total_ts,
                     {k: round(v, 3) for k, v in timing.items()},
                 )
         finally:

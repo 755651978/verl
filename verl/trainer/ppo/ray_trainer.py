@@ -20,6 +20,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import time
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -985,6 +986,23 @@ class RayPPOTrainer:
             )
         return non_null_weights[0]
 
+    @staticmethod
+    def _summarize_tensor_payload(payload: Optional[dict[str, torch.Tensor]]) -> tuple[int, float, float]:
+        if not payload:
+            return 0, 0.0, 0.0
+        tensor_count = 0
+        total_bytes = 0
+        largest_bytes = 0
+        for value in payload.values():
+            if not torch.is_tensor(value):
+                continue
+            tensor_bytes = value.numel() * value.element_size()
+            tensor_count += 1
+            total_bytes += tensor_bytes
+            largest_bytes = max(largest_bytes, tensor_bytes)
+        mib = 1024 * 1024
+        return tensor_count, total_bytes / mib, largest_bytes / mib
+
     def _should_publish_drafter_weights(self, drafter_trained: bool) -> bool:
         if not drafter_trained or not self.use_drafter or self.drafter_wg is None:
             return False
@@ -1143,33 +1161,7 @@ class RayPPOTrainer:
         summary["drafter/publish_snapshot_elapsed_sec"] = max(
             float(r.get("publish_snapshot_elapsed_sec", 0.0)) for r in normalized_results
         )
-        for raw_key in (
-            "activation_elapsed_sec",
-            "training_loop_elapsed_sec",
-            "cleanup_elapsed_sec",
-            "training_prepare_batch_elapsed_sec",
-            "training_batch_readiness_elapsed_sec",
-            "training_zero_grad_elapsed_sec",
-            "training_forward_loss_elapsed_sec",
-            "training_metric_reduce_elapsed_sec",
-            "training_backward_elapsed_sec",
-            "training_optimizer_elapsed_sec",
-            "training_total_elapsed_sec",
-            "training_timed_steps",
-            "training_activation_build_model_elapsed_sec",
-            "training_activation_load_model_elapsed_sec",
-            "training_activation_load_optimizer_elapsed_sec",
-            "training_activation_target_to_device_elapsed_sec",
-            "training_activation_apply_target_lm_head_elapsed_sec",
-            "training_cleanup_pending_checkpoint_wait_elapsed_sec",
-            "training_cleanup_final_checkpoint_elapsed_sec",
-            "training_cleanup_zero_grad_elapsed_sec",
-            "training_cleanup_barrier_elapsed_sec",
-            "training_cleanup_offload_model_elapsed_sec",
-            "training_cleanup_offload_optimizer_elapsed_sec",
-            "training_cleanup_target_to_cpu_elapsed_sec",
-            "training_cleanup_empty_cache_elapsed_sec",
-        ):
+        for raw_key in ("activation_elapsed_sec", "training_loop_elapsed_sec", "cleanup_elapsed_sec"):
             summary[f"drafter/{raw_key}"] = max(float(r.get(raw_key, 0.0)) for r in normalized_results)
         return summary
 
@@ -1901,12 +1893,27 @@ class RayPPOTrainer:
                                 with marked_timer("publish_drafter", timing_raw, color="red"):
                                     metrics["drafter/publish_attempted"] = 1
                                     metrics["drafter/publish_skipped_interval"] = 0
+                                    publish_wait_ts = time.perf_counter()
                                     waited_publish_refs = self._wait_pending_drafter_publish()
+                                    metrics["drafter/publish_wait_pending_elapsed_sec"] = (
+                                        time.perf_counter() - publish_wait_ts
+                                    )
                                     metrics["drafter/publish_async_waited"] = waited_publish_refs
+                                    publish_get_ts = time.perf_counter()
                                     drafter_weights = self._get_published_drafter_weights()
+                                    metrics["drafter/publish_get_weights_elapsed_sec"] = (
+                                        time.perf_counter() - publish_get_ts
+                                    )
                                     try:
                                         if drafter_weights is not None:
+                                            tensor_count, payload_mib, largest_mib = self._summarize_tensor_payload(
+                                                drafter_weights
+                                            )
+                                            metrics["drafter/publish_payload_tensors"] = tensor_count
+                                            metrics["drafter/publish_payload_mib"] = payload_mib
+                                            metrics["drafter/publish_largest_tensor_mib"] = largest_mib
                                             training_cfg = self.config.actor_rollout_ref.rollout.drafter.training
+                                            publish_call_ts = time.perf_counter()
                                             if bool(training_cfg.get("publish_async", False)):
                                                 self._pending_drafter_publish_refs = (
                                                     self.actor_rollout_wg.update_draft_weights_async(
@@ -1919,9 +1926,16 @@ class RayPPOTrainer:
                                                     drafter_weights, global_steps=self.global_steps
                                                 )
                                                 metrics["drafter/publish_async"] = 0
+                                            metrics["drafter/publish_update_call_elapsed_sec"] = (
+                                                time.perf_counter() - publish_call_ts
+                                            )
                                             metrics["drafter/published"] = 1
                                         else:
                                             metrics["drafter/published"] = 0
+                                            metrics["drafter/publish_payload_tensors"] = 0
+                                            metrics["drafter/publish_payload_mib"] = 0.0
+                                            metrics["drafter/publish_largest_tensor_mib"] = 0.0
+                                            metrics["drafter/publish_update_call_elapsed_sec"] = 0.0
                                     finally:
                                         del drafter_weights
                             else:
@@ -1930,6 +1944,12 @@ class RayPPOTrainer:
                                 metrics["drafter/publish_async"] = 0
                                 metrics["drafter/publish_async_waited"] = 0
                                 metrics["drafter/publish_skipped_interval"] = int(drafter_trained)
+                                metrics["drafter/publish_wait_pending_elapsed_sec"] = 0.0
+                                metrics["drafter/publish_get_weights_elapsed_sec"] = 0.0
+                                metrics["drafter/publish_payload_tensors"] = 0
+                                metrics["drafter/publish_payload_mib"] = 0.0
+                                metrics["drafter/publish_largest_tensor_mib"] = 0.0
+                                metrics["drafter/publish_update_call_elapsed_sec"] = 0.0
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)

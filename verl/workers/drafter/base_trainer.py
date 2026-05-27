@@ -446,21 +446,6 @@ class DrafterBaseTrainer:
         self.checkpoint_dir = self.config.rollout.drafter.get("checkpoint_path")
         self.step = self.config.rollout.drafter.training.step
 
-    def reset_training_timing_stats(self) -> None:
-        self._training_timing_accumulator = {}
-        self._training_timing_steps = 0
-
-    def _add_training_timing(self, name: str, elapsed_sec: float) -> None:
-        self._training_timing_accumulator[name] = self._training_timing_accumulator.get(name, 0.0) + float(elapsed_sec)
-
-    def get_training_timing_stats(self) -> dict[str, float]:
-        stats = {
-            f"training_{name}_elapsed_sec": value
-            for name, value in self._training_timing_accumulator.items()
-        }
-        stats["training_timed_steps"] = float(self._training_timing_steps)
-        return stats
-
     def _create_copy_stream(self):
         if device_name == "cpu":
             return None
@@ -793,9 +778,7 @@ class DrafterBaseTrainer:
 
             if self.model is None:
                 logger.info("Draft Model not initialized, calling build_draft_model during activation...")
-                build_ts = time.perf_counter()
                 self._build_draft_model()
-                self._add_training_timing("activation_build_model", time.perf_counter() - build_ts)
 
             # 只有当配置了 offload 或者当前模型不在 CUDA 上时执行加载
             first_param = next(self.model.parameters(), None)
@@ -803,27 +786,19 @@ class DrafterBaseTrainer:
 
             if self.is_offload_param or not is_on_cuda:
                 # 调用工具将 FSDP 分片移动到 GPU
-                load_model_ts = time.perf_counter()
                 load_fsdp_model_to_gpu(self.model)
-                self._add_training_timing("activation_load_model", time.perf_counter() - load_model_ts)
                 logger.debug("Loaded drafter model to GPU for training")
             
             if self.optimizer is not None:
                 # 获取 device_id,否则在多卡环境优化器状态可能全部挤在 cuda:0 导致 OOM
                 current_dev_id = get_device_id()
-                load_optimizer_ts = time.perf_counter()
                 load_fsdp_optimizer(optimizer=self.optimizer, device_id=current_dev_id)
-                self._add_training_timing("activation_load_optimizer", time.perf_counter() - load_optimizer_ts)
                 logger.debug("Loaded drafter optimizer to GPU for training")
 
             target_model = getattr(self.backend, "target_model", None)
             if target_model is not None:
-                target_to_device_ts = time.perf_counter()
                 target_model.to(self.runtime_device)
-                self._add_training_timing("activation_target_to_device", time.perf_counter() - target_to_device_ts)
-            apply_target_ts = time.perf_counter()
             self._apply_pending_target_lm_head_weight()
-            self._add_training_timing("activation_apply_target_lm_head", time.perf_counter() - apply_target_ts)
 
             # 先标记初始化完成，然后开启 active 开关，确保训练循环不会读到中间状态
             self._training_initialized = True
@@ -1933,41 +1908,23 @@ class DrafterBaseTrainer:
             )
             return False
 
-        step_start_ts = time.perf_counter()
-        step_timing = {}
-
-        def finish_step(success: bool) -> bool:
-            step_timing["total"] = time.perf_counter() - step_start_ts
-            for timing_name, elapsed in step_timing.items():
-                self._add_training_timing(timing_name, elapsed)
-            self._training_timing_steps += 1
-            return success
-
-        prepare_ts = time.perf_counter()
         with self._ulysses_group_context():
             batch = self._prepare_training_batch()
-        step_timing["prepare_batch"] = time.perf_counter() - prepare_ts
-        readiness_ts = time.perf_counter()
         if not self._sync_batch_readiness(batch is not None):
-            step_timing["batch_readiness"] = time.perf_counter() - readiness_ts
             logger.debug(f"[EagleTrainer rank {self.rank}] Skipping step {step} due to missing drafter batch")
-            return finish_step(False)
-        step_timing["batch_readiness"] = time.perf_counter() - readiness_ts
+            return False
         if batch is None:
             logger.debug(
                 f"[EagleTrainer rank {self.rank}] Not enough data at step {step} "
                 f"(have={len(self.collected_data)} need>={self.batch_size})"
             )
-            return finish_step(False)
+            return False
         
         # 开启训练模式
-        zero_grad_ts = time.perf_counter()
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
-        step_timing["zero_grad"] = time.perf_counter() - zero_grad_ts
 
         # 前向传播
-        forward_loss_ts = time.perf_counter()
         with self._ulysses_group_context():
             with torch.amp.autocast(device_type=device_name, dtype=torch.bfloat16):
                 loss_dict = self.backend.compute_loss(self.model, batch, self._current_pad_size)
@@ -1975,10 +1932,8 @@ class DrafterBaseTrainer:
                 l_v = loss_dict["total_local_vloss"]
                 l_p = loss_dict["total_local_ploss"]
                 l_n = loss_dict["local_num_tokens"]
-        step_timing["forward_loss"] = time.perf_counter() - forward_loss_ts
 
         # 分布式同步（Global Reduction）,如果使用序列并行，仅在这里进行一次标量同步
-        reduce_ts = time.perf_counter()
         sp_group = self._get_sp_group()
         dp_group = self._get_dp_group()
         if sp_group is not None and self._get_sp_world_size() > 1:
@@ -1997,14 +1952,13 @@ class DrafterBaseTrainer:
             global_vloss, global_ploss, global_tokens = metrics[0], metrics[1], metrics[2]
         else:
             global_vloss, global_ploss, global_tokens = l_v, l_p, l_n
-        step_timing["metric_reduce"] = time.perf_counter() - reduce_ts
         
         # 最终 Loss 平滑处理
         if float(global_tokens.detach().float().item()) <= 0:
             logger.warning(
                 f"Step {self.training_steps + 1}: no finite drafter target tokens, skipping optimizer step"
             )
-            return finish_step(False)
+            return False
 
         denom = global_tokens.clamp(min=1.0)
         vloss = global_vloss / denom
@@ -2020,15 +1974,12 @@ class DrafterBaseTrainer:
                 f"ploss={float(ploss.detach().float().item())}, "
                 f"tokens={float(global_tokens.detach().float().item())}"
             )
-            return finish_step(False)
+            return False
 
         # 反向传播
-        backward_ts = time.perf_counter()
         loss.backward()
-        step_timing["backward"] = time.perf_counter() - backward_ts
 
         # 更新权重
-        optimizer_ts = time.perf_counter()
         grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         if not torch.isfinite(grad_norm):
             logger.error(
@@ -2036,20 +1987,18 @@ class DrafterBaseTrainer:
                 f"grad_norm={float(grad_norm.detach().float().item())}"
             )
             self.optimizer.zero_grad(set_to_none=True)
-            step_timing["optimizer"] = time.perf_counter() - optimizer_ts
-            return finish_step(False)
+            return False
         self.optimizer.step()
         if self.lr_scheduler is not None:
             self.lr_scheduler.step()
         self.optimizer.zero_grad(set_to_none=True)
-        step_timing["optimizer"] = time.perf_counter() - optimizer_ts
 
         self.training_steps += 1
         if self.training_steps % 10 == 0:
             logger.info(
                 f"Step {self.training_steps}: loss={float(loss.item()):.4f}, vloss={float(vloss.item()):.4f}, ploss={float(ploss.item()):.4f}"
             )
-        return finish_step(True)
+        return True
     
     def increment_rl_step(self, global_step: Optional[int] = None):
         """Increment the RL step counter in the data buffer.
@@ -2165,7 +2114,6 @@ class DrafterBaseTrainer:
         self._training_active = False
 
         # Wait for any pending async checkpoint save to complete
-        checkpoint_wait_ts = time.perf_counter()
         if self._pending_checkpoint_future is not None:
             logger.debug(f"[Rank {self.rank}] Waiting for pending checkpoint save to complete...")
             try:
@@ -2184,10 +2132,8 @@ class DrafterBaseTrainer:
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"Pending full drafter checkpoint save failed: {e}")
             self._pending_full_checkpoint_future = None
-        self._add_training_timing("cleanup_pending_checkpoint_wait", time.perf_counter() - checkpoint_wait_ts)
 
         # Save final checkpoint and wait for it to complete
-        final_checkpoint_ts = time.perf_counter()
         if self.checkpoint_dir and self.model is not None and self.training_steps > 0:
             final_ckpt_step = self.current_rl_step if self.current_rl_step > 0 else self.training_steps
             final_future = self._save_checkpoint_async(final_ckpt_step, is_final=True)
@@ -2205,18 +2151,14 @@ class DrafterBaseTrainer:
                 except Exception as e:  # noqa: BLE001
                     logger.warning(f"Final full drafter checkpoint save failed: {e}")
                 self._pending_full_checkpoint_future = None
-        self._add_training_timing("cleanup_final_checkpoint", time.perf_counter() - final_checkpoint_ts)
 
         if self.optimizer is not None:
             try:
-                cleanup_zero_grad_ts = time.perf_counter()
                 self.optimizer.zero_grad(set_to_none=True)
-                self._add_training_timing("cleanup_zero_grad", time.perf_counter() - cleanup_zero_grad_ts)
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Failed to clear drafter gradients during cleanup: {e}")
 
         # Clean up distributed resources gracefully
-        cleanup_barrier_ts = time.perf_counter()
         sp_group = self._get_sp_group()
         dp_group = self._get_dp_group()
         if sp_group is not None and self._get_sp_world_size() > 1:
@@ -2271,22 +2213,17 @@ class DrafterBaseTrainer:
                         pass  # Ignore barrier errors during cleanup
             except Exception as e:
                 logger.debug(f"Process group cleanup error (expected): {e}")
-        self._add_training_timing("cleanup_barrier", time.perf_counter() - cleanup_barrier_ts)
 
         if self.model is not None:
             try:
-                offload_model_ts = time.perf_counter()
                 offload_fsdp_model_to_cpu(self.model)
-                self._add_training_timing("cleanup_offload_model", time.perf_counter() - offload_model_ts)
                 logger.debug("Offloaded drafter model to CPU after training")
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Failed to offload drafter model during cleanup: {e}")
 
         if self.optimizer is not None:
             try:
-                offload_optimizer_ts = time.perf_counter()
                 offload_fsdp_optimizer(self.optimizer)
-                self._add_training_timing("cleanup_offload_optimizer", time.perf_counter() - offload_optimizer_ts)
                 logger.debug("Offloaded drafter optimizer state to CPU after training")
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Failed to offload drafter optimizer during cleanup: {e}")
@@ -2294,9 +2231,7 @@ class DrafterBaseTrainer:
         target_model = getattr(self.backend, "target_model", None)
         if target_model is not None:
             try:
-                target_to_cpu_ts = time.perf_counter()
                 target_model.to("cpu")
-                self._add_training_timing("cleanup_target_to_cpu", time.perf_counter() - target_to_cpu_ts)
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Failed to offload drafter target model during cleanup: {e}")
         
@@ -2307,11 +2242,9 @@ class DrafterBaseTrainer:
             self._full_checkpoint_executor.shutdown(wait=False)
             self._full_checkpoint_executor = None
         if device_name != "cpu" and hasattr(self.device_module, "empty_cache"):
-            empty_cache_ts = time.perf_counter()
             if hasattr(self.device_module, "synchronize"):
                 self.device_module.synchronize()
             self.device_module.empty_cache()
-            self._add_training_timing("cleanup_empty_cache", time.perf_counter() - empty_cache_ts)
         self._training_initialized = False
         self._last_ckpt_step = -1
         self.training_steps = 0
