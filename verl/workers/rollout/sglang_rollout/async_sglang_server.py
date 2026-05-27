@@ -1049,6 +1049,14 @@ class SGLangHttpServer:
         max_hidden_tokens = _positive_int_or_none(
             getattr(training_cfg, "hidden_state_max_tokens_per_sample", None)
         )
+        if _drafter_uses_dflash_aux_hidden(self.config.drafter):
+            dflash_max_window = _positive_int_or_none(getattr(training_cfg, "dflash_max_window", None))
+            if dflash_max_window is not None:
+                front_hidden_tokens = (
+                    min(front_hidden_tokens, dflash_max_window)
+                    if front_hidden_tokens is not None
+                    else dflash_max_window
+                )
         estimated_hidden_rows = _expected_collected_hidden_rows(
             len(prompt_ids),
             max_new_tokens,
