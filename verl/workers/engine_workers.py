@@ -1099,7 +1099,7 @@ class DrafterWorker(Worker):
             )
         return result
 
-    @register(dispatch_mode=make_nd_compute_dispatch_fn(mesh_name=DRAFTER_TARGET_SYNC_MESH))
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def get_drafter_target_lm_head_row_indices(self):
         if not self.enable_drafter or not self.in_drafter_train_group or self.trainer is None:
             return None
