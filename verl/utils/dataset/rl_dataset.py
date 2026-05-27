@@ -141,9 +141,6 @@ class RLHFDataset(Dataset):
         self.shuffle = config.get("shuffle", False)
         self.seed = config.get("seed")
 
-        # For diffusion model training only
-        self.negative_prompt_key = config.get("negative_prompt_key", "negative_prompt")
-
         self._download()
         self._read_files_and_tokenize()
 
@@ -191,68 +188,20 @@ class RLHFDataset(Dataset):
             image_key = self.image_key
             video_key = self.video_key
 
-            def get_apply_kwargs():
-                apply_kwargs = dict(**self.apply_chat_template_kwargs)
-                if self.tool_schemas is not None:
-                    apply_kwargs["tools"] = self.tool_schemas
-                apply_kwargs.pop("tokenize", None)
-                apply_kwargs.pop("return_dict", None)
-                apply_kwargs.pop("return_tensors", None)
-                return apply_kwargs
-
-            def apply_chat_template_for_filter(template_owner, messages, apply_kwargs):
-                try:
-                    from transformers.utils.chat_template_utils import render_jinja_template
-
-                    template_kwargs = dict(apply_kwargs)
-                    tools = template_kwargs.pop("tools", None)
-                    documents = template_kwargs.pop("documents", None)
-                    add_generation_prompt = template_kwargs.pop("add_generation_prompt", True)
-                    continue_final_message = template_kwargs.pop("continue_final_message", False)
-                    return_assistant_tokens_mask = template_kwargs.pop("return_assistant_tokens_mask", False)
-                    if hasattr(template_owner, "get_chat_template"):
-                        chat_template = template_owner.get_chat_template(None, tools)
-                    else:
-                        chat_template = getattr(template_owner, "chat_template", None)
-                    if isinstance(chat_template, dict):
-                        if tools is not None and "tool_use" in chat_template:
-                            chat_template = chat_template["tool_use"]
-                        else:
-                            chat_template = chat_template.get("default")
-                    if chat_template is None:
-                        raise ValueError("chat_template is not set")
-
-                    tokenizer_for_template = getattr(template_owner, "tokenizer", template_owner)
-                    template_kwargs = {
-                        **getattr(tokenizer_for_template, "special_tokens_map", {}),
-                        **template_kwargs,
-                    }
-                    rendered, _ = render_jinja_template(
-                        conversations=[messages],
-                        tools=tools,
-                        documents=documents,
-                        chat_template=chat_template,
-                        return_assistant_tokens_mask=return_assistant_tokens_mask,
-                        continue_final_message=continue_final_message,
-                        add_generation_prompt=add_generation_prompt,
-                        **template_kwargs,
-                    )
-                    return rendered[0]
-                except Exception:
-                    return template_owner.apply_chat_template(
-                        messages,
-                        add_generation_prompt=True,
-                        tokenize=False,
-                        **apply_kwargs,
-                    )
-
             if processor is not None:
                 from verl.utils.dataset.vision_utils import process_image, process_video
 
                 def doc2len(doc) -> int:
                     try:
-                        messages = self._build_messages(doc, key=self.prompt_key)
-                        raw_prompt = apply_chat_template_for_filter(processor, messages, get_apply_kwargs())
+                        messages = self._build_messages(doc)
+                        # pass tool schemas if available so the processor can format prompts
+                        apply_kwargs = dict(**self.apply_chat_template_kwargs)
+                        if self.tool_schemas is not None:
+                            apply_kwargs["tools"] = self.tool_schemas
+
+                        raw_prompt = self.processor.apply_chat_template(
+                            messages, add_generation_prompt=True, tokenize=False, **apply_kwargs
+                        )
                         if image_key in doc and doc[image_key]:
                             images = [
                                 process_image(image, image_patch_size=self.image_patch_size) for image in doc[image_key]
@@ -277,31 +226,11 @@ class RLHFDataset(Dataset):
                             videos = None
                             videos_kwargs = {}
 
-                        if images is None and videos is None:
-                            # only text prompt
-                            return len(
-                                processor.tokenizer(
-                                    text=raw_prompt,
-                                    add_special_tokens=False,  # avoid adding special tokens
-                                    return_attention_mask=False,
-                                )["input_ids"]
-                            )
-                        else:
-                            # multi-modal prompt
-                            processor_kwargs = dict(
-                                text=[raw_prompt],
-                                images=images,
-                                videos=videos,
-                                videos_kwargs=videos_kwargs,
-                            )
-                            try:
-                                output = processor(
-                                    **processor_kwargs,
-                                    return_mm_token_type_ids=False,
-                                )
-                            except TypeError:
-                                output = processor(**processor_kwargs)
-                            return len(output["input_ids"][0])
+                        return len(
+                            processor(text=[raw_prompt], images=images, videos=videos, videos_kwargs=videos_kwargs)[
+                                "input_ids"
+                            ][0]
+                        )
                     except Exception:
                         print("Error processing one of the samples, skipping...")
                         traceback.print_exc()
@@ -311,12 +240,18 @@ class RLHFDataset(Dataset):
 
                 def doc2len(doc) -> int:
                     try:
-                        raw_prompt = apply_chat_template_for_filter(tokenizer, doc[prompt_key], get_apply_kwargs())
-                        tokenized_prompt = tokenizer(
-                            raw_prompt,
-                            add_special_tokens=False,
-                            return_attention_mask=False,
-                        )["input_ids"]
+                        apply_kwargs = dict(**self.apply_chat_template_kwargs)
+                        if self.tool_schemas is not None:
+                            apply_kwargs["tools"] = self.tool_schemas
+
+                        # Keep explicit tokenization to avoid transformers version default changes.
+                        apply_kwargs.pop("tokenize", None)
+                        apply_kwargs.pop("return_dict", None)
+                        apply_kwargs.pop("return_tensors", None)
+
+                        tokenized_prompt = tokenizer.apply_chat_template(
+                            doc[prompt_key], add_generation_prompt=True, tokenize=True, **apply_kwargs
+                        )
                         return len(normalize_token_ids(tokenized_prompt))
                     except Exception:
                         print("Error processing one of the samples, skipping...")
@@ -354,7 +289,7 @@ class RLHFDataset(Dataset):
     def __len__(self):
         return len(self.dataframe)
 
-    def _build_messages(self, example: dict, key: str):
+    def _build_messages(self, example: dict):
         """Replace <image> and <video> placeholder in messages with corresponding image and video
         which is required by processor.apply_chat_template.
         - <image>: {"type": "image", **image}
@@ -366,10 +301,10 @@ class RLHFDataset(Dataset):
         Returns:
             messages: List of messages with replaced placeholder.
         """
-        messages: list = example[key]
-        # When concatenating image and video datasets, get will return None for image or video sample
-        images = example.get(self.image_key, None) or []
-        videos = example.get(self.video_key, None) or []
+        messages: list = example[self.prompt_key]
+        # When concatenating image and video datasets, pop will return None for image or video sample
+        images = example.pop(self.image_key, None) or []
+        videos = example.pop(self.video_key, None) or []
 
         image_offset, video_offset = 0, 0
         for message in messages:
@@ -413,12 +348,7 @@ class RLHFDataset(Dataset):
     def __getitem__(self, item):
         """For rollout, apply_chat_template has been moved to AgentLoop, so we only return raw_prompt here."""
         row_dict: dict = self.dataframe[item]
-        row_dict["raw_prompt"] = self._build_messages(row_dict, key=self.prompt_key)
-        if self.negative_prompt_key in row_dict:
-            row_dict["raw_negative_prompt"] = self._build_messages(row_dict, key=self.negative_prompt_key)
-
-        row_dict.pop(self.image_key, None)
-        row_dict.pop(self.video_key, None)
+        row_dict["raw_prompt"] = self._build_messages(row_dict)
 
         # TODO(wuxibin): We still need a dummy tensor to make sure DataProto.batch is not empty.
         # Remove this after deprecate DataProto by TensorDict.
@@ -429,11 +359,13 @@ class RLHFDataset(Dataset):
             row_dict["extra_info"] = dict()
         index = row_dict.get("extra_info", {}).get("index", 0)
         tools_kwargs = row_dict.get("extra_info", {}).get("tools_kwargs", {})
+        interaction_kwargs = row_dict.get("extra_info", {}).get("interaction_kwargs", {})
         need_tools_kwargs = row_dict.get("extra_info", {}).get("need_tools_kwargs", self.need_tools_kwargs)
         if need_tools_kwargs and not tools_kwargs:
             logger.warning("tools_kwargs is empty for index %s, data source: %s", index, row_dict["data_source"])
         row_dict["index"] = index
         row_dict["tools_kwargs"] = tools_kwargs
+        row_dict["interaction_kwargs"] = interaction_kwargs
         return row_dict
 
     @classmethod
