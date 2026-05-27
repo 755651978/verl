@@ -1,6 +1,7 @@
 import logging
 import json
 import os
+import glob
 import time
 import asyncio
 import random
@@ -414,6 +415,9 @@ class DrafterBaseTrainer:
         self.drafter_train_config = None
         self._pending_target_lm_head_weight = None
         self._target_lm_head_weight_step = None
+        self._cached_target_lm_head_row_indices = None
+        self._training_timing_accumulator = {}
+        self._training_timing_steps = 0
         self._frozen_param_names = {"model.embed_tokens.weight"}
 
         # Ulysses Sequence Parallelism configuration. EAGLE/EAGLE3 can slice
@@ -441,6 +445,21 @@ class DrafterBaseTrainer:
 
         self.checkpoint_dir = self.config.rollout.drafter.get("checkpoint_path")
         self.step = self.config.rollout.drafter.training.step
+
+    def reset_training_timing_stats(self) -> None:
+        self._training_timing_accumulator = {}
+        self._training_timing_steps = 0
+
+    def _add_training_timing(self, name: str, elapsed_sec: float) -> None:
+        self._training_timing_accumulator[name] = self._training_timing_accumulator.get(name, 0.0) + float(elapsed_sec)
+
+    def get_training_timing_stats(self) -> dict[str, float]:
+        stats = {
+            f"training_{name}_elapsed_sec": value
+            for name, value in self._training_timing_accumulator.items()
+        }
+        stats["training_timed_steps"] = float(self._training_timing_steps)
+        return stats
 
     def _create_copy_stream(self):
         if device_name == "cpu":
@@ -802,7 +821,11 @@ class DrafterBaseTrainer:
             self._training_active = False
             return False
 
-    def sync_target_lm_head_weight(self, weight: torch.Tensor, global_step: Optional[int] = None) -> dict[str, Any]:
+    def sync_target_lm_head_weight(
+        self,
+        weight: torch.Tensor,
+        global_step: Optional[int] = None,
+    ) -> dict[str, Any]:
         """Update the frozen target lm_head used by last-hidden drafter training."""
         if weight is None or not torch.is_tensor(weight):
             return {"accepted": False, "applied": False, "reason": "missing_weight"}
@@ -817,6 +840,112 @@ class DrafterBaseTrainer:
             "global_step": global_step,
             "shape": tuple(self._pending_target_lm_head_weight.shape),
         }
+
+    def get_target_lm_head_row_indices(self) -> Optional[dict[str, Any]]:
+        """Return target lm_head row indices needed by the current drafter loss."""
+        if getattr(self.backend, "model_type", None) != "eagle3":
+            return None
+        if self.model is not None:
+            draft_model = self.model.module if hasattr(self.model, "module") else self.model
+            t2d = getattr(draft_model, "t2d", None)
+            row_info = self._build_target_lm_head_row_indices_from_t2d(t2d)
+            if row_info is not None:
+                self._cached_target_lm_head_row_indices = row_info
+            return row_info
+        if self._cached_target_lm_head_row_indices is not None:
+            return self._cached_target_lm_head_row_indices
+
+        row_info = self._load_target_lm_head_row_indices_from_checkpoint()
+        if row_info is not None:
+            self._cached_target_lm_head_row_indices = row_info
+        return row_info
+
+    def _build_target_lm_head_row_indices_from_t2d(self, t2d: Optional[torch.Tensor]) -> Optional[dict[str, Any]]:
+        if t2d is None or not torch.is_tensor(t2d):
+            return None
+
+        t2d_cpu = t2d.detach().to(device="cpu", dtype=torch.bool).flatten()
+        source_vocab_size = int(t2d_cpu.numel())
+        row_indices = torch.nonzero(t2d_cpu, as_tuple=False).flatten().to(dtype=torch.long).contiguous()
+        selected_rows = int(row_indices.numel())
+        if selected_rows <= 0 or selected_rows >= source_vocab_size:
+            return None
+        return {
+            "row_indices": row_indices,
+            "source_vocab_size": source_vocab_size,
+            "selected_rows": selected_rows,
+        }
+
+    def _load_target_lm_head_row_indices_from_checkpoint(self) -> Optional[dict[str, Any]]:
+        model_path = self.config.rollout.drafter.get("model_path")
+        if not model_path or not os.path.isdir(model_path):
+            return None
+        try:
+            t2d = self._load_checkpoint_tensor(model_path, "t2d")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Failed to load EAGLE3 t2d from drafter checkpoint %s: %s", model_path, exc)
+            return None
+        row_info = self._build_target_lm_head_row_indices_from_t2d(t2d)
+        if row_info is not None:
+            logger.warning(
+                "[drafter target lm_head rows] loaded t2d from checkpoint model_path=%s "
+                "target_vocab=%s selected_rows=%s",
+                model_path,
+                row_info["source_vocab_size"],
+                row_info["selected_rows"],
+            )
+        return row_info
+
+    def _load_checkpoint_tensor(self, model_path: str, logical_name: str) -> torch.Tensor:
+        index_paths = glob.glob(os.path.join(model_path, "*.index.json"))
+        if len(index_paths) > 1:
+            raise FileNotFoundError(f"Multiple index.json files found in {model_path}")
+        if index_paths:
+            with open(index_paths[0], "r") as f:
+                index_json = json.load(f)
+            weight_map = index_json.get("weight_map", {})
+            selected_key = self._select_checkpoint_tensor_key(weight_map.keys(), logical_name)
+            if selected_key is None:
+                raise KeyError(f"Cannot find {logical_name} in checkpoint index {index_paths[0]}")
+            ckpt_file = os.path.join(model_path, weight_map[selected_key])
+            return self._load_tensor_from_checkpoint_file(ckpt_file, selected_key)
+
+        for filename in ("model.safetensors", "pytorch_model.bin"):
+            ckpt_file = os.path.join(model_path, filename)
+            if os.path.exists(ckpt_file):
+                return self._load_tensor_from_checkpoint_file(ckpt_file, logical_name)
+        raise FileNotFoundError(f"No model index, model.safetensors or pytorch_model.bin found in {model_path}")
+
+    @staticmethod
+    def _select_checkpoint_tensor_key(keys, logical_name: str) -> Optional[str]:
+        keys = list(keys)
+        if logical_name in keys:
+            return logical_name
+        suffix = f".{logical_name}"
+        return next((key for key in keys if str(key).endswith(suffix)), None)
+
+    def _load_tensor_from_checkpoint_file(self, ckpt_file: str, logical_name: str) -> torch.Tensor:
+        if ckpt_file.endswith(".safetensors"):
+            from safetensors import safe_open
+
+            with safe_open(ckpt_file, framework="pt", device="cpu") as f:
+                selected_key = self._select_checkpoint_tensor_key(f.keys(), logical_name)
+                if selected_key is None:
+                    raise KeyError(f"Cannot find {logical_name} in {ckpt_file}")
+                return f.get_tensor(selected_key)
+
+        try:
+            state_dict = torch.load(ckpt_file, map_location="cpu", weights_only=True)
+        except TypeError:
+            state_dict = torch.load(ckpt_file, map_location="cpu")
+        if isinstance(state_dict, dict) and "state_dict" in state_dict and isinstance(state_dict["state_dict"], dict):
+            state_dict = state_dict["state_dict"]
+        if not isinstance(state_dict, dict):
+            raise TypeError(f"Unsupported checkpoint object type for {ckpt_file}: {type(state_dict)}")
+        selected_key = self._select_checkpoint_tensor_key(state_dict.keys(), logical_name)
+        if selected_key is None:
+            raise KeyError(f"Cannot find {logical_name} in {ckpt_file}")
+        return state_dict[selected_key]
 
     def _target_lm_head_module(self):
         target_model = getattr(self.backend, "target_model", None)
@@ -839,10 +968,13 @@ class DrafterBaseTrainer:
         target_weight = lm_head.weight
         source_weight = self._pending_target_lm_head_weight
         if tuple(source_weight.shape) != tuple(target_weight.shape):
-            raise ValueError(
-                "Target lm_head weight shape mismatch for drafter training: "
-                f"source={tuple(source_weight.shape)}, target={tuple(target_weight.shape)}"
-            )
+            lm_head = self._resize_target_lm_head_to_weight(lm_head, source_weight)
+            target_weight = lm_head.weight
+            if tuple(source_weight.shape) != tuple(target_weight.shape):
+                raise ValueError(
+                    "Target lm_head weight shape mismatch for drafter training: "
+                    f"source={tuple(source_weight.shape)}, target={tuple(target_weight.shape)}"
+                )
 
         target_weight.copy_(source_weight.to(device=target_weight.device, dtype=target_weight.dtype, non_blocking=True))
         lm_head.requires_grad_(False)
@@ -854,6 +986,42 @@ class DrafterBaseTrainer:
             target_weight.device,
         )
         return True
+
+    def _resize_target_lm_head_to_weight(self, lm_head, source_weight: torch.Tensor):
+        if source_weight.dim() != 2 or int(source_weight.shape[1]) != int(lm_head.in_features):
+            return lm_head
+        new_vocab_size = int(source_weight.shape[0])
+        if new_vocab_size == int(lm_head.out_features):
+            return lm_head
+
+        new_head = torch.nn.Linear(
+            lm_head.in_features,
+            new_vocab_size,
+            bias=False,
+            device=lm_head.weight.device,
+            dtype=lm_head.weight.dtype,
+        )
+        new_head.requires_grad_(False)
+
+        target_model = getattr(self.backend, "target_model", None)
+        target_lm_head = getattr(self.backend, "target_lm_head", None)
+        if target_model is not None and getattr(target_model, "fc", None) is lm_head:
+            target_model.fc = new_head
+            logger.warning(
+                "[drafter target lm_head sync] resized target_model.fc from out_features=%s to out_features=%s",
+                lm_head.out_features,
+                new_vocab_size,
+            )
+            return target_model.fc
+        if target_lm_head is not None and getattr(target_lm_head, "fc", None) is lm_head:
+            target_lm_head.fc = new_head
+            logger.warning(
+                "[drafter target lm_head sync] resized target_lm_head.fc from out_features=%s to out_features=%s",
+                lm_head.out_features,
+                new_vocab_size,
+            )
+            return target_lm_head.fc
+        return lm_head
 
     def collect_online_data(self, batch: dict, hidden_states: torch.Tensor, target_logprobs: List = None) -> None:
         """Collect online data from inference for Eagle training.
@@ -1746,23 +1914,41 @@ class DrafterBaseTrainer:
             )
             return False
 
+        step_start_ts = time.perf_counter()
+        step_timing = {}
+
+        def finish_step(success: bool) -> bool:
+            step_timing["total"] = time.perf_counter() - step_start_ts
+            for timing_name, elapsed in step_timing.items():
+                self._add_training_timing(timing_name, elapsed)
+            self._training_timing_steps += 1
+            return success
+
+        prepare_ts = time.perf_counter()
         with self._ulysses_group_context():
             batch = self._prepare_training_batch()
+        step_timing["prepare_batch"] = time.perf_counter() - prepare_ts
+        readiness_ts = time.perf_counter()
         if not self._sync_batch_readiness(batch is not None):
+            step_timing["batch_readiness"] = time.perf_counter() - readiness_ts
             logger.debug(f"[EagleTrainer rank {self.rank}] Skipping step {step} due to missing drafter batch")
-            return False
+            return finish_step(False)
+        step_timing["batch_readiness"] = time.perf_counter() - readiness_ts
         if batch is None:
             logger.debug(
                 f"[EagleTrainer rank {self.rank}] Not enough data at step {step} "
                 f"(have={len(self.collected_data)} need>={self.batch_size})"
             )
-            return False
+            return finish_step(False)
         
         # 开启训练模式
+        zero_grad_ts = time.perf_counter()
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
+        step_timing["zero_grad"] = time.perf_counter() - zero_grad_ts
 
         # 前向传播
+        forward_loss_ts = time.perf_counter()
         with self._ulysses_group_context():
             with torch.amp.autocast(device_type=device_name, dtype=torch.bfloat16):
                 loss_dict = self.backend.compute_loss(self.model, batch, self._current_pad_size)
@@ -1770,8 +1956,10 @@ class DrafterBaseTrainer:
                 l_v = loss_dict["total_local_vloss"]
                 l_p = loss_dict["total_local_ploss"]
                 l_n = loss_dict["local_num_tokens"]
+        step_timing["forward_loss"] = time.perf_counter() - forward_loss_ts
 
         # 分布式同步（Global Reduction）,如果使用序列并行，仅在这里进行一次标量同步
+        reduce_ts = time.perf_counter()
         sp_group = self._get_sp_group()
         dp_group = self._get_dp_group()
         if sp_group is not None and self._get_sp_world_size() > 1:
@@ -1790,13 +1978,14 @@ class DrafterBaseTrainer:
             global_vloss, global_ploss, global_tokens = metrics[0], metrics[1], metrics[2]
         else:
             global_vloss, global_ploss, global_tokens = l_v, l_p, l_n
+        step_timing["metric_reduce"] = time.perf_counter() - reduce_ts
         
         # 最终 Loss 平滑处理
         if float(global_tokens.detach().float().item()) <= 0:
             logger.warning(
                 f"Step {self.training_steps + 1}: no finite drafter target tokens, skipping optimizer step"
             )
-            return False
+            return finish_step(False)
 
         denom = global_tokens.clamp(min=1.0)
         vloss = global_vloss / denom
@@ -1812,12 +2001,15 @@ class DrafterBaseTrainer:
                 f"ploss={float(ploss.detach().float().item())}, "
                 f"tokens={float(global_tokens.detach().float().item())}"
             )
-            return False
+            return finish_step(False)
 
         # 反向传播
+        backward_ts = time.perf_counter()
         loss.backward()
+        step_timing["backward"] = time.perf_counter() - backward_ts
 
         # 更新权重
+        optimizer_ts = time.perf_counter()
         grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         if not torch.isfinite(grad_norm):
             logger.error(
@@ -1825,18 +2017,20 @@ class DrafterBaseTrainer:
                 f"grad_norm={float(grad_norm.detach().float().item())}"
             )
             self.optimizer.zero_grad(set_to_none=True)
-            return False
+            step_timing["optimizer"] = time.perf_counter() - optimizer_ts
+            return finish_step(False)
         self.optimizer.step()
         if self.lr_scheduler is not None:
             self.lr_scheduler.step()
         self.optimizer.zero_grad(set_to_none=True)
+        step_timing["optimizer"] = time.perf_counter() - optimizer_ts
 
         self.training_steps += 1
         if self.training_steps % 10 == 0:
             logger.info(
                 f"Step {self.training_steps}: loss={float(loss.item()):.4f}, vloss={float(vloss.item()):.4f}, ploss={float(ploss.item()):.4f}"
             )
-        return True
+        return finish_step(True)
     
     def increment_rl_step(self, global_step: Optional[int] = None):
         """Increment the RL step counter in the data buffer.

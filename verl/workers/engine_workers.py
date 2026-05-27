@@ -707,7 +707,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         return output.cpu() if output is not None else None
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def get_actor_lm_head_weight(self):
+    def get_actor_lm_head_weight(self, row_indices: Optional[torch.Tensor] = None):
         if not self._is_actor or self.actor is None:
             return None
 
@@ -742,14 +742,29 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             logger.warning("Unable to find actor lm_head.weight or tied model.embed_tokens.weight for drafter sync")
             return None
 
+        selected_rows = None
+        source_vocab_size = int(selected_weight.shape[0])
+        if row_indices is not None:
+            row_indices = row_indices.detach().to(device=selected_weight.device, dtype=torch.long)
+            if row_indices.numel() > 0 and row_indices.numel() < source_vocab_size:
+                selected_weight = selected_weight.index_select(0, row_indices)
+                selected_rows = int(row_indices.numel())
+            elif row_indices.numel() == 0:
+                logger.warning("Received empty lm_head row_indices for drafter sync; falling back to full lm_head export")
+
         weight = selected_weight.detach().to(device="cpu", dtype=torch.bfloat16).contiguous()
         logger.warning(
-            "[actor lm_head export] name=%s shape=%s dtype=%s",
+            "[actor lm_head export] name=%s shape=%s dtype=%s source_vocab=%s selected_rows=%s",
             selected_name,
             tuple(weight.shape),
             weight.dtype,
+            source_vocab_size,
+            selected_rows,
         )
-        return {"name": selected_name, "weight": weight}
+        return {
+            "name": selected_name,
+            "weight": weight,
+        }
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     async def update_draft_weights(self, weights: dict[str, torch.Tensor], global_steps: int = None):
@@ -1084,6 +1099,20 @@ class DrafterWorker(Worker):
             )
         return result
 
+    @register(dispatch_mode=make_nd_compute_dispatch_fn(mesh_name=DRAFTER_TARGET_SYNC_MESH))
+    def get_drafter_target_lm_head_row_indices(self):
+        if not self.enable_drafter or not self.in_drafter_train_group or self.trainer is None:
+            return None
+        result = self.trainer.get_target_lm_head_row_indices()
+        if result is not None and self.is_drafter_group_leader:
+            logger.warning(
+                "[drafter target lm_head rows] replica=%s target_vocab=%s selected_rows=%s",
+                self.replica_rank,
+                result.get("source_vocab_size"),
+                result.get("selected_rows"),
+            )
+        return result
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def train_drafter(self):
         result = {
@@ -1114,23 +1143,30 @@ class DrafterWorker(Worker):
             result["triggered"] = True
             start_ts = time.time()
             self.trainer.clear_pending_publish_state_dict()
+            self.trainer.reset_training_timing_stats()
+            activation_ts = time.time()
             success = await self.trainer.activate_training_model()
+            result["activation_elapsed_sec"] = time.time() - activation_ts
             if not success:
                 logger.error(
                     f"[DrafterWorker replica={self.replica_rank}] failed to activate trainer at step {self.last_global_step}"
                 )
                 self.trainer.clear_pending_publish_state_dict()
+                cleanup_ts = time.time()
                 await self.trainer.cleanup_training(clear_data=False)
+                result["cleanup_elapsed_sec"] = time.time() - cleanup_ts
                 result["reason"] = "activation_failed"
                 result["elapsed_sec"] = time.time() - start_ts
                 return result
 
             try:
+                train_loop_ts = time.time()
                 for _ in range(self.train_steps_per_trigger):
                     result["attempted_steps"] += 1
                     step_ok = await self.trainer.training_step(self.last_global_step)
                     if step_ok:
                         result["successful_steps"] += 1
+                result["training_loop_elapsed_sec"] = time.time() - train_loop_ts
                 if result["successful_steps"] > 0:
                     should_prepare_publish = (
                         self.publish_interval_steps <= 0
@@ -1146,13 +1182,16 @@ class DrafterWorker(Worker):
                 else:
                     self.trainer.clear_pending_publish_state_dict()
             finally:
+                cleanup_ts = time.time()
                 await self.trainer.cleanup_training(clear_data=result["successful_steps"] > 0)
+                result["cleanup_elapsed_sec"] = time.time() - cleanup_ts
 
             result["trained"] = result["successful_steps"] > 0
             result["reason"] = "trained" if result["trained"] else "no_trainable_batch"
             if result["trained"]:
                 self.last_trained_step = self.last_global_step
             result["elapsed_sec"] = time.time() - start_ts
+            result.update(self.trainer.get_training_timing_stats())
             return result
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)

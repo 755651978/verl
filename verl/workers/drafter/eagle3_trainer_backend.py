@@ -938,8 +938,15 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
     def _compute_target_p(self, target_scores, t2d, loss_mask):
         loss_mask = loss_mask.to(device=target_scores.device)
         t2d = t2d.to(device=target_scores.device, dtype=torch.bool)
-        target_subset_scores = target_scores
-        target_subset_scores = target_subset_scores[..., t2d]
+        if target_scores.size(-1) == t2d.numel():
+            target_subset_scores = target_scores[..., t2d]
+        elif target_scores.size(-1) == int(t2d.sum().detach().item()):
+            target_subset_scores = target_scores
+        else:
+            raise ValueError(
+                "EAGLE3 target score vocab size mismatch: "
+                f"target_scores={target_scores.size(-1)}, target_vocab={t2d.numel()}, draft_vocab={int(t2d.sum().detach().item())}"
+            )
         if target_subset_scores.size(-1) == 0:
             raise ValueError("EAGLE3 target-to-draft vocab mask selects zero tokens")
         finite_target_mask = torch.isfinite(target_subset_scores).any(dim=-1)

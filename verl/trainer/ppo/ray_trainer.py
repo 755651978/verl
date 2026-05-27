@@ -1000,13 +1000,45 @@ class RayPPOTrainer:
         ray.get(pending_refs)
         return len(pending_refs)
 
-    def _get_actor_lm_head_payload(self) -> Optional[dict[str, torch.Tensor]]:
+    def _get_drafter_target_lm_head_row_selection(self) -> Optional[dict[str, Any]]:
+        if not self.use_drafter or self.drafter_wg is None:
+            return None
+        if self.config.actor_rollout_ref.rollout.drafter.training.get("use_logits", False):
+            return None
+        row_infos = self.drafter_wg.get_drafter_target_lm_head_row_indices() or []
+        non_null_infos = [info for info in row_infos if isinstance(info, dict) and info.get("row_indices") is not None]
+        if not non_null_infos:
+            return None
+        first = non_null_infos[0]
+        first_rows = first.get("row_indices")
+        for info in non_null_infos[1:]:
+            first_selected = int(first.get("selected_rows", -1))
+            other_selected = int(info.get("selected_rows", -2))
+            first_vocab = int(first.get("source_vocab_size", -1))
+            other_vocab = int(info.get("source_vocab_size", -2))
+            if other_selected != first_selected or other_vocab != first_vocab:
+                raise RuntimeError(
+                    "Inconsistent drafter target lm_head row selection across replicas: "
+                    f"first=({first_selected}/{first_vocab}), other=({other_selected}/{other_vocab})"
+                )
+            other_rows = info.get("row_indices")
+            if torch.is_tensor(first_rows) and torch.is_tensor(other_rows) and not torch.equal(first_rows, other_rows):
+                raise RuntimeError("Inconsistent drafter target lm_head row indices across replicas.")
+        return first
+
+    def _get_actor_lm_head_payload(
+        self,
+        row_selection: Optional[dict[str, Any]] = None,
+    ) -> Optional[dict[str, torch.Tensor]]:
         if not self.use_drafter or self.drafter_wg is None:
             return None
         if self.config.actor_rollout_ref.rollout.drafter.training.get("use_logits", False):
             return None
 
-        lm_head_payloads = self.actor_rollout_wg.get_actor_lm_head_weight() or []
+        row_indices = None
+        if row_selection is not None:
+            row_indices = row_selection.get("row_indices")
+        lm_head_payloads = self.actor_rollout_wg.get_actor_lm_head_weight(row_indices=row_indices) or []
         non_null_payloads = [payload for payload in lm_head_payloads if payload is not None]
         if not non_null_payloads:
             return None
@@ -1031,7 +1063,8 @@ class RayPPOTrainer:
         return payload_buckets, global_step_buckets
 
     def _sync_drafter_target_lm_head(self) -> int:
-        payload = self._get_actor_lm_head_payload()
+        row_selection = self._get_drafter_target_lm_head_row_selection()
+        payload = self._get_actor_lm_head_payload(row_selection=row_selection)
         if payload is None:
             return 0
 
@@ -1110,6 +1143,21 @@ class RayPPOTrainer:
         summary["drafter/publish_snapshot_elapsed_sec"] = max(
             float(r.get("publish_snapshot_elapsed_sec", 0.0)) for r in normalized_results
         )
+        for raw_key in (
+            "activation_elapsed_sec",
+            "training_loop_elapsed_sec",
+            "cleanup_elapsed_sec",
+            "training_prepare_batch_elapsed_sec",
+            "training_batch_readiness_elapsed_sec",
+            "training_zero_grad_elapsed_sec",
+            "training_forward_loss_elapsed_sec",
+            "training_metric_reduce_elapsed_sec",
+            "training_backward_elapsed_sec",
+            "training_optimizer_elapsed_sec",
+            "training_total_elapsed_sec",
+            "training_timed_steps",
+        ):
+            summary[f"drafter/{raw_key}"] = max(float(r.get(raw_key, 0.0)) for r in normalized_results)
         return summary
 
     def _save_checkpoint(self):
