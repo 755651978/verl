@@ -423,6 +423,8 @@ class DrafterBaseTrainer:
         self._cached_target_lm_head_row_indices = None
         self._training_timing_accumulator = {}
         self._training_timing_steps = 0
+        self._training_metric_sums = {}
+        self._training_metric_steps = 0
         self._frozen_param_names = {"model.embed_tokens.weight"}
 
         # Ulysses Sequence Parallelism configuration. EAGLE/EAGLE3 can slice
@@ -469,6 +471,94 @@ class DrafterBaseTrainer:
             and getattr(self.training_device_mesh, "mesh_dim_names", None) is not None
             and dim_name in self.training_device_mesh.mesh_dim_names
         )
+
+    def reset_training_metrics(self) -> None:
+        self._training_metric_sums = {}
+        self._training_metric_steps = 0
+
+    def get_training_metrics(self) -> dict[str, float]:
+        sums = dict(self._training_metric_sums)
+        steps = max(int(self._training_metric_steps), 1)
+        metrics: dict[str, float] = {}
+        correct = sums.get("dflash/correct_count", 0.0)
+        eval_tokens = sums.get("dflash/eval_token_count", 0.0)
+        if eval_tokens > 0:
+            metrics["dflash/accuracy"] = correct / eval_tokens
+        for key in (
+            "dflash/valid_token_count",
+            "dflash/weighted_token_count",
+            "dflash/sanitized_rows",
+            "dflash/masked_rows",
+            "dflash/sampled_vocab_size",
+            "dflash/loss_mode_id",
+        ):
+            if key in sums:
+                metrics[key] = sums[key] / steps
+        metrics["dflash/metric_steps"] = float(self._training_metric_steps)
+
+        for pos in range(int(self.config.rollout.drafter.training.get("dflash_block_size", 16))):
+            count_key = f"dflash/count_per_position/{pos}"
+            count = sums.get(count_key, 0.0)
+            if count <= 0:
+                continue
+            metrics[count_key] = count / steps
+            loss_sum = sums.get(f"dflash/loss_sum_per_position/{pos}", 0.0)
+            correct_sum = sums.get(f"dflash/correct_per_position/{pos}", 0.0)
+            metrics[f"dflash/loss_per_position/{pos}"] = loss_sum / count
+            metrics[f"dflash/accuracy_per_position/{pos}"] = correct_sum / count
+        return metrics
+
+    def _reduce_training_metric(self, value: torch.Tensor) -> torch.Tensor:
+        reduced = value.detach().float().clone()
+        sp_group = self._get_sp_group()
+        dp_group = self._get_dp_group()
+        if sp_group is not None and self._get_sp_world_size() > 1:
+            dist.all_reduce(reduced, group=sp_group)
+            if dp_group is not None and self._get_dp_world_size() > 1:
+                dist.all_reduce(reduced, group=dp_group)
+        elif dp_group is not None and self._get_dp_world_size() > 1:
+            dist.all_reduce(reduced, group=dp_group)
+        elif self.training_device_mesh is not None and self.training_device_mesh.size() > 1:
+            dist.all_reduce(reduced, group=self.training_device_mesh.get_group())
+        return reduced
+
+    def _record_dflash_training_metrics(self, loss_dict: dict[str, Any]) -> None:
+        diagnostics = loss_dict.get("diagnostics")
+        if not isinstance(diagnostics, dict):
+            return
+        self._training_metric_steps += 1
+        scalar_keys = {
+            "correct_count": "dflash/correct_count",
+            "eval_token_count": "dflash/eval_token_count",
+            "valid_token_count": "dflash/valid_token_count",
+            "weighted_token_count": "dflash/weighted_token_count",
+            "sanitized_rows": "dflash/sanitized_rows",
+            "masked_rows": "dflash/masked_rows",
+            "sampled_vocab_size": "dflash/sampled_vocab_size",
+            "loss_mode_id": "dflash/loss_mode_id",
+        }
+        for source_key, metric_key in scalar_keys.items():
+            value = diagnostics.get(source_key)
+            if not torch.is_tensor(value):
+                continue
+            reduced = self._reduce_training_metric(value.reshape(()))
+            self._training_metric_sums[metric_key] = self._training_metric_sums.get(metric_key, 0.0) + float(
+                reduced.cpu().item()
+            )
+
+        vector_keys = {
+            "loss_sum_per_position": "dflash/loss_sum_per_position",
+            "correct_per_position": "dflash/correct_per_position",
+            "count_per_position": "dflash/count_per_position",
+        }
+        for source_key, metric_prefix in vector_keys.items():
+            value = diagnostics.get(source_key)
+            if not torch.is_tensor(value):
+                continue
+            reduced = self._reduce_training_metric(value)
+            for idx, item in enumerate(reduced.detach().cpu().tolist()):
+                metric_key = f"{metric_prefix}/{idx}"
+                self._training_metric_sums[metric_key] = self._training_metric_sums.get(metric_key, 0.0) + float(item)
 
     def _get_sp_group(self):
         if self._has_mesh_dim("sp"):
@@ -1982,6 +2072,7 @@ class DrafterBaseTrainer:
                 l_v = loss_dict["total_local_vloss"]
                 l_p = loss_dict["total_local_ploss"]
                 l_n = loss_dict["local_num_tokens"]
+                self._record_dflash_training_metrics(loss_dict)
 
         # 分布式同步（Global Reduction）,如果使用序列并行，仅在这里进行一次标量同步
         sp_group = self._get_sp_group()

@@ -67,13 +67,23 @@ class DFlashTrainingModel(nn.Module):
 
     _no_split_modules = ["DFlashDecoderLayer"]
 
-    def __init__(self, draft_model: DFlashDraftModel, block_size: int = 16, num_anchors: int = 512, loss_decay_gamma: float = 7.0):
+    def __init__(
+        self,
+        draft_model: DFlashDraftModel,
+        block_size: int = 16,
+        num_anchors: int = 512,
+        loss_decay_gamma: float = 7.0,
+        loss_mode: str = "full_vocab",
+        sampled_ce_negatives: int = 0,
+    ):
         super().__init__()
         self.draft_model = draft_model
         self.config = draft_model.config
         self.block_size = block_size
         self.num_anchors = num_anchors
         self.loss_decay_gamma = loss_decay_gamma
+        self.loss_mode = str(loss_mode or "full_vocab")
+        self.sampled_ce_negatives = max(int(sampled_ce_negatives), 0)
         self._tensor_template_cache: dict[tuple, torch.Tensor] = {}
 
     def _cached_arange(self, name: str, length: int, device: torch.device, *, view_shape: tuple[int, ...] | None = None):
@@ -152,6 +162,24 @@ class DFlashTrainingModel(nn.Module):
         )
         return self.draft_model.embed_tokens(noise_ids)
 
+    def _build_restricted_vocab(self, input_ids: torch.Tensor, active_targets: torch.Tensor, vocab_size: int) -> torch.Tensor:
+        candidates = [active_targets]
+        flat_input_ids = input_ids.reshape(-1)
+        flat_input_ids = flat_input_ids[(flat_input_ids >= 0) & (flat_input_ids < vocab_size)]
+        if flat_input_ids.numel() > 0:
+            candidates.append(flat_input_ids)
+        if self.loss_mode == "sampled_ce" and self.sampled_ce_negatives > 0:
+            candidates.append(
+                torch.randint(
+                    low=0,
+                    high=vocab_size,
+                    size=(self.sampled_ce_negatives,),
+                    dtype=torch.long,
+                    device=input_ids.device,
+                )
+            )
+        return torch.unique(torch.cat(candidates), sorted=True)
+
     def forward(self, input_ids: torch.Tensor, hidden_states_list: list[torch.Tensor], loss_mask: torch.Tensor, lm_head_weight: torch.Tensor):
         bsz, seq_len = input_ids.shape
         device = input_ids.device
@@ -181,8 +209,6 @@ class DFlashTrainingModel(nn.Module):
             block_mask=block_mask,
             noise_embedding=noise_embedding,
         )
-        logits = F.linear(draft_hidden, lm_head_weight)
-
         label_offsets = self._cached_arange("label_offsets", self.block_size, device, view_shape=(1, 1, -1))
         label_indices = anchor_positions.unsqueeze(-1) + label_offsets
         valid_label_mask = label_indices < seq_len
@@ -201,25 +227,84 @@ class DFlashTrainingModel(nn.Module):
             decay_weights = self._cached_decay_weights(device)
             weight_mask = weight_mask * decay_weights
 
-        flat_logits = logits.view(-1, logits.size(-1))
         flat_targets = target_ids.view(-1)
         flat_weights = weight_mask.view(-1)
-        loss_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
-        valid_token_count = flat_weights.sum().clamp(min=1e-6)
-        loss = (loss_per_token * flat_weights).sum() / valid_token_count
+        active_mask = flat_weights > 0
+        flat_hidden = draft_hidden.view(-1, draft_hidden.size(-1))
+        active_hidden = flat_hidden[active_mask]
+        active_targets = flat_targets[active_mask]
+        active_weights = flat_weights[active_mask]
+        loss_per_token = torch.zeros_like(flat_weights)
+
+        sanitized_rows = torch.zeros((), dtype=torch.float32, device=device)
+        if active_targets.numel() == 0:
+            loss = flat_weights.sum() * 0.0
+        elif self.loss_mode in {"restricted_ce", "sampled_ce"}:
+            vocab_size = int(lm_head_weight.shape[0])
+            restricted_vocab = self._build_restricted_vocab(input_ids, active_targets, vocab_size)
+            restricted_weight = lm_head_weight.index_select(0, restricted_vocab)
+            active_logits = F.linear(active_hidden, restricted_weight)
+            active_ce_targets = torch.searchsorted(restricted_vocab, active_targets)
+            active_loss = F.cross_entropy(active_logits, active_ce_targets, reduction="none")
+            finite_loss = torch.isfinite(active_loss)
+            sanitized_rows = (~finite_loss).sum().to(dtype=torch.float32)
+            active_loss = torch.where(finite_loss, active_loss, torch.zeros_like(active_loss))
+            active_loss_weights = active_weights * finite_loss.to(dtype=active_weights.dtype)
+            loss_per_token[active_mask] = active_loss
+            valid_token_count = active_loss_weights.sum().clamp(min=1e-6)
+            loss = (active_loss * active_loss_weights).sum() / valid_token_count
+        else:
+            active_logits = F.linear(active_hidden, lm_head_weight)
+            active_loss = F.cross_entropy(active_logits, active_targets, reduction="none")
+            finite_loss = torch.isfinite(active_loss)
+            sanitized_rows = (~finite_loss).sum().to(dtype=torch.float32)
+            active_loss = torch.where(finite_loss, active_loss, torch.zeros_like(active_loss))
+            active_loss_weights = active_weights * finite_loss.to(dtype=active_weights.dtype)
+            loss_per_token[active_mask] = active_loss
+            valid_token_count = active_loss_weights.sum().clamp(min=1e-6)
+            loss = (active_loss * active_loss_weights).sum() / valid_token_count
 
         with torch.no_grad():
-            pred_ids = torch.argmax(flat_logits, dim=-1)
-            correct = (pred_ids == flat_targets) & (binary_eval_mask > 0.5)
+            correct = torch.zeros_like(binary_eval_mask, dtype=torch.bool)
+            if active_targets.numel() > 0:
+                if self.loss_mode in {"restricted_ce", "sampled_ce"}:
+                    active_pred_ids = restricted_vocab[torch.argmax(active_logits, dim=-1)]
+                else:
+                    active_pred_ids = torch.argmax(active_logits, dim=-1)
+                correct[active_mask] = active_pred_ids == active_targets
             actual_token_count = binary_eval_mask.sum().clamp(min=1e-6)
             accuracy = correct.sum().float() / actual_token_count
             binary_weights = binary_eval_mask.view(bsz, n_blocks, self.block_size)
             count_per_position = binary_weights.sum(dim=(0, 1))
             count_per_pos = count_per_position.clamp(min=1.0)
-            loss_per_position = (loss_per_token.view(bsz, n_blocks, self.block_size) * binary_weights).sum(dim=(0, 1)) / count_per_pos
-            acc_per_position = correct.view(bsz, n_blocks, self.block_size).float().sum(dim=(0, 1)) / count_per_pos
+            loss_sum_per_position = (loss_per_token.view(bsz, n_blocks, self.block_size) * binary_weights).sum(dim=(0, 1))
+            correct_per_position = correct.view(bsz, n_blocks, self.block_size).float().sum(dim=(0, 1))
+            loss_per_position = loss_sum_per_position / count_per_pos
+            acc_per_position = correct_per_position / count_per_pos
+            masked_rows = (binary_eval_mask <= 0.5).sum().to(dtype=torch.float32)
+            diagnostics = {
+                "correct_count": correct.sum().float(),
+                "eval_token_count": binary_eval_mask.sum().float(),
+                "valid_token_count": binary_eval_mask.sum().float(),
+                "weighted_token_count": flat_weights.sum().float(),
+                "sanitized_rows": sanitized_rows,
+                "masked_rows": masked_rows,
+                "loss_sum_per_position": loss_sum_per_position,
+                "correct_per_position": correct_per_position,
+                "count_per_position": count_per_position,
+                "sampled_vocab_size": torch.tensor(
+                    float(restricted_vocab.numel()) if self.loss_mode in {"restricted_ce", "sampled_ce"} and active_targets.numel() > 0 else float(lm_head_weight.shape[0]),
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                "loss_mode_id": torch.tensor(
+                    {"full_vocab": 0.0, "restricted_ce": 1.0, "sampled_ce": 2.0}.get(self.loss_mode, 0.0),
+                    dtype=torch.float32,
+                    device=device,
+                ),
+            }
 
-        return loss, accuracy, loss_per_position, acc_per_position, count_per_position
+        return loss, accuracy, loss_per_position, acc_per_position, count_per_position, diagnostics
 
 
 class DFlashTrainerBackend:
@@ -519,6 +604,8 @@ class DFlashTrainerBackend:
             block_size=int(training_cfg.get("dflash_block_size", 16)),
             num_anchors=int(training_cfg.get("dflash_num_anchors", 512)),
             loss_decay_gamma=float(training_cfg.get("dflash_loss_decay_gamma", 7.0)),
+            loss_mode=str(training_cfg.get("dflash_loss_mode", "full_vocab")),
+            sampled_ce_negatives=int(training_cfg.get("dflash_sampled_ce_negatives", 0)),
         ), drafter_config
 
     def _build_target_lm_head(self, target_model_path: str, target_hf_config=None):
@@ -608,7 +695,7 @@ class DFlashTrainerBackend:
         per_layer_dim = hidden_states.shape[-1] // num_context_layers
         hidden_states_list = list(hidden_states.split(per_layer_dim, dim=-1))
 
-        loss, accuracy, loss_pp, acc_pp, count_pp = model(
+        loss, accuracy, loss_pp, acc_pp, count_pp, diagnostics = model(
             input_ids=batch["input_ids"],
             hidden_states_list=hidden_states_list,
             loss_mask=batch["loss_mask"],
@@ -625,4 +712,5 @@ class DFlashTrainerBackend:
             "loss_per_position": loss_pp.detach(),
             "acc_per_position": acc_pp.detach(),
             "count_per_position": count_pp.detach(),
+            "diagnostics": {key: value.detach() if torch.is_tensor(value) else value for key, value in diagnostics.items()},
         }

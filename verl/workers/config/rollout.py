@@ -129,6 +129,8 @@ class DrafterTrainingConfig(BaseConfig):
     dflash_mask_token_id: Optional[int] = None
     dflash_target_layer_ids: Optional[list[int]] = None
     dflash_max_window: int = 512
+    dflash_loss_mode: str = "full_vocab"
+    dflash_sampled_ce_negatives: int = 0
     current_max_samples: int = 2000
     data_buffer_max_size: int = 1024
     hidden_state_clip_value: Optional[float] = 1.0e4
@@ -172,6 +174,10 @@ class DrafterTrainingConfig(BaseConfig):
             raise ValueError("`logits_sparse_min_mass` must be in [0, 1] or null.")
         if self.batch_size_per_gpu <= 0:
             raise ValueError("`batch_size_per_gpu` must be positive.")
+        if self.dflash_loss_mode not in {"full_vocab", "restricted_ce", "sampled_ce"}:
+            raise ValueError("`dflash_loss_mode` must be one of 'full_vocab', 'restricted_ce', or 'sampled_ce'.")
+        if self.dflash_sampled_ce_negatives < 0:
+            raise ValueError("`dflash_sampled_ce_negatives` must be non-negative.")
 
 
 @dataclass

@@ -1200,6 +1200,15 @@ class RayPPOTrainer:
         )
         for raw_key in ("activation_elapsed_sec", "training_loop_elapsed_sec", "cleanup_elapsed_sec"):
             summary[f"drafter/{raw_key}"] = max(float(r.get(raw_key, 0.0)) for r in normalized_results)
+        for result in normalized_results:
+            for key, value in result.items():
+                if not isinstance(key, str) or not key.startswith("dflash/"):
+                    continue
+                try:
+                    numeric_value = float(value)
+                except (TypeError, ValueError):
+                    continue
+                summary[key] = max(summary.get(key, numeric_value), numeric_value)
         return summary
 
     def _save_checkpoint(self):

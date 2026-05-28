@@ -1190,12 +1190,14 @@ class DrafterWorker(Worker):
 
             try:
                 train_loop_ts = time.time()
+                self.trainer.reset_training_metrics()
                 for _ in range(self.train_steps_per_trigger):
                     result["attempted_steps"] += 1
                     step_ok = await self.trainer.training_step(self.last_global_step)
                     if step_ok:
                         result["successful_steps"] += 1
                 result["training_loop_elapsed_sec"] = time.time() - train_loop_ts
+                result.update(self.trainer.get_training_metrics())
                 if result["successful_steps"] > 0:
                     should_prepare_publish = (
                         self.publish_interval_steps <= 0

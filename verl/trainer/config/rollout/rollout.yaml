@@ -507,6 +507,8 @@ drafter:
     dflash_mask_token_id: null
     dflash_target_layer_ids: null
     dflash_max_window: 512
+    dflash_loss_mode: full_vocab
+    dflash_sampled_ce_negatives: 0
     current_max_samples: 2000
     data_buffer_max_size: 1024
     hidden_state_clip_value: 1.0e4
