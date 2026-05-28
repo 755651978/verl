@@ -1671,6 +1671,11 @@ def _filter_sglang_drafter_last_hidden_output(logits_output, index) -> None:
         index_len = None
     if _is_torch_tensor(last_hidden_states) and index_len is not None and last_hidden_states.dim() > 0:
         hidden_rows = int(last_hidden_states.shape[0])
+        if hidden_rows == index_len:
+            setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTERED_ATTR, True)
+            _filter_sglang_last_hidden_logprob_check_tensors(logits_output, index)
+            _log_sglang_last_hidden_logprob_check(logits_output, stage="already_filtered")
+            return
         if hidden_rows < index_len:
             logger.warning(
                 "Skip filtering SGLang drafter last-hidden output: hidden_rows=%s < index_len=%s",
@@ -1957,8 +1962,7 @@ def _sglang_decode_hidden_position_start(req, rows: int) -> int:
     return max(
         len(getattr(req, "origin_input_ids", []) or [])
         + len(getattr(req, "output_ids", []) or [])
-        - int(rows)
-        - 1,
+        - int(rows),
         0,
     )
 
@@ -2158,6 +2162,8 @@ def _wrap_sglang_eagle_verify_last_hidden_filter(method):
         try:
             logits_output, verify_output = result[0], result[1]
             accepted_indices = getattr(verify_output, "accept_indices", None)
+            if accepted_indices is None:
+                accepted_indices = getattr(verify_output, "accepted_indices", None)
             if accepted_indices is not None:
                 _filter_sglang_drafter_last_hidden_output(logits_output, accepted_indices)
         except Exception as exc:  # noqa: BLE001
@@ -2233,10 +2239,28 @@ def _make_sglang_eagle_verify_full_hidden_patch(original_method):
 """,
         ),
         (
+            """            logits_output.hidden_states = logits_output.hidden_states[
+                res.accepted_indices
+            ]
+""",
+            """            logits_output.hidden_states = logits_output.hidden_states[
+                res.accepted_indices
+            ]
+            _filter_sglang_drafter_last_hidden_output(logits_output, res.accepted_indices)
+""",
+        ),
+        (
             "        logits_output.hidden_states = logits_output.hidden_states[res.accept_indices]\n",
             (
                 "        logits_output.hidden_states = logits_output.hidden_states[res.accept_indices]\n"
                 "        _filter_sglang_drafter_last_hidden_output(logits_output, res.accept_indices)\n"
+            ),
+        ),
+        (
+            "        logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]\n",
+            (
+                "        logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]\n"
+                "        _filter_sglang_drafter_last_hidden_output(logits_output, res.accepted_indices)\n"
             ),
         ),
     )
