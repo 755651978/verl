@@ -518,7 +518,7 @@ class DrafterBaseTrainer:
         # A. 实例化模型（委托给backend）
         pending_target_weight = self._pending_target_lm_head_weight
         if (
-            getattr(self.backend, "model_type", None) == "eagle3"
+            getattr(self.backend, "model_type", None) in {"eagle3", "dflash"}
             and torch.is_tensor(pending_target_weight)
             and pending_target_weight.dim() == 2
         ):
