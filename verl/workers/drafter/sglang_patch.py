@@ -2720,8 +2720,9 @@ def _make_sglang_drafter_last_hidden_forward_patch(original_method):
             else:
                 output.hidden_states = dflash_hidden_states
                 setattr(output, "_verl_dflash_aux_hidden_states", True)
-        if return_last_hidden and getattr(output, "hidden_states", None) is not None and hidden_states is not None:
-            _attach_sglang_last_hidden_logprob_check(self, output, hidden_states, lm_head, logits_metadata)
+        if return_last_hidden and hidden_states is not None:
+            if getattr(output, "hidden_states", None) is not None:
+                _attach_sglang_last_hidden_logprob_check(self, output, hidden_states, lm_head, logits_metadata)
             setattr(output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, hidden_states)
             setattr(output, _VERL_DRAFTER_LAST_HIDDEN_FILTERED_ATTR, False)
         return output
