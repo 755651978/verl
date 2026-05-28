@@ -49,6 +49,8 @@ _EAGLE_LINEAR_TRITON_ENV = "VERL_SGLANG_NPU_EAGLE_LINEAR_TRITON"
 _EAGLE_LINEAR_TRITON_DEBUG_ENV = "VERL_SGLANG_NPU_EAGLE_LINEAR_TRITON_DEBUG"
 _EAGLE_TOP_K_RENORM_FAST_PATH_ENV = "VERL_SGLANG_NPU_EAGLE_TOP_K_RENORM_FAST_PATH"
 _DRAFTER_RETURN_LAST_HIDDEN_ENV = "VERL_SGLANG_DRAFTER_RETURN_LAST_HIDDEN"
+_DRAFTER_LAST_HIDDEN_LOGPROB_CHECK_ENV = "VERL_DRAFTER_LAST_HIDDEN_LOGPROB_CHECK"
+_DRAFTER_LAST_HIDDEN_LOGPROB_CHECK_MAX_LOGS_ENV = "VERL_DRAFTER_LAST_HIDDEN_LOGPROB_CHECK_MAX_LOGS"
 _DISABLE_SGLANG_PATCH_ENV = "VERL_DISABLE_SGLANG_PATCH"
 _SGLANG_PATCHES_ENV = "VERL_SGLANG_PATCHES"
 
@@ -63,6 +65,7 @@ _SGLANG_EAGLE_VERIFY_HIDDEN_STATES_PATCHED = False
 _SGLANG_DFLASH_VERIFY_HIDDEN_STATES_PATCHED = False
 _SGLANG_DRAFTER_LAST_HIDDEN_OUTPUT_PATCHED = False
 _SGLANG_SCHEDULER_PROCESS_PATCHED = False
+_SGLANG_LAST_HIDDEN_LOGPROB_CHECK_LOG_COUNT = 0
 _SCHEDULER_PROCESS_PATCH_ATTR = "_verl_patched_scheduler_process"
 _SGLANG_TOP_K_ALL = 1 << 30
 _SGLANG_PATCH_NAMES = {
@@ -79,6 +82,11 @@ _VERL_HIDDEN_STATES_STREAM_FINAL_ATTR = "_verl_hidden_states_stream_final"
 _VERL_DRAFTER_RETURN_LAST_HIDDEN_PARAM = "_verl_drafter_return_last_hidden"
 _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR = "_verl_drafter_last_hidden_states"
 _VERL_DFLASH_RETURN_AUX_HIDDEN_PARAM = "_verl_dflash_return_aux_hidden"
+_VERL_DRAFTER_LH_CHECK_RECOMPUTED_TOP_IDS_ATTR = "_verl_drafter_lh_check_recomputed_top_ids"
+_VERL_DRAFTER_LH_CHECK_RECOMPUTED_TOP_LOGPROBS_ATTR = "_verl_drafter_lh_check_recomputed_top_logprobs"
+_VERL_DRAFTER_LH_CHECK_RECOMPUTED_AT_SGLANG_TOP_ATTR = "_verl_drafter_lh_check_recomputed_at_sglang_top"
+_VERL_DRAFTER_LH_CHECK_SGLANG_TOP_IDS_ATTR = "_verl_drafter_lh_check_sglang_top_ids"
+_VERL_DRAFTER_LH_CHECK_SGLANG_TOP_LOGPROBS_ATTR = "_verl_drafter_lh_check_sglang_top_logprobs"
 
 
 def configure_sglang_eagle_weight_update_patch(
@@ -283,6 +291,20 @@ def _sglang_npu_eagle_linear_triton_debug_enabled() -> bool:
 
 def _sglang_drafter_return_last_hidden_enabled() -> bool:
     return _env_flag_enabled(_DRAFTER_RETURN_LAST_HIDDEN_ENV, default=False)
+
+
+def _sglang_last_hidden_logprob_check_enabled() -> bool:
+    return _env_flag_enabled(_DRAFTER_LAST_HIDDEN_LOGPROB_CHECK_ENV, default=False)
+
+
+def _sglang_last_hidden_logprob_check_max_logs() -> int:
+    raw_value = os.getenv(_DRAFTER_LAST_HIDDEN_LOGPROB_CHECK_MAX_LOGS_ENV)
+    if raw_value is None:
+        return 8
+    try:
+        return max(0, int(raw_value))
+    except (TypeError, ValueError):
+        return 8
 
 
 def _debug_sglang_npu_eagle_linear_triton(reason: str, **details: Any) -> None:
@@ -1426,6 +1448,147 @@ def _slice_sglang_drafter_last_hidden_output(logits_output, index):
     return last_hidden_states[index]
 
 
+def _sglang_forward_mode_is_target_verify(logits_metadata) -> bool:
+    forward_mode = getattr(logits_metadata, "forward_mode", None)
+    is_target_verify = getattr(forward_mode, "is_target_verify", None)
+    if callable(is_target_verify):
+        try:
+            return bool(is_target_verify())
+        except Exception:  # noqa: BLE001
+            return False
+    return False
+
+
+def _attach_sglang_last_hidden_logprob_check(logits_processor, logits_output, hidden_states, lm_head, logits_metadata) -> None:
+    if not _sglang_last_hidden_logprob_check_enabled():
+        return
+    if not _sglang_forward_mode_is_target_verify(logits_metadata):
+        return
+    next_token_logits = getattr(logits_output, "next_token_logits", None)
+    if not (_is_torch_tensor(next_token_logits) and _is_torch_tensor(hidden_states)):
+        return
+
+    try:
+        with torch.no_grad():
+            sglang_logits_snapshot = next_token_logits.detach().clone()
+            recomputed_logits = logits_processor._get_logits(hidden_states, lm_head, logits_metadata)
+            rows = min(int(recomputed_logits.shape[0]), int(sglang_logits_snapshot.shape[0]))
+            vocab = min(int(recomputed_logits.shape[-1]), int(sglang_logits_snapshot.shape[-1]))
+            if rows <= 0 or vocab <= 0:
+                return
+            recomputed_logits = recomputed_logits[:rows, :vocab].float()
+            sglang_logits = sglang_logits_snapshot[:rows, :vocab].float()
+            recomputed_logprobs = torch.nn.functional.log_softmax(recomputed_logits, dim=-1)
+            sglang_logprobs = torch.nn.functional.log_softmax(sglang_logits, dim=-1)
+            sglang_top_logprobs, sglang_top_ids = sglang_logprobs.max(dim=-1)
+            recomputed_top_logprobs, recomputed_top_ids = recomputed_logprobs.max(dim=-1)
+            row_ids = torch.arange(rows, device=recomputed_logprobs.device)
+            recomputed_at_sglang_top = recomputed_logprobs[row_ids, sglang_top_ids]
+            setattr(logits_output, _VERL_DRAFTER_LH_CHECK_RECOMPUTED_TOP_IDS_ATTR, recomputed_top_ids.detach())
+            setattr(
+                logits_output,
+                _VERL_DRAFTER_LH_CHECK_RECOMPUTED_TOP_LOGPROBS_ATTR,
+                recomputed_top_logprobs.detach(),
+            )
+            setattr(
+                logits_output,
+                _VERL_DRAFTER_LH_CHECK_RECOMPUTED_AT_SGLANG_TOP_ATTR,
+                recomputed_at_sglang_top.detach(),
+            )
+            setattr(logits_output, _VERL_DRAFTER_LH_CHECK_SGLANG_TOP_IDS_ATTR, sglang_top_ids.detach())
+            setattr(logits_output, _VERL_DRAFTER_LH_CHECK_SGLANG_TOP_LOGPROBS_ATTR, sglang_top_logprobs.detach())
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to attach SGLang last-hidden logprob check tensors: %s", exc)
+
+
+def _filter_sglang_last_hidden_logprob_check_tensors(logits_output, index) -> None:
+    for attr in (
+        _VERL_DRAFTER_LH_CHECK_RECOMPUTED_TOP_IDS_ATTR,
+        _VERL_DRAFTER_LH_CHECK_RECOMPUTED_TOP_LOGPROBS_ATTR,
+        _VERL_DRAFTER_LH_CHECK_RECOMPUTED_AT_SGLANG_TOP_ATTR,
+        _VERL_DRAFTER_LH_CHECK_SGLANG_TOP_IDS_ATTR,
+        _VERL_DRAFTER_LH_CHECK_SGLANG_TOP_LOGPROBS_ATTR,
+    ):
+        value = getattr(logits_output, attr, None)
+        if not _is_torch_tensor(value):
+            continue
+        try:
+            index_len = int(index.numel()) if _is_torch_tensor(index) else len(index)
+        except Exception:  # noqa: BLE001
+            index_len = None
+        if index_len is not None and value.dim() > 0 and int(value.shape[0]) == index_len:
+            continue
+        try:
+            setattr(logits_output, attr, value[index])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to filter SGLang last-hidden logprob check tensor %s: %s", attr, exc)
+
+
+def _log_sglang_last_hidden_logprob_check(logits_output) -> None:
+    global _SGLANG_LAST_HIDDEN_LOGPROB_CHECK_LOG_COUNT
+    if not _sglang_last_hidden_logprob_check_enabled():
+        return
+    if _SGLANG_LAST_HIDDEN_LOGPROB_CHECK_LOG_COUNT >= _sglang_last_hidden_logprob_check_max_logs():
+        return
+
+    recomputed_top_ids = getattr(logits_output, _VERL_DRAFTER_LH_CHECK_RECOMPUTED_TOP_IDS_ATTR, None)
+    recomputed_top_logprobs = getattr(logits_output, _VERL_DRAFTER_LH_CHECK_RECOMPUTED_TOP_LOGPROBS_ATTR, None)
+    recomputed_at_sglang_top = getattr(logits_output, _VERL_DRAFTER_LH_CHECK_RECOMPUTED_AT_SGLANG_TOP_ATTR, None)
+    sglang_top_ids = getattr(logits_output, _VERL_DRAFTER_LH_CHECK_SGLANG_TOP_IDS_ATTR, None)
+    sglang_top_logprobs = getattr(logits_output, _VERL_DRAFTER_LH_CHECK_SGLANG_TOP_LOGPROBS_ATTR, None)
+    if not all(
+        _is_torch_tensor(t)
+        for t in (
+            recomputed_top_ids,
+            recomputed_top_logprobs,
+            recomputed_at_sglang_top,
+            sglang_top_ids,
+            sglang_top_logprobs,
+        )
+    ):
+        return
+
+    try:
+        with torch.no_grad():
+            rows = min(
+                int(recomputed_top_ids.numel()),
+                int(recomputed_top_logprobs.numel()),
+                int(recomputed_at_sglang_top.numel()),
+                int(sglang_top_ids.numel()),
+                int(sglang_top_logprobs.numel()),
+            )
+            if rows <= 0:
+                return
+            recomputed_top_ids = recomputed_top_ids[:rows].reshape(-1)
+            recomputed_top_logprobs = recomputed_top_logprobs[:rows].reshape(-1).float()
+            recomputed_at_sglang_top = recomputed_at_sglang_top[:rows].reshape(-1).float()
+            sglang_top_ids = sglang_top_ids[:rows].reshape(-1)
+            sglang_top_logprobs = sglang_top_logprobs[:rows].reshape(-1).float()
+            finite = torch.isfinite(recomputed_at_sglang_top) & torch.isfinite(sglang_top_logprobs)
+            if not finite.any():
+                return
+            match = (recomputed_top_ids == sglang_top_ids) & finite
+            diff = (recomputed_at_sglang_top[finite] - sglang_top_logprobs[finite]).abs()
+            p95 = torch.quantile(diff, 0.95) if diff.numel() > 1 else diff.max()
+            logger.warning(
+                "[sglang last_hidden logprob check] rows=%s valid_rows=%s top1_match=%.6f "
+                "logprob_abs_diff_mean=%.6g logprob_abs_diff_p95=%.6g "
+                "logprob_abs_diff_max=%.6g recomputed_top1_logprob_mean=%.6g "
+                "sglang_top1_logprob_mean=%.6g",
+                rows,
+                int(finite.detach().sum().cpu().item()),
+                float(match[finite].float().mean().detach().cpu().item()),
+                float(diff.mean().detach().cpu().item()),
+                float(p95.detach().cpu().item()),
+                float(diff.max().detach().cpu().item()),
+                float(recomputed_top_logprobs[finite].mean().detach().cpu().item()),
+                float(sglang_top_logprobs[finite].mean().detach().cpu().item()),
+            )
+            _SGLANG_LAST_HIDDEN_LOGPROB_CHECK_LOG_COUNT += 1
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to log SGLang last-hidden logprob check: %s", exc)
+
+
 def _filter_sglang_drafter_last_hidden_output(logits_output, index) -> None:
     last_hidden_states = getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, None)
     if last_hidden_states is None:
@@ -1456,6 +1619,8 @@ def _filter_sglang_drafter_last_hidden_output(logits_output, index) -> None:
         logger.warning("Failed to filter SGLang drafter last-hidden output by accepted indices: %s", exc)
         return
     setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, filtered_last_hidden_states)
+    _filter_sglang_last_hidden_logprob_check_tensors(logits_output, index)
+    _log_sglang_last_hidden_logprob_check(logits_output)
 
 
 def _sglang_hidden_chunk_rows(chunk) -> int:
@@ -2315,6 +2480,7 @@ def _make_sglang_drafter_last_hidden_forward_patch(original_method):
                 output.hidden_states = dflash_hidden_states
                 setattr(output, "_verl_dflash_aux_hidden_states", True)
         if return_last_hidden and getattr(output, "hidden_states", None) is not None and hidden_states is not None:
+            _attach_sglang_last_hidden_logprob_check(self, output, hidden_states, lm_head, logits_metadata)
             setattr(output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, hidden_states)
         return output
 
