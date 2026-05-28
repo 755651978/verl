@@ -1067,12 +1067,19 @@ class DrafterBaseTrainer:
 
         target_weight.copy_(source_weight.to(device=target_weight.device, dtype=target_weight.dtype, non_blocking=True))
         lm_head.requires_grad_(False)
+        block = target_weight[: min(8, int(target_weight.size(0))), : min(8, int(target_weight.size(1)))].detach().float()
+        row0_norm = target_weight[0].detach().float().norm() if int(target_weight.size(0)) > 0 else None
+        row_last_norm = target_weight[-1].detach().float().norm() if int(target_weight.size(0)) > 0 else None
         logger.warning(
-            "[drafter target lm_head sync] applied global_step=%s shape=%s dtype=%s device=%s",
+            "[drafter target lm_head sync] applied global_step=%s shape=%s dtype=%s device=%s "
+            "block_sum=%.6g row0_norm=%s row_last_norm=%s",
             self._target_lm_head_weight_step,
             tuple(target_weight.shape),
             target_weight.dtype,
             target_weight.device,
+            float(block.sum().detach().cpu().item()),
+            None if row0_norm is None else round(float(row0_norm.detach().cpu().item()), 6),
+            None if row_last_norm is None else round(float(row_last_norm.detach().cpu().item()), 6),
         )
         return True
 

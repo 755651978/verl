@@ -308,6 +308,7 @@ def _log_last_hidden_logprob_check(
     target_topk_logprobs: torch.Tensor,
     t2d: torch.Tensor,
     loss_mask: torch.Tensor,
+    target_head_weight: torch.Tensor | None = None,
 ) -> None:
     if (
         not isinstance(target_scores, torch.Tensor)
@@ -448,6 +449,65 @@ def _log_last_hidden_logprob_check(
             best_rows,
             ", ".join(shift_entries),
         )
+        mismatch_rows = torch.nonzero(valid_top1 & (target_top1_full_id != sglang_top1_id), as_tuple=False).view(-1)
+        if mismatch_rows.numel() > 0:
+            examples = []
+            for row in mismatch_rows[:3].detach().cpu().tolist():
+                sglang_id = int(sglang_top1_id[row].detach().cpu().item())
+                target_id = int(target_top1_full_id[row].detach().cpu().item())
+                sglang_lp = float(sglang_top1_logprob[row].detach().cpu().item())
+                target_lp = float(target_top1_logprob[row].detach().cpu().item())
+                target_at_sglang = float(
+                    log_probs[row, sglang_score_id[row].clamp(min=0, max=score_vocab_size - 1)]
+                    .detach()
+                    .cpu()
+                    .item()
+                )
+                examples.append(
+                    {
+                        "row": row,
+                        "sglang_top1": sglang_id,
+                        "target_top1": target_id,
+                        "sglang_lp": round(sglang_lp, 6),
+                        "target_lp": round(target_lp, 6),
+                        "target_at_sglang": round(target_at_sglang, 6),
+                    }
+                )
+
+            weight_stats = None
+            if isinstance(target_head_weight, torch.Tensor):
+                weight = target_head_weight.detach()
+                try:
+                    ids = torch.tensor(
+                        [examples[0]["sglang_top1"], examples[0]["target_top1"]],
+                        device=weight.device,
+                        dtype=torch.long,
+                    )
+                    ids = ids[(ids >= 0) & (ids < int(weight.size(0)))]
+                    row_norms = weight.index_select(0, ids).float().norm(dim=-1).detach().cpu().tolist()
+                    block = weight[: min(8, int(weight.size(0))), : min(8, int(weight.size(1)))].float()
+                    weight_stats = {
+                        "shape": tuple(weight.shape),
+                        "dtype": str(weight.dtype),
+                        "device": str(weight.device),
+                        "sample_ids": [int(x) for x in ids.detach().cpu().tolist()],
+                        "sample_row_norms": [round(float(x), 6) for x in row_norms],
+                        "block_sum": round(float(block.sum().detach().cpu().item()), 6),
+                    }
+                except Exception as exc:  # noqa: BLE001
+                    weight_stats = {"error": str(exc)}
+
+            logger.warning(
+                "[drafter last_hidden logprob check detail] score_shape=%s topk_shape=%s "
+                "score_vocab=%s target_vocab=%s draft_vocab=%s examples=%s target_head=%s",
+                tuple(scores.shape),
+                tuple(topk.shape),
+                score_vocab_size,
+                vocab_size,
+                draft_vocab_size,
+                examples,
+                weight_stats,
+            )
 
 
 def _build_topk_draft_vocab_coverage_mask(
@@ -989,6 +1049,7 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
                     target_topk_logprobs=debug_target_topk_logprobs,
                     t2d=draft_model.t2d,
                     loss_mask=loss_mask,
+                    target_head_weight=getattr(getattr(self.target_model, "fc", None), "weight", None),
                 )
                 self._last_hidden_logprob_check_count = log_count + 1
 
