@@ -168,3 +168,4 @@ actor_rollout_ref:
       min_lr_ratio: null
       warmup_style: "constant" 
       use_logits: False
+      target_lm_head_row_restricted_sync: True
