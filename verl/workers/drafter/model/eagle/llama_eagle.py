@@ -1361,6 +1361,21 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
     config_class = LlamaConfig
     _no_split_modules = ["LlamaDecoderLayer"]
 
+    @staticmethod
+    def _num_aux_hidden_states(config) -> int:
+        num_aux_hidden_states = getattr(config, "num_aux_hidden_states", None)
+        if num_aux_hidden_states is None:
+            eagle_config = getattr(config, "eagle_config", None)
+            layer_ids = getattr(eagle_config, "target_hidden_layer_ids", None)
+            if layer_ids is None:
+                layer_ids = getattr(eagle_config, "eagle_aux_hidden_state_layer_ids", None)
+            if layer_ids is None and isinstance(eagle_config, dict):
+                layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids") or eagle_config.get(
+                    "target_hidden_layer_ids"
+                )
+            num_aux_hidden_states = len(layer_ids) if layer_ids else 3
+        return int(num_aux_hidden_states)
+
     def __init__(self, config, quant_config=None, attention_backend="sdpa") -> None:
         super().__init__(config)
         
@@ -1370,14 +1385,26 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         self.vocab_size = config.vocab_size
         self.draft_vocab_size = getattr(config, "draft_vocab_size", config.vocab_size)
         self.target_hidden_size = getattr(config, "target_hidden_size", config.hidden_size)
+        self.num_aux_hidden_states = self._num_aux_hidden_states(config)
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
         self.midlayer = LlamaDecoderLayer(config, attention_backend=attention_backend)
 
         self.fc = torch.nn.Linear(
-            self.target_hidden_size * 3, config.hidden_size, bias=False
+            self.target_hidden_size * self.num_aux_hidden_states, config.hidden_size, bias=False
         )
+        use_fc_norm = getattr(config, "fc_norm", None) or getattr(config, "use_aux_norm", False)
+        if use_fc_norm:
+            self.fc_norm = nn.ModuleList(
+                [LlamaRMSNorm(self.target_hidden_size, eps=config.rms_norm_eps) for _ in range(self.num_aux_hidden_states)]
+            )
+            if self.num_aux_hidden_states == 3:
+                self.aux_norm_low = self.fc_norm[0]
+                self.aux_norm_mid = self.fc_norm[1]
+                self.aux_norm_high = self.fc_norm[2]
+        else:
+            self.fc_norm = None
 
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = nn.Linear(
@@ -1509,12 +1536,18 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         return self.embed_tokens(input_ids)
 
     def project_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # eagle 3 requires hidden states from 3 layers
-        expected_hidden_size = self.target_hidden_size * 3
+        # EAGLE3 consumes the configured target aux hidden-state layers.
+        expected_hidden_size = self.target_hidden_size * self.num_aux_hidden_states
         if hidden_states.size(-1) != expected_hidden_size:
             raise ValueError(
                 f"EAGLE3 expects hidden_states last dim {expected_hidden_size}, "
                 f"got {hidden_states.size(-1)}"
+            )
+        if self.fc_norm is not None:
+            chunks = hidden_states.chunk(self.num_aux_hidden_states, dim=-1)
+            hidden_states = torch.cat(
+                [norm(chunk) for norm, chunk in zip(self.fc_norm, chunks)],
+                dim=-1,
             )
         return self.fc(hidden_states)
 
