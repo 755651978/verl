@@ -1699,6 +1699,38 @@ def _append_sglang_prefill_hidden_states(req, logits_output, hidden_state_offset
     return end
 
 
+def _sglang_decode_accept_rows_per_req(result) -> list[int] | None:
+    """Return per-request accepted row counts for SGLang 0.5.12 decode output.
+
+    EAGLE/DFLASH spec-v1 reports num_correct_drafts_per_req_cpu without the
+    bonus token. Spec-v2 accept_lens already includes the bonus token.
+    """
+
+    num_correct_drafts = getattr(result, "num_correct_drafts_per_req_cpu", None)
+    if num_correct_drafts is not None:
+        return [max(int(x) + 1, 1) for x in num_correct_drafts]
+
+    accept_lens = getattr(result, "accept_lens", None)
+    if accept_lens is not None:
+        if _is_torch_tensor(accept_lens):
+            accept_lens = accept_lens.detach().cpu().tolist()
+        return [max(int(x), 1) for x in accept_lens]
+
+    return None
+
+
+def _sglang_decode_hidden_position_start(req, rows: int) -> int:
+    # Spec verify hidden rows are the features that predict accepted tokens, so
+    # the first row belongs to the position before the first accepted token.
+    return max(
+        len(getattr(req, "origin_input_ids", []) or [])
+        + len(getattr(req, "output_ids", []) or [])
+        - int(rows)
+        - 1,
+        0,
+    )
+
+
 def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: int, hidden_state_offset: int, batch=None) -> int:
     hidden_states = getattr(logits_output, "hidden_states", None)
     if hidden_states is None:
@@ -1712,24 +1744,15 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
             setattr(req, "_verl_logged_missing_decode_hidden_states", True)
         return hidden_state_offset
 
-    accept_lengths = getattr(result, "accept_length_per_req_cpu", None)
-    if accept_lengths is None:
-        accept_lengths = getattr(result, "accept_lens", None)
-    if accept_lengths is None:
-        accept_lengths = getattr(result, "num_correct_drafts_per_req_cpu", None)
-    if accept_lengths is not None and req_index < len(accept_lengths) and _is_torch_tensor(hidden_states):
-        rows = max(int(accept_lengths[req_index]) + 1, 1)
+    accept_rows_per_req = _sglang_decode_accept_rows_per_req(result)
+    if accept_rows_per_req is not None and req_index < len(accept_rows_per_req) and _is_torch_tensor(hidden_states):
+        rows = accept_rows_per_req[req_index]
 
         if getattr(logits_output, "_verl_dflash_aux_hidden_states", False):
             end = hidden_state_offset + rows
             total_hidden = int(hidden_states.shape[0])
             if hidden_states.dim() >= 2 and end <= total_hidden:
-                position_start = max(
-                    len(getattr(req, "origin_input_ids", []) or [])
-                    + len(getattr(req, "output_ids", []) or [])
-                    - rows,
-                    0,
-                )
+                position_start = _sglang_decode_hidden_position_start(req, rows)
                 _append_sglang_hidden_state_chunk_with_budget(
                     req,
                     hidden_states[hidden_state_offset:end],
@@ -1748,12 +1771,7 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
             rows = min(rows, int(hidden_states.shape[1]))
             if rows <= 0:
                 return hidden_state_offset
-            position_start = max(
-                len(getattr(req, "origin_input_ids", []) or [])
-                + len(getattr(req, "output_ids", []) or [])
-                - rows,
-                0,
-            )
+            position_start = _sglang_decode_hidden_position_start(req, rows)
             chunk = hidden_states[req_index, :rows]
             chunk = _sglang_concat_last_hidden_for_drafter(
                 req,
@@ -1769,17 +1787,9 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
             )
             return hidden_state_offset + rows
 
-        num_requests = len(accept_lengths)
         total_hidden = int(hidden_states.shape[0])
-        per_req_alloc = total_hidden // num_requests if num_requests > 0 else total_hidden
-        rows = min(rows, max(per_req_alloc, 1))
-        position_start = max(
-            len(getattr(req, "origin_input_ids", []) or [])
-            + len(getattr(req, "output_ids", []) or [])
-            - rows,
-            0,
-        )
-        expected_rows = num_requests * per_req_alloc
+        position_start = _sglang_decode_hidden_position_start(req, rows)
+        expected_rows = sum(accept_rows_per_req)
         end = hidden_state_offset + rows
         has_expected_rows = total_hidden >= expected_rows and end <= total_hidden
         if hidden_states.dim() >= 2 and has_expected_rows:
@@ -1916,8 +1926,6 @@ def _wrap_sglang_eagle_verify_last_hidden_filter(method):
         try:
             logits_output, verify_output = result[0], result[1]
             accepted_indices = getattr(verify_output, "accept_indices", None)
-            if accepted_indices is None:
-                accepted_indices = getattr(verify_output, "accepted_indices", None)
             if accepted_indices is not None:
                 _filter_sglang_drafter_last_hidden_output(logits_output, accepted_indices)
         except Exception as exc:  # noqa: BLE001
@@ -1981,13 +1989,6 @@ def _make_sglang_eagle_verify_full_hidden_patch(original_method):
         return None
 
     hidden_filter_replacements = (
-        (
-            "        logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]\n",
-            (
-                "        logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]\n"
-                "        _filter_sglang_drafter_last_hidden_output(logits_output, res.accepted_indices)\n"
-            ),
-        ),
         (
             """            logits_output.hidden_states = logits_output.hidden_states[
                 res.accept_indices

@@ -73,6 +73,7 @@ _VERL_HIDDEN_STATE_PROMPT_LEN_PARAM = "_verl_prompt_len"
 _VERL_DRAFTER_RETURN_LAST_HIDDEN_ENV = "VERL_SGLANG_DRAFTER_RETURN_LAST_HIDDEN"
 _VERL_DRAFTER_RETURN_LAST_HIDDEN_PARAM = "_verl_drafter_return_last_hidden"
 _VERL_DFLASH_RETURN_AUX_HIDDEN_PARAM = "_verl_dflash_return_aux_hidden"
+_VERL_DRAFTER_LAST_HIDDEN_LOGPROB_CHECK_ENV = "VERL_DRAFTER_LAST_HIDDEN_LOGPROB_CHECK"
 
 
 def _drafter_uses_eagle_last_hidden(drafter_cfg) -> bool:
@@ -104,6 +105,13 @@ def _drafter_uses_dflash_aux_hidden(drafter_cfg) -> bool:
         and getattr(drafter_cfg, "enable_drafter_training", False)
         and getattr(training_cfg, "collect_hidden_states_from_sgl", False)
         and not getattr(training_cfg, "use_logits", False)
+    )
+
+
+def _drafter_last_hidden_logprob_check_enabled(drafter_cfg) -> bool:
+    return (
+        _env_flag_enabled(_VERL_DRAFTER_LAST_HIDDEN_LOGPROB_CHECK_ENV, default=False)
+        and _drafter_uses_eagle_last_hidden(drafter_cfg)
     )
 
 
@@ -988,13 +996,15 @@ class SGLangHttpServer:
             )
             if front_hidden_tokens is not None:
                 custom_params[_VERL_HIDDEN_STATE_FRONT_TOKENS_PARAM] = int(front_hidden_tokens)
-            if self.config.drafter.training.use_logits:
+            collect_last_hidden_logprob_check = _drafter_last_hidden_logprob_check_enabled(self.config.drafter)
+            if self.config.drafter.training.use_logits or collect_last_hidden_logprob_check:
                 request.update({"return_logprob": True})
                 request.update({"top_logprobs_num": self.config.drafter.training.logits_topk})
-            elif _drafter_uses_dflash_aux_hidden(self.config.drafter):
-                custom_params[_VERL_DFLASH_RETURN_AUX_HIDDEN_PARAM] = True
-            elif _drafter_uses_eagle_last_hidden(self.config.drafter):
-                custom_params[_VERL_DRAFTER_RETURN_LAST_HIDDEN_PARAM] = True
+            if not self.config.drafter.training.use_logits:
+                if _drafter_uses_dflash_aux_hidden(self.config.drafter):
+                    custom_params[_VERL_DFLASH_RETURN_AUX_HIDDEN_PARAM] = True
+                elif _drafter_uses_eagle_last_hidden(self.config.drafter):
+                    custom_params[_VERL_DRAFTER_RETURN_LAST_HIDDEN_PARAM] = True
             sampling_params["custom_params"] = custom_params
 
         if self.config.drafter.enable:
@@ -1065,7 +1075,10 @@ class SGLangHttpServer:
             target_logprobs_dropped_rows = 0
             output_token_logprobs = output.get("meta_info", {}).get("output_token_logprobs", []) or []
             sampled_token_mismatch = _count_sampled_token_mismatches(output_token_logprobs, list(token_ids))
-            collect_target_logprobs = bool(self.config.drafter.training.use_logits)
+            collect_target_logprobs = bool(
+                self.config.drafter.training.use_logits
+                or _drafter_last_hidden_logprob_check_enabled(self.config.drafter)
+            )
             if collect_target_logprobs:
                 logits_topk = int(self.config.drafter.training.logits_topk)
                 target_logprobs_position_start = max(len(prompt_ids) - 1, 0)

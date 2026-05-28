@@ -47,6 +47,7 @@ _ALIGNMENT_DEBUG_EVERY_N_STEPS_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_EVERY_N_STEPS
 _ALIGNMENT_DEBUG_MAX_SAMPLES_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_MAX_SAMPLES_PER_STEP"
 _ALIGNMENT_DEBUG_TOKEN_WINDOW_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_TOKEN_WINDOW"
 _ALIGNMENT_DEBUG_RANKS_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_RANKS"
+_LAST_HIDDEN_LOGPROB_CHECK_ENV = "VERL_DRAFTER_LAST_HIDDEN_LOGPROB_CHECK"
 
 
 def _env_flag_enabled(name: str, default: bool = False) -> bool:
@@ -74,6 +75,10 @@ def _env_int(name: str, default: int, minimum: int) -> int:
 
 def alignment_debug_enabled() -> bool:
     return _env_flag_enabled(_ALIGNMENT_DEBUG_ENV, default=False)
+
+
+def last_hidden_logprob_check_enabled() -> bool:
+    return _env_flag_enabled(_LAST_HIDDEN_LOGPROB_CHECK_ENV, default=False)
 
 
 def alignment_debug_every_n_steps() -> int:
@@ -1403,6 +1408,11 @@ class DrafterBaseTrainer:
 
         use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))
         same_step_target_head_required = self.backend.model_type == "eagle3" and not use_logits
+        collect_last_hidden_logprob_check = (
+            self.backend.model_type == "eagle3"
+            and not use_logits
+            and last_hidden_logprob_check_enabled()
+        )
 
         # Determine data source: DataBuffer (cross-step) or collected_data (current step only).
         # last-hidden supervision can only be reconstructed with the exact target
@@ -1494,9 +1504,11 @@ class DrafterBaseTrainer:
 
             target_logprobs_item = None
             target_logprobs_train_start = 0
-            if self.backend.model_type == "eagle3" and use_logits:
+            if self.backend.model_type == "eagle3" and (use_logits or collect_last_hidden_logprob_check):
                 target_logprobs_item = preprocessed_lists["target_logprobs"][item_idx]
-                target_logprobs_train_start = _eagle_target_logprobs_train_start(source_item)
+                if target_logprobs_item is not None:
+                    target_logprobs_train_start = _eagle_target_logprobs_train_start(source_item)
+            if self.backend.model_type == "eagle3" and use_logits:
                 train_seq_len = min(
                     max(ids.size(0) - 2, 0),
                     h_states.size(0),
@@ -1506,13 +1518,16 @@ class DrafterBaseTrainer:
                 )
             elif self.backend.model_type == "eagle3":
                 last_h_states = preprocessed_lists["last_h_states"][item_idx]
-                train_seq_len = min(
+                train_seq_len_limits = [
                     max(ids.size(0) - 2, 0),
                     h_states.size(0),
                     max(item_loss_mask.size(0) - 2, 0),
                     item_position_ids.size(0),
                     max(last_h_states.size(0) - 1, 0),
-                )
+                ]
+                if collect_last_hidden_logprob_check and target_logprobs_item is not None:
+                    train_seq_len_limits.append(max(target_logprobs_item.size(0) - target_logprobs_train_start, 0))
+                train_seq_len = min(train_seq_len_limits)
             elif self.backend.model_type == "eagle":
                 train_seq_len = min(
                     max(ids.size(0) - 2, 0),
@@ -1542,7 +1557,7 @@ class DrafterBaseTrainer:
             if alignment_debug_enabled():
                 sample_index = self._alignment_debug_sample_index(current_step, "prepare_item")
                 train_target_logprobs = None
-                if self.backend.model_type == "eagle3" and use_logits:
+                if self.backend.model_type == "eagle3" and (use_logits or collect_last_hidden_logprob_check) and target_logprobs_item is not None:
                     train_target_logprobs = target_logprobs_item[
                         target_logprobs_train_start : target_logprobs_train_start + train_seq_len
                     ]
@@ -1662,6 +1677,12 @@ class DrafterBaseTrainer:
                     )
                 else:
                     last_hidden_state_chunks.append(last_h_states[1 : 1 + train_seq_len])
+                    if collect_last_hidden_logprob_check and target_logprobs_item is not None:
+                        target_logprob_chunks.append(
+                            target_logprobs_item[
+                                target_logprobs_train_start : target_logprobs_train_start + train_seq_len
+                            ]
+                        )
             elif self.backend.model_type == "eagle":
                 target_chunks.append(h_states[1 : 1 + train_seq_len])
 
@@ -1707,6 +1728,17 @@ class DrafterBaseTrainer:
                 if not last_hidden_state_chunks:
                     return None
                 last_hidden_states = torch.cat(last_hidden_state_chunks, dim=0).unsqueeze(0).contiguous()
+                debug_target_logprobs = None
+                if collect_last_hidden_logprob_check:
+                    if len(target_logprob_chunks) == len(last_hidden_state_chunks):
+                        debug_target_logprobs = torch.cat(target_logprob_chunks, dim=0).unsqueeze(0).contiguous()
+                    elif target_logprob_chunks:
+                        logger.warning(
+                            "[Rank %s] Skip last-hidden logprob check payload: target_chunks=%s hidden_chunks=%s",
+                            self.rank,
+                            len(target_logprob_chunks),
+                            len(last_hidden_state_chunks),
+                        )
         elif self.backend.model_type == "eagle":
             if not target_chunks:
                 return None
@@ -1724,6 +1756,8 @@ class DrafterBaseTrainer:
                 batch["target_logprobs"] = target_logprobs
             else:
                 batch["last_hidden_states"] = last_hidden_states
+                if collect_last_hidden_logprob_check and debug_target_logprobs is not None:
+                    batch["target_logprobs"] = debug_target_logprobs
         elif self.backend.model_type == "eagle":
             batch["target"] = target
 
@@ -1738,6 +1772,7 @@ class DrafterBaseTrainer:
                 target_logprobs = batch["target_logprobs"]
             else:
                 last_hidden_states = batch["last_hidden_states"]
+                debug_target_logprobs = batch.get("target_logprobs")
         elif self.backend.model_type == "eagle":
             target = batch["target"]
 
@@ -1770,6 +1805,17 @@ class DrafterBaseTrainer:
                         last_hidden_states = torch.nn.functional.pad(
                             last_hidden_states, (0, 0, 0, pad_size), value=0.0
                         )
+                        if debug_target_logprobs is not None:
+                            pad_shape = list(debug_target_logprobs.shape)
+                            pad_shape[1] = pad_size
+                            target_logprobs_pad = torch.zeros(
+                                pad_shape,
+                                dtype=debug_target_logprobs.dtype,
+                                device=debug_target_logprobs.device,
+                            )
+                            target_logprobs_pad[..., 0] = float("-inf")
+                            target_logprobs_pad[..., 1] = -1.0
+                            debug_target_logprobs = torch.cat((debug_target_logprobs, target_logprobs_pad), dim=1)
                 elif self.backend.model_type == "eagle":
                     target = torch.nn.functional.pad(target, (0, 0, 0, pad_size), value=0.0)
 
@@ -1782,6 +1828,8 @@ class DrafterBaseTrainer:
                     target_logprobs = slice_input_tensor(target_logprobs, dim=1, padding=False)
                 else:
                     last_hidden_states = slice_input_tensor(last_hidden_states, dim=1, padding=False)
+                    if debug_target_logprobs is not None:
+                        debug_target_logprobs = slice_input_tensor(debug_target_logprobs, dim=1, padding=False)
             elif self.backend.model_type == "eagle":
                 target = slice_input_tensor(target, dim=1, padding=False)
 
@@ -1803,6 +1851,8 @@ class DrafterBaseTrainer:
                 batch["target_logprobs"] = target_logprobs
             else:
                 batch["last_hidden_states"] = last_hidden_states
+                if collect_last_hidden_logprob_check and debug_target_logprobs is not None:
+                    batch["target_logprobs"] = debug_target_logprobs
         elif self.backend.model_type == "eagle":
             batch["target"] = target
 
