@@ -1361,21 +1361,6 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
     config_class = LlamaConfig
     _no_split_modules = ["LlamaDecoderLayer"]
 
-    @staticmethod
-    def _num_aux_hidden_states(config) -> int:
-        num_aux_hidden_states = getattr(config, "num_aux_hidden_states", None)
-        if num_aux_hidden_states is None:
-            eagle_config = getattr(config, "eagle_config", None)
-            layer_ids = getattr(eagle_config, "target_hidden_layer_ids", None)
-            if layer_ids is None:
-                layer_ids = getattr(eagle_config, "eagle_aux_hidden_state_layer_ids", None)
-            if layer_ids is None and isinstance(eagle_config, dict):
-                layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids") or eagle_config.get(
-                    "target_hidden_layer_ids"
-                )
-            num_aux_hidden_states = len(layer_ids) if layer_ids else 3
-        return int(num_aux_hidden_states)
-
     def __init__(self, config, quant_config=None, attention_backend="sdpa") -> None:
         super().__init__(config)
         
@@ -1385,28 +1370,16 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         self.vocab_size = config.vocab_size
         self.draft_vocab_size = getattr(config, "draft_vocab_size", config.vocab_size)
         self.target_hidden_size = getattr(config, "target_hidden_size", config.hidden_size)
-        self.num_aux_hidden_states = self._num_aux_hidden_states(config)
-        self.num_hidden_layers = int(getattr(config, "num_hidden_layers", 1) or 1)
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
-        self.layers = nn.ModuleList(
-            [LlamaDecoderLayer(config, attention_backend=attention_backend) for _ in range(self.num_hidden_layers)]
-        )
+        self.midlayer = LlamaDecoderLayer(config, attention_backend=attention_backend)
 
         self.fc = torch.nn.Linear(
-            self.target_hidden_size * self.num_aux_hidden_states, config.hidden_size, bias=False
+            self.target_hidden_size * 3, config.hidden_size, bias=False
         )
-        use_fc_norm = getattr(config, "fc_norm", None) or getattr(config, "use_aux_norm", False)
-        if use_fc_norm:
-            self.fc_norm = nn.ModuleList(
-                [LlamaRMSNorm(self.target_hidden_size, eps=config.rms_norm_eps) for _ in range(self.num_aux_hidden_states)]
-            )
-        else:
-            self.fc_norm = None
 
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.norm_output = getattr(config, "norm_output", False)
         self.lm_head = nn.Linear(
             config.hidden_size, self.draft_vocab_size, bias=False
         )
@@ -1419,32 +1392,6 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         d2t = torch.arange(self.draft_vocab_size, dtype=torch.int64)
         self.register_buffer("t2d", t2d)
         self.register_buffer("d2t", d2t)
-
-    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
-        legacy_name_map = {
-            "midlayer.": "layers.0.",
-            "aux_norm_low.": "fc_norm.0.",
-            "aux_norm_mid.": "fc_norm.1.",
-            "aux_norm_high.": "fc_norm.2.",
-        }
-        for legacy, new in legacy_name_map.items():
-            legacy_prefix = prefix + legacy
-            new_prefix = prefix + new
-            for key in list(state_dict.keys()):
-                if key.startswith(legacy_prefix):
-                    mapped_key = new_prefix + key[len(legacy_prefix) :]
-                    if mapped_key not in state_dict:
-                        state_dict[mapped_key] = state_dict[key]
-                    state_dict.pop(key, None)
-        super()._load_from_state_dict(
-            state_dict,
-            prefix,
-            local_metadata,
-            strict,
-            missing_keys,
-            unexpected_keys,
-            error_msgs,
-        )
 
     def reset_rope_buffers(self, dtype=torch.float32) -> int:
         reset_count = 0
@@ -1480,7 +1427,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             cache_hidden = None
         else:
             logger.info(f"using ttt_length {ttt_length}, caching hidden states")
-            cache_hidden = [[[], []] for _ in range(self.num_hidden_layers)]
+            cache_hidden = [[], []]
 
         batch_size, seq_length, _ = hidden_states.size()
 
@@ -1536,8 +1483,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             )
 
             # 计算logits
-            logits_hidden_states = self.norm(current_hidden_states)
-            logits = self.lm_head(logits_hidden_states)
+            logits = self.compute_logits(current_hidden_states)
 
             # 保存当前状态供外层Loss使用
             all_step_logits.append(logits)
@@ -1546,41 +1492,29 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
 
             # 更新 Mask 和 Input
             if not is_last:
-                if self.norm_output:
-                    current_hidden_states = logits_hidden_states
                 # 原因：为了模拟“预测下一个词”的过程，我们需要将输入序列向右平移。
                 # 这样在 idx+1 步时，模型实际上是在基于 Token[n+idx] 预测 Token[n+idx+1]
                 current_input_ids = self._shift_right(current_input_ids)
                 current_loss_mask = self._shift_right(current_loss_mask)
                 current_position_mask = self._shift_right(current_position_mask)
 
-        # Match SGLang EAGLE3: draft logits use normed states, while aux hidden
-        # states stay pre-norm unless the checkpoint opts into norm_output.
-        final_hidden_states = logits_hidden_states if self.norm_output else current_hidden_states
-
         return {
             "logits": all_step_logits,
             "loss_masks": all_step_loss_masks,
             "position_masks": all_step_position_masks,
-            "last_hidden_states": final_hidden_states,
+            "last_hidden_states": current_hidden_states
         }
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
     def project_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # EAGLE3 consumes the configured target aux hidden-state layers.
-        expected_hidden_size = self.target_hidden_size * self.num_aux_hidden_states
+        # eagle 3 requires hidden states from 3 layers
+        expected_hidden_size = self.target_hidden_size * 3
         if hidden_states.size(-1) != expected_hidden_size:
             raise ValueError(
                 f"EAGLE3 expects hidden_states last dim {expected_hidden_size}, "
                 f"got {hidden_states.size(-1)}"
-            )
-        if self.fc_norm is not None:
-            chunks = hidden_states.chunk(self.num_aux_hidden_states, dim=-1)
-            hidden_states = torch.cat(
-                [norm(chunk) for norm, chunk in zip(self.fc_norm, chunks)],
-                dim=-1,
             )
         return self.fc(hidden_states)
 
@@ -1599,19 +1533,16 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         output_attentions: bool = False,
         use_cache: bool = True,
     ) -> torch.Tensor:
-        for layer_idx, layer in enumerate(self.layers):
-            layer_cache_hidden = None if cache_hidden is None else cache_hidden[layer_idx]
-            hidden_states = layer(
-                input_emb=input_embeds,
-                hidden_states=hidden_states,
-                cache_hidden=layer_cache_hidden,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-            )
-        return hidden_states
+        return self.midlayer(
+            input_emb=input_embeds,
+            hidden_states=hidden_states,
+            cache_hidden=cache_hidden,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+        )
     
     def _shift_right(self, x: torch.Tensor):
         """实现 Teacher Forcing 下的右移填充：舍弃首位，末位补0"""

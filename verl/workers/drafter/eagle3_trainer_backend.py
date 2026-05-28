@@ -749,19 +749,6 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
         pad_id = int(getattr(model_config, "pad_token_id", 0) or 0)
         h_dim = getattr(model_config, "target_hidden_size", model_config.hidden_size)
         use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))
-        num_aux_hidden_states = getattr(model_config, "num_aux_hidden_states", None)
-        if num_aux_hidden_states is None:
-            eagle_config = getattr(model_config, "eagle_config", None)
-            layer_ids = getattr(eagle_config, "target_hidden_layer_ids", None)
-            if layer_ids is None:
-                layer_ids = getattr(eagle_config, "eagle_aux_hidden_state_layer_ids", None)
-            if layer_ids is None and isinstance(eagle_config, dict):
-                layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids") or eagle_config.get(
-                    "target_hidden_layer_ids"
-                )
-            num_aux_hidden_states = len(layer_ids) if layer_ids else 3
-        num_aux_hidden_states = int(num_aux_hidden_states)
-        aux_hidden_size = num_aux_hidden_states * h_dim
 
         for item in items:
             # 1. 搬运到GPU
@@ -775,17 +762,16 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
             else:
                 full_h = raw_h.to(device, dtype=torch.bfloat16)
 
-            min_hidden_size = aux_hidden_size if use_logits else aux_hidden_size + h_dim
+            min_hidden_size = 3 * h_dim if use_logits else 4 * h_dim
             if full_h.size(-1) < min_hidden_size:
                 raise ValueError(
                     f"EAGLE3 expected at least {min_hidden_size} hidden dims "
-                    f"({num_aux_hidden_states}{'' if use_logits else ' + final'} target layers of size {h_dim}), "
-                    f"got {full_h.size(-1)}"
+                    f"({'3' if use_logits else '4'} target layers of size {h_dim}), got {full_h.size(-1)}"
                 )
 
-            h_states = full_h[:, :aux_hidden_size]
+            h_states = full_h[:, : 3 * h_dim]
             if not use_logits:
-                last_h_states = full_h[:, aux_hidden_size : aux_hidden_size + h_dim]
+                last_h_states = full_h[:, 3 * h_dim : 4 * h_dim]
 
             # Compute loss_mask if not present (for DataBuffer items)
             full_len = ids.size(0)

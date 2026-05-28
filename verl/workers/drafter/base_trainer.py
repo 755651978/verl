@@ -1266,7 +1266,7 @@ class DrafterBaseTrainer:
                 "input_ids": cpu_input_ids[i, feature_start:feature_end],
                 "hidden_states": cpu_h_states[i, hidden_start:hidden_end, :],
                 "loss_mask": full_loss_mask[feature_start:feature_end],
-                "position_ids": torch.arange(feature_start, feature_end, dtype=torch.long),
+                "position_ids": torch.arange(input_feature_length, dtype=torch.long),
                 "target_logprobs": target_logprobs_item,
                 "responses": cpu_responses[i] if cpu_responses is not None else None,
                 "prompts": cpu_prompts[i] if cpu_prompts is not None else None,
