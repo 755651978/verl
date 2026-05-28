@@ -1386,10 +1386,13 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         self.draft_vocab_size = getattr(config, "draft_vocab_size", config.vocab_size)
         self.target_hidden_size = getattr(config, "target_hidden_size", config.hidden_size)
         self.num_aux_hidden_states = self._num_aux_hidden_states(config)
+        self.num_hidden_layers = int(getattr(config, "num_hidden_layers", 1) or 1)
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
-        self.midlayer = LlamaDecoderLayer(config, attention_backend=attention_backend)
+        self.layers = nn.ModuleList(
+            [LlamaDecoderLayer(config, attention_backend=attention_backend) for _ in range(self.num_hidden_layers)]
+        )
 
         self.fc = torch.nn.Linear(
             self.target_hidden_size * self.num_aux_hidden_states, config.hidden_size, bias=False
@@ -1399,14 +1402,11 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             self.fc_norm = nn.ModuleList(
                 [LlamaRMSNorm(self.target_hidden_size, eps=config.rms_norm_eps) for _ in range(self.num_aux_hidden_states)]
             )
-            if self.num_aux_hidden_states == 3:
-                self.aux_norm_low = self.fc_norm[0]
-                self.aux_norm_mid = self.fc_norm[1]
-                self.aux_norm_high = self.fc_norm[2]
         else:
             self.fc_norm = None
 
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm_output = getattr(config, "norm_output", False)
         self.lm_head = nn.Linear(
             config.hidden_size, self.draft_vocab_size, bias=False
         )
@@ -1419,6 +1419,32 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         d2t = torch.arange(self.draft_vocab_size, dtype=torch.int64)
         self.register_buffer("t2d", t2d)
         self.register_buffer("d2t", d2t)
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        legacy_name_map = {
+            "midlayer.": "layers.0.",
+            "aux_norm_low.": "fc_norm.0.",
+            "aux_norm_mid.": "fc_norm.1.",
+            "aux_norm_high.": "fc_norm.2.",
+        }
+        for legacy, new in legacy_name_map.items():
+            legacy_prefix = prefix + legacy
+            new_prefix = prefix + new
+            for key in list(state_dict.keys()):
+                if key.startswith(legacy_prefix):
+                    mapped_key = new_prefix + key[len(legacy_prefix) :]
+                    if mapped_key not in state_dict:
+                        state_dict[mapped_key] = state_dict[key]
+                    state_dict.pop(key, None)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def reset_rope_buffers(self, dtype=torch.float32) -> int:
         reset_count = 0
@@ -1454,7 +1480,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             cache_hidden = None
         else:
             logger.info(f"using ttt_length {ttt_length}, caching hidden states")
-            cache_hidden = [[], []]
+            cache_hidden = [[[], []] for _ in range(self.num_hidden_layers)]
 
         batch_size, seq_length, _ = hidden_states.size()
 
@@ -1510,7 +1536,8 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             )
 
             # 计算logits
-            logits = self.compute_logits(current_hidden_states)
+            logits_hidden_states = self.norm(current_hidden_states)
+            logits = self.lm_head(logits_hidden_states)
 
             # 保存当前状态供外层Loss使用
             all_step_logits.append(logits)
@@ -1519,6 +1546,8 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
 
             # 更新 Mask 和 Input
             if not is_last:
+                if self.norm_output:
+                    current_hidden_states = logits_hidden_states
                 # 原因：为了模拟“预测下一个词”的过程，我们需要将输入序列向右平移。
                 # 这样在 idx+1 步时，模型实际上是在基于 Token[n+idx] 预测 Token[n+idx+1]
                 current_input_ids = self._shift_right(current_input_ids)
@@ -1566,16 +1595,19 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         output_attentions: bool = False,
         use_cache: bool = True,
     ) -> torch.Tensor:
-        return self.midlayer(
-            input_emb=input_embeds,
-            hidden_states=hidden_states,
-            cache_hidden=cache_hidden,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            output_attentions=output_attentions,
-            use_cache=use_cache,
-        )
+        for layer_idx, layer in enumerate(self.layers):
+            layer_cache_hidden = None if cache_hidden is None else cache_hidden[layer_idx]
+            hidden_states = layer(
+                input_emb=input_embeds,
+                hidden_states=hidden_states,
+                cache_hidden=layer_cache_hidden,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+            )
+        return hidden_states
     
     def _shift_right(self, x: torch.Tensor):
         """实现 Teacher Forcing 下的右移填充：舍弃首位，末位补0"""
