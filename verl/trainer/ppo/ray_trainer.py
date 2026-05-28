@@ -1880,21 +1880,21 @@ class RayPPOTrainer:
                         # Still in critic warmup, only update weights to wake up rollout replicas.
                         self.checkpoint_manager.update_weights(self.global_steps)
                     else:
-                        # update actor first so drafter trains against the latest lm_head
-                        with marked_timer("update_actor", timing_raw, color="red"):
-                            actor_output = self._update_actor(batch)
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                        metrics.update(actor_output_metrics)
-
-                        # Sync the updated actor's lm_head to the drafter BEFORE training.
-                        # The drafter's frozen target lm_head must match the actor version
-                        # whose distribution the drafter is learning to approximate.
+                        # last-hidden drafter training must use the same actor head version
+                        # that produced this step's rollout hidden states. Only copy it when
+                        # the drafter will train on this PPO step.
                         if self.use_drafter and self.drafter_wg is not None:
                             if self._should_sync_drafter_target_lm_head():
                                 with marked_timer("sync_drafter_target_lm_head", timing_raw, color="red"):
                                     metrics.update(self._sync_drafter_target_lm_head())
                             else:
                                 metrics["drafter/target_lm_head_synced"] = 0
+
+                        # update actor
+                        with marked_timer("update_actor", timing_raw, color="red"):
+                            actor_output = self._update_actor(batch)
+                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                        metrics.update(actor_output_metrics)
 
                         # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                         esi_close_to_expiration = should_save_ckpt_esi(

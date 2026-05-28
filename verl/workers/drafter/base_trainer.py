@@ -1603,7 +1603,7 @@ class DrafterBaseTrainer:
                     max(ids.size(0) - 2, 0),
                     h_states.size(0),
                     max(item_loss_mask.size(0) - 2, 0),
-                    max(item_position_ids.size(0) - 1, 0),
+                    item_position_ids.size(0),
                     max(target_logprobs_item.size(0) - target_logprobs_train_start, 0),
                 )
             elif self.backend.model_type == "eagle3":
@@ -1612,7 +1612,7 @@ class DrafterBaseTrainer:
                     max(ids.size(0) - 2, 0),
                     h_states.size(0),
                     max(item_loss_mask.size(0) - 2, 0),
-                    max(item_position_ids.size(0) - 1, 0),
+                    item_position_ids.size(0),
                     max(last_h_states.size(0) - 1, 0),
                 ]
                 if collect_last_hidden_logprob_check and target_logprobs_item is not None:
@@ -1623,7 +1623,7 @@ class DrafterBaseTrainer:
                     max(ids.size(0) - 2, 0),
                     h_states.size(0),
                     max(item_loss_mask.size(0) - 2, 0),
-                    max(item_position_ids.size(0) - 1, 0),
+                    item_position_ids.size(0),
                     max(h_states.size(0) - 1, 0),
                 )
             elif self.backend.model_type == "dflash":
@@ -1746,7 +1746,7 @@ class DrafterBaseTrainer:
             if uses_shifted_eagle_inputs:
                 input_id_chunks.append(ids[1 : 1 + train_seq_len])
                 hidden_state_chunks.append(h_states[:train_seq_len])
-                position_id_chunks.append(item_position_ids[1 : 1 + train_seq_len])
+                position_id_chunks.append(item_position_ids[:train_seq_len])
             else:
                 input_id_chunks.append(ids[:train_seq_len])
                 hidden_state_chunks.append(h_states[:train_seq_len])
