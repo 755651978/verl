@@ -1554,11 +1554,16 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
                 current_loss_mask = self._shift_right(current_loss_mask)
                 current_position_mask = self._shift_right(current_position_mask)
 
+        # SGLang returns norm(hidden + residual) as aux hidden states.
+        # The target model's lm_head expects normalized hidden states,
+        # so we must return norm'd states here to match inference behavior.
+        final_normed = self.norm(current_hidden_states)
+
         return {
             "logits": all_step_logits,
             "loss_masks": all_step_loss_masks,
             "position_masks": all_step_position_masks,
-            "last_hidden_states": current_hidden_states 
+            "last_hidden_states": final_normed,
         }
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
