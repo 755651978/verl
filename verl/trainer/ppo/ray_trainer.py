@@ -1036,7 +1036,10 @@ class RayPPOTrainer:
     def _get_drafter_target_lm_head_row_selection(self) -> Optional[dict[str, Any]]:
         if not self.use_drafter or self.drafter_wg is None:
             return None
-        if self.config.actor_rollout_ref.rollout.drafter.training.get("use_logits", False):
+        training_cfg = self.config.actor_rollout_ref.rollout.drafter.training
+        if training_cfg.get("use_logits", False):
+            return None
+        if not training_cfg.get("target_lm_head_row_restricted_sync", True):
             return None
         row_infos = self.drafter_wg.get_drafter_target_lm_head_row_indices() or []
         non_null_infos = [info for info in row_infos if isinstance(info, dict) and info.get("row_indices") is not None]

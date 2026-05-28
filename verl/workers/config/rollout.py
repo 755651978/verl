@@ -111,6 +111,7 @@ class DrafterTrainingConfig(BaseConfig):
     min_lr_ratio: int = None
     warmup_style: str = "constant"
     use_logits: bool = False
+    target_lm_head_row_restricted_sync: bool = True
     logits_topk: int = 128
     logits_loss_mode: str = "dense_tail"
     logits_sparse_min_intersection: int = 1
