@@ -1501,6 +1501,32 @@ def _attach_sglang_last_hidden_logprob_check(logits_processor, logits_output, hi
         logger.warning("Failed to attach SGLang last-hidden logprob check tensors: %s", exc)
 
 
+def _attach_sglang_last_hidden_logprob_check_from_graph_runner(graph_runner, logits_output, logits_metadata) -> None:
+    if not _sglang_last_hidden_logprob_check_enabled():
+        return
+    last_hidden_states = getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, None)
+    if not _is_torch_tensor(last_hidden_states):
+        return
+    model_runner = getattr(graph_runner, "model_runner", None)
+    model = getattr(model_runner, "model", None)
+    logits_processor = getattr(model, "logits_processor", None)
+    lm_head = getattr(model, "lm_head", None)
+    if logits_processor is None or lm_head is None:
+        logger.warning(
+            "Skip SGLang graph last-hidden logprob check: missing logits_processor/lm_head "
+            "model_type=%s",
+            type(model).__name__,
+        )
+        return
+    _attach_sglang_last_hidden_logprob_check(
+        logits_processor,
+        logits_output,
+        last_hidden_states,
+        lm_head,
+        logits_metadata,
+    )
+
+
 def _filter_sglang_last_hidden_logprob_check_tensors(logits_output, index) -> None:
     for attr in (
         _VERL_DRAFTER_LH_CHECK_RECOMPUTED_TOP_IDS_ATTR,
@@ -2516,6 +2542,8 @@ def _make_sglang_drafter_last_hidden_graph_replay_patch(original_method):
         output = _sglang_graph_replay_output_buffer(self, original_method)
         if output is not None:
             _copy_sglang_drafter_last_hidden_output(output, result, slice(0, self.raw_num_token))
+            logits_metadata = args[0] if args else kwargs.get("forward_batch")
+            _attach_sglang_last_hidden_logprob_check_from_graph_runner(self, result, logits_metadata)
         return result
 
     patched_graph_replay._verl_patched_drafter_last_hidden_output = True
