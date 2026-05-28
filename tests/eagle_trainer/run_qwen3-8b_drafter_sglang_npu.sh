@@ -10,7 +10,7 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
 export HCCL_OP_EXPANSION_MOD=AIV
 
-export VERL_SGLANG_PATCHES=eagle_update_weights,hidden_states_tensor_output,npu_eagle_target_sampling
+export VERL_SGLANG_PATCHES=eagle_update_weights,hidden_states_tensor_output,top_logprobs_tensor_output,npu_eagle_target_sampling
 
 project_name='verl_grpo_example_dapo_drafter'
 exp_name='qwen3_8b_function_rm_drafter'
