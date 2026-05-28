@@ -27,6 +27,15 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 device_name = get_device_name()
 
 
+class _SyncedTargetHead(nn.Module):
+    def __init__(self, hidden_size: int, vocab_size: int):
+        super().__init__()
+        self.fc = nn.Linear(hidden_size, vocab_size, bias=False)
+
+    def forward(self, hidden_states):
+        return self.fc(hidden_states)
+
+
 def _create_dflash_mask_mod(anchor_positions: torch.Tensor, block_keep_mask: torch.Tensor, ctx_len: int, block_size: int):
     """Create DFlash block attention mask.
 
@@ -503,7 +512,7 @@ class DFlashTrainerBackend:
         draft_model.load_embedding(target_model_path)
         draft_model.freeze_embedding()
 
-        self.target_lm_head = self._build_target_lm_head(target_model_path)
+        self.target_lm_head = self._build_target_lm_head(target_model_path, target_hf_config)
         training_cfg = self.config.rollout.drafter.training
         return DFlashTrainingModel(
             draft_model=draft_model,
@@ -512,8 +521,29 @@ class DFlashTrainerBackend:
             loss_decay_gamma=float(training_cfg.get("dflash_loss_decay_gamma", 7.0)),
         ), drafter_config
 
-    def _build_target_lm_head(self, target_model_path: str):
+    def _build_target_lm_head(self, target_model_path: str, target_hf_config=None):
         target_device = torch.device(f"{device_name}:{get_device_id()}") if device_name != "cpu" else torch.device("cpu")
+        synced_shape = getattr(self, "_initial_target_lm_head_shape", None)
+        if synced_shape is not None and len(synced_shape) == 2:
+            vocab_size, hidden_size = int(synced_shape[0]), int(synced_shape[1])
+            target_text_config = getattr(target_hf_config, "text_config", target_hf_config)
+            expected_hidden = getattr(target_text_config, "hidden_size", hidden_size)
+            if int(expected_hidden) != hidden_size:
+                raise ValueError(
+                    "Synced DFlash target lm_head hidden size mismatch: "
+                    f"synced={hidden_size}, target_config={expected_hidden}"
+                )
+            target_lm_head = _SyncedTargetHead(hidden_size=hidden_size, vocab_size=vocab_size)
+            target_lm_head = target_lm_head.to(target_device, dtype=torch.bfloat16).eval()
+            for param in target_lm_head.parameters():
+                param.requires_grad_(False)
+            logger.warning(
+                "[DFlash target lm_head] build synced target head shape=(%s, %s) without loading full checkpoint",
+                vocab_size,
+                hidden_size,
+            )
+            return target_lm_head
+
         target_lm_head = TargetHead.from_pretrained(model_path=target_model_path).to(target_device).eval()
         for param in target_lm_head.parameters():
             param.requires_grad_(False)
