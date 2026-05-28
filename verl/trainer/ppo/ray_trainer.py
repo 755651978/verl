@@ -1089,29 +1089,48 @@ class RayPPOTrainer:
             self.drafter_wg._dispatch_info[_DRAFTER_TARGET_SYNC_MESH] = target_sync_mapping
 
         target_sync_bucket_count = max(int(dp_rank) for dp_rank in target_sync_mapping) + 1
-        payload_buckets = [None for _ in range(target_sync_bucket_count)]
-        global_step_buckets = [None for _ in range(target_sync_bucket_count)]
-        payload_buckets[0] = payload
-        global_step_buckets[0] = self.global_steps
+        payload_buckets = [payload for _ in range(target_sync_bucket_count)]
+        global_step_buckets = [self.global_steps for _ in range(target_sync_bucket_count)]
         return payload_buckets, global_step_buckets
 
-    def _sync_drafter_target_lm_head(self) -> int:
+    def _sync_drafter_target_lm_head(self) -> dict[str, float]:
         row_selection = self._get_drafter_target_lm_head_row_selection()
         payload = self._get_actor_lm_head_payload(row_selection=row_selection)
         if payload is None:
-            return 0
+            return {
+                "drafter/target_lm_head_synced": 0,
+                "drafter/target_lm_head_sync_accepted": 0,
+                "drafter/target_lm_head_sync_failed": 0,
+                "drafter/target_lm_head_sync_missing_payload": 0,
+                "drafter/target_lm_head_sync_eligible": 0,
+            }
 
         payload_buckets, global_step_buckets = self._build_drafter_target_lm_head_sync_args(payload)
         sync_results = self.drafter_wg.sync_target_lm_head_weight(
             payload_buckets,
             global_step=global_step_buckets,
         ) or []
-        accepted = [
-            result
+        accepted_count = sum(
+            1
             for result in sync_results
             if isinstance(result, dict) and bool(result.get("accepted", False))
+        )
+        ignored_reasons = {"disabled", "not_in_training_group"}
+        eligible_results = [
+            result
+            for result in sync_results
+            if isinstance(result, dict) and result.get("reason") not in ignored_reasons
         ]
-        return int(bool(accepted))
+        missing_payload_count = sum(1 for result in eligible_results if result.get("reason") == "missing_payload")
+        failed_count = sum(1 for result in eligible_results if not bool(result.get("accepted", False)))
+        synced = int(bool(eligible_results) and accepted_count == len(eligible_results))
+        return {
+            "drafter/target_lm_head_synced": synced,
+            "drafter/target_lm_head_sync_accepted": accepted_count,
+            "drafter/target_lm_head_sync_failed": failed_count,
+            "drafter/target_lm_head_sync_missing_payload": missing_payload_count,
+            "drafter/target_lm_head_sync_eligible": len(eligible_results),
+        }
 
     def _should_sync_drafter_target_lm_head(self) -> bool:
         if not self.use_drafter or self.drafter_wg is None:
@@ -1855,7 +1874,7 @@ class RayPPOTrainer:
                         if self.use_drafter and self.drafter_wg is not None:
                             if self._should_sync_drafter_target_lm_head():
                                 with marked_timer("sync_drafter_target_lm_head", timing_raw, color="red"):
-                                    metrics["drafter/target_lm_head_synced"] = self._sync_drafter_target_lm_head()
+                                    metrics.update(self._sync_drafter_target_lm_head())
                             else:
                                 metrics["drafter/target_lm_head_synced"] = 0
 
