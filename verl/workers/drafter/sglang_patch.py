@@ -66,6 +66,7 @@ _SGLANG_DFLASH_VERIFY_HIDDEN_STATES_PATCHED = False
 _SGLANG_DRAFTER_LAST_HIDDEN_OUTPUT_PATCHED = False
 _SGLANG_SCHEDULER_PROCESS_PATCHED = False
 _SGLANG_LAST_HIDDEN_LOGPROB_CHECK_LOG_COUNT = 0
+_SGLANG_LAST_HIDDEN_LOGPROB_CHECK_SKIP_LOG_COUNT = 0
 _SCHEDULER_PROCESS_PATCH_ATTR = "_verl_patched_scheduler_process"
 _SGLANG_TOP_K_ALL = 1 << 30
 _SGLANG_PATCH_NAMES = {
@@ -81,6 +82,7 @@ _VERL_HIDDEN_STATE_METADATA_MARKER = "__verl_hidden_state_metadata__"
 _VERL_HIDDEN_STATES_STREAM_FINAL_ATTR = "_verl_hidden_states_stream_final"
 _VERL_DRAFTER_RETURN_LAST_HIDDEN_PARAM = "_verl_drafter_return_last_hidden"
 _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR = "_verl_drafter_last_hidden_states"
+_VERL_DRAFTER_LAST_HIDDEN_FILTERED_ATTR = "_verl_drafter_last_hidden_filtered_by_accept_indices"
 _VERL_DFLASH_RETURN_AUX_HIDDEN_PARAM = "_verl_dflash_return_aux_hidden"
 _VERL_DRAFTER_LH_CHECK_RECOMPUTED_TOP_IDS_ATTR = "_verl_drafter_lh_check_recomputed_top_ids"
 _VERL_DRAFTER_LH_CHECK_RECOMPUTED_TOP_LOGPROBS_ATTR = "_verl_drafter_lh_check_recomputed_top_logprobs"
@@ -305,6 +307,16 @@ def _sglang_last_hidden_logprob_check_max_logs() -> int:
         return max(0, int(raw_value))
     except (TypeError, ValueError):
         return 8
+
+
+def _log_sglang_last_hidden_logprob_check_skip(reason: str, **details: Any) -> None:
+    global _SGLANG_LAST_HIDDEN_LOGPROB_CHECK_SKIP_LOG_COUNT
+    if not _sglang_last_hidden_logprob_check_enabled():
+        return
+    if _SGLANG_LAST_HIDDEN_LOGPROB_CHECK_SKIP_LOG_COUNT >= _sglang_last_hidden_logprob_check_max_logs():
+        return
+    logger.warning("[sglang last_hidden logprob check skip] reason=%s details=%s", reason, details)
+    _SGLANG_LAST_HIDDEN_LOGPROB_CHECK_SKIP_LOG_COUNT += 1
 
 
 def _debug_sglang_npu_eagle_linear_triton(reason: str, **details: Any) -> None:
@@ -1463,9 +1475,18 @@ def _attach_sglang_last_hidden_logprob_check(logits_processor, logits_output, hi
     if not _sglang_last_hidden_logprob_check_enabled():
         return
     if not _sglang_forward_mode_is_target_verify(logits_metadata):
+        _log_sglang_last_hidden_logprob_check_skip(
+            "not_target_verify",
+            forward_mode=repr(getattr(logits_metadata, "forward_mode", None)),
+        )
         return
     next_token_logits = getattr(logits_output, "next_token_logits", None)
     if not (_is_torch_tensor(next_token_logits) and _is_torch_tensor(hidden_states)):
+        _log_sglang_last_hidden_logprob_check_skip(
+            "missing_logits_or_hidden",
+            next_token_logits_type=type(next_token_logits).__name__,
+            hidden_states_type=type(hidden_states).__name__,
+        )
         return
 
     try:
@@ -1497,6 +1518,7 @@ def _attach_sglang_last_hidden_logprob_check(logits_processor, logits_output, hi
             )
             setattr(logits_output, _VERL_DRAFTER_LH_CHECK_SGLANG_TOP_IDS_ATTR, sglang_top_ids.detach())
             setattr(logits_output, _VERL_DRAFTER_LH_CHECK_SGLANG_TOP_LOGPROBS_ATTR, sglang_top_logprobs.detach())
+            _log_sglang_last_hidden_logprob_check(logits_output, stage="attach")
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to attach SGLang last-hidden logprob check tensors: %s", exc)
 
@@ -1550,7 +1572,7 @@ def _filter_sglang_last_hidden_logprob_check_tensors(logits_output, index) -> No
             logger.warning("Failed to filter SGLang last-hidden logprob check tensor %s: %s", attr, exc)
 
 
-def _log_sglang_last_hidden_logprob_check(logits_output) -> None:
+def _log_sglang_last_hidden_logprob_check(logits_output, stage: str = "filtered") -> None:
     global _SGLANG_LAST_HIDDEN_LOGPROB_CHECK_LOG_COUNT
     if not _sglang_last_hidden_logprob_check_enabled():
         return
@@ -1597,10 +1619,11 @@ def _log_sglang_last_hidden_logprob_check(logits_output) -> None:
             diff = (recomputed_at_sglang_top[finite] - sglang_top_logprobs[finite]).abs()
             p95 = torch.quantile(diff, 0.95) if diff.numel() > 1 else diff.max()
             logger.warning(
-                "[sglang last_hidden logprob check] rows=%s valid_rows=%s top1_match=%.6f "
+                "[sglang last_hidden logprob check] stage=%s rows=%s valid_rows=%s top1_match=%.6f "
                 "logprob_abs_diff_mean=%.6g logprob_abs_diff_p95=%.6g "
                 "logprob_abs_diff_max=%.6g recomputed_top1_logprob_mean=%.6g "
                 "sglang_top1_logprob_mean=%.6g",
+                stage,
                 rows,
                 int(finite.detach().sum().cpu().item()),
                 float(match[finite].float().mean().detach().cpu().item()),
@@ -1619,6 +1642,10 @@ def _filter_sglang_drafter_last_hidden_output(logits_output, index) -> None:
     last_hidden_states = getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, None)
     if last_hidden_states is None:
         return
+    if bool(getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTERED_ATTR, False)):
+        _filter_sglang_last_hidden_logprob_check_tensors(logits_output, index)
+        _log_sglang_last_hidden_logprob_check(logits_output, stage="already_filtered")
+        return
 
     # The verify path may already have applied this filter through a source
     # patch. Keep this helper idempotent so a wrapper can safely call it again
@@ -1629,8 +1656,6 @@ def _filter_sglang_drafter_last_hidden_output(logits_output, index) -> None:
         index_len = None
     if _is_torch_tensor(last_hidden_states) and index_len is not None and last_hidden_states.dim() > 0:
         hidden_rows = int(last_hidden_states.shape[0])
-        if hidden_rows == index_len:
-            return
         if hidden_rows < index_len:
             logger.warning(
                 "Skip filtering SGLang drafter last-hidden output: hidden_rows=%s < index_len=%s",
@@ -1645,8 +1670,9 @@ def _filter_sglang_drafter_last_hidden_output(logits_output, index) -> None:
         logger.warning("Failed to filter SGLang drafter last-hidden output by accepted indices: %s", exc)
         return
     setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, filtered_last_hidden_states)
+    setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTERED_ATTR, True)
     _filter_sglang_last_hidden_logprob_check_tensors(logits_output, index)
-    _log_sglang_last_hidden_logprob_check(logits_output)
+    _log_sglang_last_hidden_logprob_check(logits_output, stage="filtered")
 
 
 def _sglang_hidden_chunk_rows(chunk) -> int:
@@ -2508,6 +2534,7 @@ def _make_sglang_drafter_last_hidden_forward_patch(original_method):
         if return_last_hidden and getattr(output, "hidden_states", None) is not None and hidden_states is not None:
             _attach_sglang_last_hidden_logprob_check(self, output, hidden_states, lm_head, logits_metadata)
             setattr(output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, hidden_states)
+            setattr(output, _VERL_DRAFTER_LAST_HIDDEN_FILTERED_ATTR, False)
         return output
 
     patched_logits_processor_forward._verl_patched_drafter_last_hidden_output = True
@@ -2518,6 +2545,11 @@ def _copy_sglang_drafter_last_hidden_output(src, dst, index) -> None:
     last_hidden_states = getattr(src, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, None)
     if last_hidden_states is not None and dst is not None:
         setattr(dst, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, last_hidden_states[index])
+        setattr(
+            dst,
+            _VERL_DRAFTER_LAST_HIDDEN_FILTERED_ATTR,
+            bool(getattr(src, _VERL_DRAFTER_LAST_HIDDEN_FILTERED_ATTR, False)),
+        )
 
 
 def _sglang_graph_replay_output_buffer(runner, original_method):
