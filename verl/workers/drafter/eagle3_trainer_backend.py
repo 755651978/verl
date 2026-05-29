@@ -134,7 +134,14 @@ def _log_eagle3_hidden_block_check(full_h: torch.Tensor, h_dim: int, item_idx: i
         logger.warning("[drafter hidden block check] failed: %s", exc)
 
 
-def _log_eagle3_raw_topk_check(last_h_states: torch.Tensor, target_model, item_idx: int, item: dict) -> None:
+def _log_eagle3_raw_topk_check(
+    last_h_states: torch.Tensor,
+    target_model,
+    item_idx: int,
+    item: dict,
+    *,
+    target_token_to_local: torch.Tensor | None = None,
+) -> None:
     global _RAW_TOPK_DEBUG_LOG_COUNT
     if not _last_hidden_logprob_check_enabled():
         return
@@ -158,33 +165,45 @@ def _log_eagle3_raw_topk_check(last_h_states: torch.Tensor, target_model, item_i
             target_scores = target_model(check_hidden).float()
             raw_top1_ids = raw_target_logprobs[:rows, 0, 1].to(device=target_scores.device, dtype=torch.long)
             raw_top1_logprobs = raw_target_logprobs[:rows, 0, 0].to(device=target_scores.device, dtype=torch.float32)
-            valid = (raw_top1_ids >= 0) & (raw_top1_ids < int(target_scores.size(-1)))
+            local_raw_top1_ids = raw_top1_ids
+            mapped_vocab = False
+            if target_token_to_local is not None and int(target_scores.size(-1)) < int(target_token_to_local.numel()):
+                target_token_to_local = target_token_to_local.to(device=target_scores.device, dtype=torch.long)
+                in_vocab = (raw_top1_ids >= 0) & (raw_top1_ids < int(target_token_to_local.numel()))
+                local_raw_top1_ids = torch.full_like(raw_top1_ids, -1)
+                local_raw_top1_ids[in_vocab] = target_token_to_local[raw_top1_ids[in_vocab]]
+                mapped_vocab = True
+            valid = (local_raw_top1_ids >= 0) & (local_raw_top1_ids < int(target_scores.size(-1)))
             if not bool(valid.any()):
                 logger.warning(
-                    "[drafter raw topk check] no valid raw ids item_idx=%s rows=%s target_vocab=%s raw_shape=%s",
+                    "[drafter raw topk check] no valid raw ids item_idx=%s rows=%s target_vocab=%s "
+                    "raw_shape=%s mapped_vocab=%s",
                     item_idx,
                     rows,
                     int(target_scores.size(-1)),
                     tuple(raw_target_logprobs.shape),
+                    mapped_vocab,
                 )
                 _RAW_TOPK_DEBUG_LOG_COUNT += 1
                 return
             target_logprobs = F.log_softmax(target_scores, dim=-1)
             target_top1_ids = target_logprobs.argmax(dim=-1)
             row_ids = torch.arange(rows, device=target_scores.device)
-            target_at_raw_top1 = target_logprobs[row_ids[valid], raw_top1_ids[valid]]
+            target_at_raw_top1 = target_logprobs[row_ids[valid], local_raw_top1_ids[valid]]
             diff = (target_at_raw_top1 - raw_top1_logprobs[valid]).abs()
-            top1_match = (target_top1_ids[valid] == raw_top1_ids[valid]).float().mean()
+            top1_match = (target_top1_ids[valid] == local_raw_top1_ids[valid]).float().mean()
             logger.warning(
                 "[drafter raw topk check] source=%s item_idx=%s rows=%s valid_rows=%s top1_match=%.6f "
-                "logprob_abs_diff_mean=%.6g raw_topk=%s sglang_attach=%s",
+                "valid_ratio=%.6f logprob_abs_diff_mean=%.6g raw_topk=%s mapped_vocab=%s sglang_attach=%s",
                 item.get("hidden_target_logprobs_source"),
                 item_idx,
                 rows,
                 int(valid.detach().sum().cpu().item()),
                 float(top1_match.detach().cpu().item()),
+                float(valid.detach().float().mean().cpu().item()),
                 float(diff.mean().detach().cpu().item()),
                 int(raw_target_logprobs.size(1)),
+                mapped_vocab,
                 item.get("hidden_raw_topk_logprob_check"),
             )
             _RAW_TOPK_DEBUG_LOG_COUNT += 1
@@ -547,6 +566,7 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
 
         self.target_model = None
         self.vocab_size = None
+        self._target_token_to_draft_index = None
 
     @property
     def model_type(self):
@@ -634,6 +654,14 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
                     "does not provide valid t2d/d2t vocab mapping buffers"
                 )
         self._validate_vocab_mapping(drafter_module)
+        t2d = drafter_module.t2d.to(dtype=torch.bool)
+        target_token_to_draft_index = torch.cumsum(t2d.to(dtype=torch.long), dim=0) - 1
+        target_token_to_draft_index = torch.where(
+            t2d,
+            target_token_to_draft_index,
+            torch.full_like(target_token_to_draft_index, -1),
+        )
+        self._target_token_to_draft_index = target_token_to_draft_index.detach().to("cpu")
 
         use_logits = training_cfg.get("use_logits", False)
         if not use_logits:
@@ -754,7 +782,13 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
             h_states = full_h[:, :aux_hidden_size]
             if not use_logits:
                 last_h_states = full_h[:, aux_hidden_size : aux_hidden_size + h_dim]
-                _log_eagle3_raw_topk_check(last_h_states, getattr(self, "target_model", None), item_idx, item)
+                _log_eagle3_raw_topk_check(
+                    last_h_states,
+                    getattr(self, "target_model", None),
+                    item_idx,
+                    item,
+                    target_token_to_local=getattr(self, "_target_token_to_draft_index", None),
+                )
 
             # Compute loss_mask if not present (for DataBuffer items)
             full_len = ids.size(0)
