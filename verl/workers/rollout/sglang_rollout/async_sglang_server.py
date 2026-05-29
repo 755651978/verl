@@ -70,6 +70,7 @@ _ALIGNMENT_DEBUG_EVERY_N_STEPS_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_EVERY_N_STEPS
 _ALIGNMENT_DEBUG_MAX_SAMPLES_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_MAX_SAMPLES_PER_STEP"
 _ALIGNMENT_DEBUG_TOKEN_WINDOW_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_TOKEN_WINDOW"
 _ALIGNMENT_DEBUG_RANKS_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_RANKS"
+_LAST_HIDDEN_LOGPROB_CHECK_ENV = "VERL_DRAFTER_LAST_HIDDEN_LOGPROB_CHECK"
 _VERL_DRAFTER_HIDDEN_WINDOW_PARAM = "_verl_drafter_hidden_state_window"
 _VERL_HIDDEN_STATE_FRONT_TOKENS_PARAM = "_verl_hidden_state_front_tokens_per_sample"
 _VERL_HIDDEN_STATE_PROMPT_LEN_PARAM = "_verl_prompt_len"
@@ -874,13 +875,14 @@ class SGLangHttpServer:
         os.environ[_VERL_DRAFTER_RETURN_LAST_HIDDEN_ENV] = (
             "1" if return_last_hidden_for_drafter else "0"
         )
+        raw_top_logprobs_for_debug = _env_flag_enabled(_LAST_HIDDEN_LOGPROB_CHECK_ENV, default=False)
         os.environ[_VERL_DRAFTER_RAW_TOP_LOGPROBS_ENV] = (
             "1"
             if (
                 self.config.drafter.enable
                 and self.config.drafter.enable_drafter_training
                 and self.config.drafter.training.collect_hidden_states_from_sgl
-                and self.config.drafter.training.use_logits
+                and (self.config.drafter.training.use_logits or raw_top_logprobs_for_debug)
             )
             else "0"
         )

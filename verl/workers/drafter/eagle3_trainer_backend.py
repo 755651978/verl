@@ -1031,6 +1031,7 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
         quality_topk_correct = torch.tensor(0.0, device=input_ids.device, dtype=torch.float32)
         quality_tokens = torch.tensor(0.0, device=input_ids.device, dtype=torch.float32)
         quality_topk = min(5, int(all_step_logits[0].size(-1)))
+        quality_step_stats = []
         sparse_base_tokens = torch.tensor(0.0, device=input_ids.device, dtype=torch.float32)
         sparse_valid_tokens = torch.tensor(0.0, device=input_ids.device, dtype=torch.float32)
         sparse_intersection_sum = torch.tensor(0.0, device=input_ids.device, dtype=torch.float32)
@@ -1085,17 +1086,35 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
             with torch.no_grad():
                 if valid_position.any():
                     draft_top1 = logits.argmax(dim=-1)
-                    quality_top1_correct += (draft_top1[valid_position] == target_top1[valid_position]).float().sum()
+                    step_top1_correct = (draft_top1[valid_position] == target_top1[valid_position]).float().sum()
+                    quality_top1_correct += step_top1_correct
                     if quality_topk > 1:
                         draft_topk = logits.topk(quality_topk, dim=-1).indices
-                        quality_topk_correct += (
+                        step_topk_correct = (
                             draft_topk[valid_position] == target_top1[valid_position].unsqueeze(-1)
                         ).any(dim=-1).float().sum()
+                        quality_topk_correct += step_topk_correct
                     else:
-                        quality_topk_correct += (
+                        step_topk_correct = (
                             draft_top1[valid_position] == target_top1[valid_position]
                         ).float().sum()
-                    quality_tokens += valid_position.float().sum()
+                        quality_topk_correct += step_topk_correct
+                    step_tokens = valid_position.float().sum()
+                    quality_tokens += step_tokens
+                    quality_step_stats.append(
+                        {
+                            "step": idx,
+                            "tokens": int(step_tokens.detach().cpu().item()),
+                            "top1": round(
+                                float((step_top1_correct / step_tokens.clamp_min(1)).detach().cpu().item()),
+                                6,
+                            ),
+                            f"top{quality_topk}": round(
+                                float((step_topk_correct / step_tokens.clamp_min(1)).detach().cpu().item()),
+                                6,
+                            ),
+                        }
+                    )
             step_loss_sum = per_token_ploss.sum()
             
             # 应用Eagle3的时间步衰减
@@ -1118,13 +1137,14 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
         if quality_tokens.detach().float().item() > 0:
             logger.warning(
                 "[drafter logits quality] valid_tokens=%s top1_acc=%.6f top%s_acc=%.6f "
-                "local_ploss_sum=%.6f local_tokens=%s",
+                "local_ploss_sum=%.6f local_tokens=%s per_step=%s",
                 int(quality_tokens.detach().cpu().item()),
                 float((quality_top1_correct / quality_tokens).detach().cpu().item()),
                 quality_topk,
                 float((quality_topk_correct / quality_tokens).detach().cpu().item()),
                 float(total_local_ploss.detach().float().cpu().item()),
                 int(total_local_tokens.detach().cpu().item()),
+                quality_step_stats,
             )
 
         return {

@@ -2014,6 +2014,173 @@ def _sglang_first_contiguous_position_len(positions) -> tuple[int | None, bool |
     return first_break, False, first_break
 
 
+def _sglang_nested_attr(obj, names: tuple[str, ...]):
+    for name in names:
+        if obj is None:
+            return None
+        try:
+            if isinstance(obj, dict):
+                obj = obj.get(name)
+            else:
+                obj = getattr(obj, name, None)
+        except Exception:  # noqa: BLE001
+            return None
+    return obj
+
+
+def _sglang_candidate_attrs(obj) -> list[str]:
+    if obj is None:
+        return []
+    try:
+        if isinstance(obj, dict):
+            names = [str(key) for key in obj.keys()]
+        else:
+            names = [name for name in dir(obj) if not name.startswith("_")]
+        return sorted(
+            name
+            for name in names
+            if any(part in name for part in ("accept", "position", "spec", "verify"))
+        )[:32]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _iter_sglang_verify_objects(*candidates):
+    seen = set()
+    stack = list(candidates)
+    nested_names = (
+        "verify_output",
+        "output",
+        "result",
+        "spec_info",
+        "speculative_info",
+        "eagle_verify_output",
+    )
+    while stack:
+        obj = stack.pop(0)
+        if obj is None:
+            continue
+        obj_id = id(obj)
+        if obj_id in seen:
+            continue
+        seen.add(obj_id)
+        yield obj
+        if isinstance(obj, (list, tuple)):
+            stack[:0] = list(obj[:4])
+            continue
+        for name in nested_names:
+            nested = _sglang_nested_attr(obj, (name,))
+            if nested is not None:
+                stack.append(nested)
+
+
+def _find_sglang_accepted_indices(*candidates):
+    for obj in _iter_sglang_verify_objects(*candidates):
+        for name in ("accept_indices", "accepted_indices", "accept_index", "accepted_index"):
+            value = _sglang_nested_attr(obj, (name,))
+            if value is not None:
+                return value
+    return None
+
+
+def _find_sglang_verify_positions(*candidates):
+    for obj in _iter_sglang_verify_objects(*candidates):
+        for name in ("positions", "hidden_positions", "accept_positions", "accepted_positions"):
+            value = _sglang_nested_attr(obj, (name,))
+            if value is not None:
+                return value
+    return None
+
+
+def _set_sglang_last_hidden_filter_summary(logits_output, summary: dict) -> None:
+    existing = getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTER_SUMMARY_ATTR, None)
+    if not isinstance(existing, dict):
+        existing = {}
+    setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTER_SUMMARY_ATTR, {**existing, **summary})
+
+
+def _mark_sglang_last_hidden_identity_filter(
+    logits_output,
+    *,
+    reason: str,
+    positions=None,
+    accepted_rows: int | None = None,
+) -> bool:
+    last_hidden_states = getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, None)
+    if not _is_torch_tensor(last_hidden_states):
+        return False
+    rows = _sglang_hidden_state_rows(last_hidden_states)
+    if rows <= 0:
+        return False
+    hidden_states = getattr(logits_output, "hidden_states", None)
+    hidden_rows = _sglang_hidden_state_rows(hidden_states)
+    if hidden_rows > 0 and hidden_rows != rows:
+        return False
+    if accepted_rows is not None and int(accepted_rows) > 0 and int(accepted_rows) != rows:
+        return False
+
+    filtered_positions = None
+    if positions is not None:
+        try:
+            if _is_torch_tensor(positions):
+                filtered_positions = positions.detach().to(dtype=torch.long).reshape(-1)
+            else:
+                filtered_positions = torch.tensor(list(positions), dtype=torch.long).reshape(-1)
+            if int(filtered_positions.numel()) >= rows:
+                filtered_positions = filtered_positions[:rows]
+                setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_POSITIONS_ATTR, filtered_positions)
+            else:
+                filtered_positions = None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to normalize SGLang identity-filter positions: %s", exc)
+            filtered_positions = None
+    pos_head, pos_tail = _sglang_tensor_head_tail(filtered_positions)
+    contiguous_rows, positions_contiguous, first_break = _sglang_first_contiguous_position_len(filtered_positions)
+    setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTERED_ATTR, True)
+    _set_sglang_last_hidden_filter_summary(
+        logits_output,
+        {
+            "stage": "identity_filtered",
+            "reason": reason,
+            "hidden_rows_before": rows,
+            "hidden_rows_after": rows,
+            "index_len": rows,
+            "accepted_rows": accepted_rows,
+            "hidden_shape": tuple(last_hidden_states.shape),
+            "positions_len": int(filtered_positions.numel()) if _is_torch_tensor(filtered_positions) else None,
+            "positions_contiguous": positions_contiguous,
+            "first_contiguous_rows": contiguous_rows,
+            "first_break": first_break,
+            "positions_head": pos_head,
+            "positions_tail": pos_tail,
+        },
+    )
+    return True
+
+
+def _mark_sglang_last_hidden_missing_filter(logits_output, *candidates) -> None:
+    last_hidden_states = getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, None)
+    if not _is_torch_tensor(last_hidden_states):
+        return
+    hidden_states = getattr(logits_output, "hidden_states", None)
+    _set_sglang_last_hidden_filter_summary(
+        logits_output,
+        {
+            "stage": "missing_accept_indices",
+            "hidden_rows_before": _sglang_hidden_state_rows(last_hidden_states),
+            "hidden_rows_after": None,
+            "hidden_shape": tuple(last_hidden_states.shape),
+            "base_hidden_rows": _sglang_hidden_state_rows(hidden_states),
+            "candidate_types": [type(obj).__name__ for obj in candidates if obj is not None][:8],
+            "candidate_attrs": [
+                {"type": type(obj).__name__, "attrs": _sglang_candidate_attrs(obj)}
+                for obj in candidates
+                if obj is not None
+            ][:4],
+        },
+    )
+
+
 def _truncate_sglang_last_hidden_logprob_check_tensors(logits_output, rows: int) -> None:
     for attr in (
         _VERL_DRAFTER_LH_CHECK_RECOMPUTED_TOP_IDS_ATTR,
@@ -2244,10 +2411,25 @@ def _filter_sglang_drafter_last_hidden_output(logits_output, index, positions=No
 
 
 def _filter_sglang_drafter_last_hidden_from_verify_result(logits_output, result, positions=None) -> None:
-    accepted_indices = getattr(result, "accept_indices", None)
+    accepted_indices = _find_sglang_accepted_indices(result)
+    if positions is None:
+        positions = _find_sglang_verify_positions(result)
     if accepted_indices is None:
-        accepted_indices = getattr(result, "accepted_indices", None)
-    if accepted_indices is None:
+        accepted_rows = None
+        try:
+            accepted_rows_per_req = _sglang_decode_accept_rows_per_req(result)
+            if accepted_rows_per_req is not None:
+                accepted_rows = sum(int(rows) for rows in accepted_rows_per_req)
+        except Exception:  # noqa: BLE001
+            accepted_rows = None
+        if _mark_sglang_last_hidden_identity_filter(
+            logits_output,
+            reason="missing_accept_indices_rows_already_aligned",
+            positions=positions,
+            accepted_rows=accepted_rows,
+        ):
+            return
+        _mark_sglang_last_hidden_missing_filter(logits_output, result)
         return
     _filter_sglang_drafter_last_hidden_output(logits_output, accepted_indices, positions=positions)
 
@@ -2498,6 +2680,8 @@ def _append_sglang_hidden_state_chunk_with_budget(
     position_start = max(int(position_start), 0)
     position_end = position_start + chunk_rows
     setattr(req, "_verl_hidden_next_position", position_end)
+    if positions is None:
+        positions = torch.arange(position_start, position_end, dtype=torch.long)
 
     window_config = _sglang_hidden_window_config(req)
     if window_config is not None:
@@ -2714,6 +2898,16 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
             )
             setattr(req, "_verl_logged_missing_decode_hidden_states", True)
         return hidden_state_offset
+    if (
+        _sglang_req_requests_last_hidden_for_drafter(req)
+        and _is_torch_tensor(getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, None))
+        and not bool(getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTERED_ATTR, False))
+    ):
+        filter_summary = getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTER_SUMMARY_ATTR, None)
+        raise RuntimeError(
+            "SGLang EAGLE verify did not expose accepted indices for final target hidden states. "
+            f"filter_summary={filter_summary}. This would train on unfiltered tree-order last_hidden rows."
+        )
     hidden_positions = getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_POSITIONS_ATTR, None)
 
     accept_rows_per_req = _sglang_decode_accept_rows_per_req(result)
@@ -2928,15 +3122,24 @@ def _wrap_sglang_eagle_verify_last_hidden_filter(method):
     def patched_verify_last_hidden_filter(self, *args, **kwargs):
         result = method(self, *args, **kwargs)
         try:
-            logits_output, verify_output = result[0], result[1]
-            accepted_indices = getattr(verify_output, "accept_indices", None)
-            if accepted_indices is None:
-                accepted_indices = getattr(verify_output, "accepted_indices", None)
+            logits_output = result[0] if isinstance(result, (list, tuple)) else getattr(result, "logits_output", None)
+            if logits_output is None:
+                return result
+            verify_output = result[1] if isinstance(result, (list, tuple)) and len(result) > 1 else result
+            spec_info = getattr(self, "spec_info", None)
+            accepted_indices = _find_sglang_accepted_indices(verify_output, result, spec_info, self)
+            positions = _find_sglang_verify_positions(spec_info, verify_output, result, self)
             if accepted_indices is not None:
                 _filter_sglang_drafter_last_hidden_output(
                     logits_output,
                     accepted_indices,
-                    positions=getattr(getattr(self, "spec_info", None), "positions", None),
+                    positions=positions,
+                )
+            else:
+                _filter_sglang_drafter_last_hidden_from_verify_result(
+                    logits_output,
+                    verify_output,
+                    positions=positions,
                 )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to apply SGLang drafter last-hidden verify filter: %s", exc)
@@ -2954,14 +3157,19 @@ def _wrap_sglang_eagle_verify_input_last_hidden_filter(method):
     def patched_verify_input_last_hidden_filter(self, batch, logits_output, *args, **kwargs):
         result = method(self, batch, logits_output, *args, **kwargs)
         try:
-            accepted_indices = getattr(result, "accept_indices", None)
-            if accepted_indices is None:
-                accepted_indices = getattr(result, "accepted_indices", None)
+            accepted_indices = _find_sglang_accepted_indices(result, self, batch)
+            positions = _find_sglang_verify_positions(self, result, batch)
             if accepted_indices is not None:
                 _filter_sglang_drafter_last_hidden_output(
                     logits_output,
                     accepted_indices,
-                    positions=getattr(self, "positions", None),
+                    positions=positions,
+                )
+            else:
+                _filter_sglang_drafter_last_hidden_from_verify_result(
+                    logits_output,
+                    result,
+                    positions=positions,
                 )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to apply SGLang drafter last-hidden verify-input filter: %s", exc)
