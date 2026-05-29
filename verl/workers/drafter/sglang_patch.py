@@ -2651,16 +2651,32 @@ def _slice_sglang_row_aligned_metadata(metadata: dict | None, start: int, end: i
     raw_target_logprobs = result.get(_VERL_RAW_TARGET_LOGPROBS_METADATA_KEY)
     if _is_torch_tensor(raw_target_logprobs) and raw_target_logprobs.dim() > 0:
         try:
-            if int(raw_target_logprobs.shape[0]) >= end:
-                sliced = raw_target_logprobs[start:end]
+            raw_rows = int(raw_target_logprobs.shape[0])
+            slice_start = min(max(int(start), 0), raw_rows)
+            slice_end = min(max(int(end), slice_start), raw_rows)
+            if slice_end > slice_start:
+                sliced = raw_target_logprobs[slice_start:slice_end]
                 if _is_torch_tensor(keep_mask):
                     mask = keep_mask.detach().to(device=sliced.device, dtype=torch.bool).reshape(-1)
-                    if int(mask.numel()) == int(sliced.shape[0]):
+                    if int(mask.numel()) != max(int(end) - int(start), 0):
+                        mask = None
+                    else:
+                        mask_start = slice_start - int(start)
+                        mask = mask[mask_start : mask_start + int(sliced.shape[0])]
+                    if _is_torch_tensor(mask) and int(mask.numel()) == int(sliced.shape[0]):
                         sliced = sliced[mask]
                 result[_VERL_RAW_TARGET_LOGPROBS_METADATA_KEY] = sliced
                 raw_summary = _raw_topk_metadata_summary(sliced)
                 if raw_summary is not None:
                     result[_VERL_RAW_TOPK_LOGPROB_CHECK_METADATA_KEY] = raw_summary
+            else:
+                result.pop(_VERL_RAW_TARGET_LOGPROBS_METADATA_KEY, None)
+                result.pop(_VERL_RAW_TOPK_LOGPROB_CHECK_METADATA_KEY, None)
+                if (
+                    result.get(_VERL_TARGET_LOGPROBS_SOURCE_METADATA_KEY)
+                    == _VERL_TARGET_LOGPROBS_SOURCE_RAW_HIDDEN_METADATA
+                ):
+                    result.pop(_VERL_TARGET_LOGPROBS_SOURCE_METADATA_KEY, None)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to slice raw target logprobs metadata: %s", exc)
     return result
