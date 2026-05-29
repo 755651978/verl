@@ -1608,6 +1608,7 @@ def _select_sglang_last_hidden_for_drafter(
     logits_output,
     input_ids,
     hidden_states,
+    hidden_states_before_norm,
     aux_hidden_states,
     logits_metadata,
 ):
@@ -1619,15 +1620,15 @@ def _select_sglang_last_hidden_for_drafter(
         get_pruned_states = getattr(logits_processor, "_get_pruned_states", None)
         if callable(get_pruned_states) and _is_torch_tensor(hidden_states):
             try:
-                pruned = get_pruned_states(input_ids, hidden_states, aux_hidden_states, logits_metadata)
-                source = "get_pruned_states_input_ids"
+                pruned = get_pruned_states(hidden_states, hidden_states_before_norm, aux_hidden_states, logits_metadata)
+                source = "get_pruned_states"
             except TypeError:
                 try:
-                    pruned = get_pruned_states(hidden_states, aux_hidden_states, logits_metadata)
-                    source = "get_pruned_states_aux"
+                    pruned = get_pruned_states(input_ids, hidden_states, aux_hidden_states, logits_metadata)
+                    source = "get_pruned_states_input_ids"
                 except TypeError:
                     pruned = get_pruned_states(hidden_states, logits_metadata)
-                    source = "get_pruned_states"
+                    source = "get_pruned_states_legacy"
             if _is_torch_tensor(pruned):
                 selected = pruned
     except Exception as exc:  # noqa: BLE001
@@ -2932,6 +2933,7 @@ def _make_sglang_drafter_last_hidden_forward_patch(original_method):
                 output,
                 input_ids,
                 hidden_states,
+                hidden_states_before_norm,
                 aux_hidden_states,
                 logits_metadata,
             )
