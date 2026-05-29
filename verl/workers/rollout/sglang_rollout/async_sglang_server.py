@@ -537,6 +537,15 @@ def _hidden_state_metadata_from_chunk(hidden_state_chunk: Any) -> dict[str, int]
         value = _positive_int_or_none(hidden_state_chunk.get(source_key))
         if value is not None or hidden_state_chunk.get(source_key) == 0:
             metadata[target_key] = int(hidden_state_chunk[source_key])
+    positions = hidden_state_chunk.get("positions")
+    if positions is not None:
+        try:
+            if torch.is_tensor(positions):
+                metadata["positions"] = positions.detach().to(device="cpu", dtype=torch.long).reshape(-1)
+            else:
+                metadata["positions"] = torch.tensor(list(positions), dtype=torch.long).reshape(-1)
+        except Exception:  # noqa: BLE001
+            logger.warning("Failed to normalize hidden-state positions metadata; ignoring positions")
     lm_head_fingerprint = hidden_state_chunk.get("lm_head_fingerprint")
     if isinstance(lm_head_fingerprint, dict):
         metadata["lm_head_fingerprint"] = lm_head_fingerprint
@@ -1256,6 +1265,7 @@ class SGLangHttpServer:
             hidden_last_hidden_logprob_check = None
             hidden_last_hidden_filter = None
             hidden_last_hidden_select = None
+            hidden_positions = None
             hidden_crop_mode = "none"
             expected_hidden_rows = _expected_full_hidden_rows(len(prompt_ids), len(token_ids))
             hidden_complete = False
@@ -1268,10 +1278,27 @@ class SGLangHttpServer:
                 if hidden_states_metadata:
                     first_metadata = hidden_states_metadata[0]
                     last_metadata = hidden_states_metadata[-1]
+                    position_chunks = [
+                        metadata.get("positions")
+                        for metadata in hidden_states_metadata
+                        if torch.is_tensor(metadata.get("positions"))
+                    ]
+                    if position_chunks:
+                        hidden_positions = torch.cat(position_chunks, dim=0).to(dtype=torch.long)
+                        if int(hidden_positions.numel()) != hidden_raw_len:
+                            logger.warning(
+                                "Drop hidden-state positions metadata with mismatched rows: positions=%s hidden_rows=%s",
+                                int(hidden_positions.numel()),
+                                hidden_raw_len,
+                            )
+                            hidden_positions = None
                     hidden_position_start = int(first_metadata.get("position_start", 0))
                     hidden_position_end = int(
                         last_metadata.get("position_end", hidden_position_start + hidden_raw_len)
                     )
+                    if hidden_positions is not None and int(hidden_positions.numel()) > 0:
+                        hidden_position_start = int(hidden_positions[0].item())
+                        hidden_position_end = int(hidden_positions[-1].item()) + 1
                     hidden_prefix_cache_rows = int(first_metadata.get("prefix_cache_rows", 0))
                     hidden_window_start = first_metadata.get("window_start")
                     hidden_window_end = first_metadata.get("window_end")
@@ -1349,6 +1376,7 @@ class SGLangHttpServer:
                     "prompts": prompt_tensor.unsqueeze(0),
                     "responses": response_tensor.unsqueeze(0),
                     "hidden_states": hidden_states.unsqueeze(0).cpu(),
+                    "hidden_positions": hidden_positions.unsqueeze(0).cpu() if hidden_positions is not None else None,
                     "hidden_position_start": hidden_position_start,
                     "hidden_position_end": hidden_position_end,
                     "hidden_prefix_cache_rows": hidden_prefix_cache_rows,

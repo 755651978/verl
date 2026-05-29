@@ -1081,6 +1081,7 @@ class DrafterWorker(Worker):
             for key in (
                 "hidden_position_start",
                 "hidden_position_end",
+                "hidden_positions",
                 "hidden_prefix_cache_rows",
                 "hidden_window_start",
                 "hidden_window_end",

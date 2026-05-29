@@ -85,6 +85,7 @@ _VERL_HIDDEN_STATE_METADATA_MARKER = "__verl_hidden_state_metadata__"
 _VERL_HIDDEN_STATES_STREAM_FINAL_ATTR = "_verl_hidden_states_stream_final"
 _VERL_DRAFTER_RETURN_LAST_HIDDEN_PARAM = "_verl_drafter_return_last_hidden"
 _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR = "_verl_drafter_last_hidden_states"
+_VERL_DRAFTER_LAST_HIDDEN_POSITIONS_ATTR = "_verl_drafter_last_hidden_positions"
 _VERL_DRAFTER_LAST_HIDDEN_FILTERED_ATTR = "_verl_drafter_last_hidden_filtered_by_accept_indices"
 _VERL_DRAFTER_LAST_HIDDEN_MATERIALIZED_ATTR = "_verl_drafter_last_hidden_materialized"
 _VERL_DFLASH_RETURN_AUX_HIDDEN_PARAM = "_verl_dflash_return_aux_hidden"
@@ -1876,11 +1877,29 @@ def _log_sglang_last_hidden_logprob_check(logits_output, stage: str = "filtered"
         logger.warning("Failed to log SGLang last-hidden logprob check: %s", exc)
 
 
-def _filter_sglang_drafter_last_hidden_output(logits_output, index) -> None:
+def _filter_sglang_drafter_last_hidden_output(logits_output, index, positions=None) -> None:
     global _SGLANG_LAST_HIDDEN_FILTER_DEBUG_LOG_COUNT
+    base_hidden_states = getattr(logits_output, "hidden_states", None)
+    if (
+        _is_torch_tensor(base_hidden_states)
+        and not bool(getattr(logits_output, "_verl_drafter_base_hidden_filtered_by_accept_indices", False))
+    ):
+        try:
+            index_tensor = index if _is_torch_tensor(index) else torch.tensor(list(index), device=base_hidden_states.device)
+            index_tensor = index_tensor.to(device=base_hidden_states.device, dtype=torch.long).reshape(-1)
+            if base_hidden_states.dim() == 3:
+                base_hidden_states = base_hidden_states.reshape(-1, base_hidden_states.shape[-1])
+            if int(index_tensor.numel()) > 0 and int(base_hidden_states.shape[0]) > int(index_tensor.max().item()):
+                setattr(logits_output, "hidden_states", base_hidden_states[index_tensor])
+                setattr(logits_output, "_verl_drafter_base_hidden_filtered_by_accept_indices", True)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to filter SGLang drafter base hidden states by accepted indices: %s", exc)
+
     last_hidden_states = getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, None)
     if last_hidden_states is None:
         return
+    if positions is not None:
+        setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_POSITIONS_ATTR, positions)
     if bool(getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTERED_ATTR, False)):
         try:
             index_len = int(index.numel()) if _is_torch_tensor(index) else len(index)
@@ -1985,6 +2004,12 @@ def _filter_sglang_drafter_last_hidden_output(logits_output, index) -> None:
         logger.warning("Failed to filter SGLang drafter last-hidden output by accepted indices: %s", exc)
         return
     setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, filtered_last_hidden_states)
+    last_hidden_positions = getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_POSITIONS_ATTR, None)
+    if _is_torch_tensor(last_hidden_positions):
+        try:
+            setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_POSITIONS_ATTR, last_hidden_positions[index].detach())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to filter SGLang drafter last-hidden positions by accepted indices: %s", exc)
     setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTERED_ATTR, True)
     filter_summary = getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTER_SUMMARY_ATTR, None)
     if isinstance(filter_summary, dict):
@@ -1994,13 +2019,13 @@ def _filter_sglang_drafter_last_hidden_output(logits_output, index) -> None:
     _log_sglang_last_hidden_logprob_check(logits_output, stage="filtered")
 
 
-def _filter_sglang_drafter_last_hidden_from_verify_result(logits_output, result) -> None:
+def _filter_sglang_drafter_last_hidden_from_verify_result(logits_output, result, positions=None) -> None:
     accepted_indices = getattr(result, "accept_indices", None)
     if accepted_indices is None:
         accepted_indices = getattr(result, "accepted_indices", None)
     if accepted_indices is None:
         return
-    _filter_sglang_drafter_last_hidden_output(logits_output, accepted_indices)
+    _filter_sglang_drafter_last_hidden_output(logits_output, accepted_indices, positions=positions)
 
 
 def _sglang_hidden_chunk_rows(chunk) -> int:
@@ -2131,6 +2156,7 @@ def _append_sglang_hidden_state_chunk_with_budget(
     chunk,
     *,
     position_start: int | None = None,
+    positions=None,
     prefix_cache_rows: int | None = None,
     extra_metadata: dict | None = None,
     batch=None,
@@ -2145,10 +2171,28 @@ def _append_sglang_hidden_state_chunk_with_budget(
     if chunk_rows <= 0:
         return
 
+    if positions is not None:
+        if _is_torch_tensor(positions):
+            positions = positions.detach().to("cpu", dtype=torch.long).reshape(-1)
+        else:
+            positions = torch.tensor(list(positions), dtype=torch.long).reshape(-1)
+        if int(positions.numel()) < chunk_rows:
+            logger.warning(
+                "Ignore short SGLang hidden positions metadata: positions=%s chunk_rows=%s",
+                int(positions.numel()),
+                chunk_rows,
+            )
+            positions = None
+        elif int(positions.numel()) > chunk_rows:
+            positions = positions[:chunk_rows]
+
     if position_start is None:
         position_start = _int_or_none(getattr(req, "_verl_hidden_next_position", None))
         if position_start is None:
-            position_start = _sglang_req_hidden_prefix_cache_rows(req)
+            if positions is not None and int(positions.numel()) > 0:
+                position_start = int(positions[0].item())
+            else:
+                position_start = _sglang_req_hidden_prefix_cache_rows(req)
     position_start = max(int(position_start), 0)
     position_end = position_start + chunk_rows
     setattr(req, "_verl_hidden_next_position", position_end)
@@ -2160,6 +2204,36 @@ def _append_sglang_hidden_state_chunk_with_budget(
             return
         window_start = window_config["window_start"]
         window_end = window_config["window_end"]
+        if positions is not None:
+            keep_mask = (positions >= window_start) & (positions < window_end)
+            if not bool(keep_mask.any()):
+                if int(positions[-1].item()) >= window_end - 1:
+                    setattr(req, "_verl_hidden_state_window_done", True)
+                    _finish_sglang_hidden_state_capture(req, batch)
+                return
+            keep_idx = torch.nonzero(keep_mask, as_tuple=False).flatten()
+            local_start = int(keep_idx[0].item())
+            local_end = int(keep_idx[-1].item()) + 1
+            clipped_chunk = _slice_sglang_hidden_chunk(chunk, local_start, local_end)
+            clipped_positions = positions[local_start:local_end]
+            if not bool(keep_mask[local_start:local_end].all()):
+                clipped_chunk = clipped_chunk[keep_mask[local_start:local_end]]
+                clipped_positions = clipped_positions[keep_mask[local_start:local_end]]
+            metadata = {
+                "position_start": int(clipped_positions[0].item()),
+                "position_end": int(clipped_positions[-1].item()) + 1,
+                "positions": clipped_positions,
+                "prefix_cache_rows": window_config["prefix_cache_rows"],
+                "window_start": window_start,
+                "window_end": window_end,
+                **(extra_metadata or {}),
+            }
+            _append_sglang_hidden_chunk_payload(req, clipped_chunk, metadata)
+            if int(positions[-1].item()) >= window_end - 1:
+                setattr(req, "_verl_hidden_state_window_done", True)
+                _finish_sglang_hidden_state_capture(req, batch)
+            return
+
         clipped_start = max(position_start, window_start)
         clipped_end = min(position_end, window_end)
         if clipped_start >= clipped_end:
@@ -2208,14 +2282,26 @@ def _append_sglang_hidden_state_chunk_with_budget(
             return
         if _is_torch_tensor(chunk) and chunk.dim() > 0 and int(chunk.shape[0]) > remaining_rows:
             chunk = chunk[:remaining_rows]
+            if positions is not None:
+                positions = positions[:remaining_rows]
         elif not _is_torch_tensor(chunk):
             try:
                 if len(chunk) > remaining_rows:
                     chunk = chunk[:remaining_rows]
+                    if positions is not None:
+                        positions = positions[:remaining_rows]
             except TypeError:
                 pass
 
-    appended_rows = _append_sglang_hidden_chunk_payload(req, chunk, extra_metadata)
+    metadata = extra_metadata
+    if positions is not None and int(positions.numel()) > 0:
+        metadata = {
+            "position_start": int(positions[0].item()),
+            "position_end": int(positions[-1].item()) + 1,
+            "positions": positions,
+            **(extra_metadata or {}),
+        }
+    appended_rows = _append_sglang_hidden_chunk_payload(req, chunk, metadata)
     collected_rows += appended_rows
     setattr(req, "_verl_hidden_state_rows", collected_rows)
     if max_rows is not None and max_rows > 0 and collected_rows >= max_rows:
@@ -2257,6 +2343,7 @@ def _append_sglang_prefill_hidden_states(req, logits_output, hidden_state_offset
         req,
         chunk,
         position_start=prefix_cache_rows,
+        positions=torch.arange(prefix_cache_rows, prefix_cache_rows + _sglang_hidden_chunk_rows(chunk), dtype=torch.long),
         prefix_cache_rows=prefix_cache_rows,
         extra_metadata=_sglang_hidden_debug_metadata(logits_output),
         batch=batch,
@@ -2296,6 +2383,11 @@ def _sglang_decode_hidden_position_start(req, rows: int) -> int:
 
 
 def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: int, hidden_state_offset: int, batch=None) -> int:
+    _filter_sglang_drafter_last_hidden_from_verify_result(
+        logits_output,
+        result,
+        positions=getattr(result, "positions", None),
+    )
     hidden_states = getattr(logits_output, "hidden_states", None)
     if hidden_states is None:
         if getattr(req, "return_hidden_states", False) and not getattr(req, "_verl_logged_missing_decode_hidden_states", False):
@@ -2307,7 +2399,7 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
             )
             setattr(req, "_verl_logged_missing_decode_hidden_states", True)
         return hidden_state_offset
-    _filter_sglang_drafter_last_hidden_from_verify_result(logits_output, result)
+    hidden_positions = getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_POSITIONS_ATTR, None)
 
     accept_rows_per_req = _sglang_decode_accept_rows_per_req(result)
     if accept_rows_per_req is not None and req_index < len(accept_rows_per_req) and _is_torch_tensor(hidden_states):
@@ -2322,6 +2414,11 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
                     req,
                     hidden_states[hidden_state_offset:end],
                     position_start=position_start,
+                    positions=(
+                        hidden_positions[hidden_state_offset:end]
+                        if _is_torch_tensor(hidden_positions)
+                        else None
+                    ),
                     extra_metadata=_sglang_hidden_debug_metadata(logits_output),
                     batch=batch,
                 )
@@ -2349,6 +2446,11 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
                 req,
                 chunk,
                 position_start=position_start,
+                positions=(
+                    hidden_positions[req_index, :rows]
+                    if _is_torch_tensor(hidden_positions) and hidden_positions.dim() == 2
+                    else None
+                ),
                 extra_metadata=_sglang_hidden_debug_metadata(logits_output),
                 batch=batch,
             )
@@ -2371,6 +2473,11 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
                 req,
                 chunk,
                 position_start=position_start,
+                positions=(
+                    hidden_positions[hidden_state_offset:end]
+                    if _is_torch_tensor(hidden_positions)
+                    else None
+                ),
                 extra_metadata=_sglang_hidden_debug_metadata(logits_output),
                 batch=batch,
             )
@@ -2401,6 +2508,7 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
             req,
             chunk,
             position_start=position_start,
+            positions=(hidden_positions[req_index] if _is_torch_tensor(hidden_positions) else None),
             extra_metadata=_sglang_hidden_debug_metadata(logits_output),
             batch=batch,
         )
@@ -2532,7 +2640,11 @@ def _wrap_sglang_eagle_verify_last_hidden_filter(method):
             if accepted_indices is None:
                 accepted_indices = getattr(verify_output, "accepted_indices", None)
             if accepted_indices is not None:
-                _filter_sglang_drafter_last_hidden_output(logits_output, accepted_indices)
+                _filter_sglang_drafter_last_hidden_output(
+                    logits_output,
+                    accepted_indices,
+                    positions=getattr(getattr(self, "spec_info", None), "positions", None),
+                )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to apply SGLang drafter last-hidden verify filter: %s", exc)
         return result
@@ -2553,7 +2665,11 @@ def _wrap_sglang_eagle_verify_input_last_hidden_filter(method):
             if accepted_indices is None:
                 accepted_indices = getattr(result, "accepted_indices", None)
             if accepted_indices is not None:
-                _filter_sglang_drafter_last_hidden_output(logits_output, accepted_indices)
+                _filter_sglang_drafter_last_hidden_output(
+                    logits_output,
+                    accepted_indices,
+                    positions=getattr(self, "positions", None),
+                )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to apply SGLang drafter last-hidden verify-input filter: %s", exc)
         return result
@@ -2646,7 +2762,9 @@ def _make_sglang_eagle_verify_full_hidden_patch(original_method):
             """            logits_output.hidden_states = logits_output.hidden_states[
                 res.accept_indices
             ]
-            _filter_sglang_drafter_last_hidden_output(logits_output, res.accept_indices)
+            _filter_sglang_drafter_last_hidden_output(
+                logits_output, res.accept_indices, positions=getattr(spec_info, "positions", None)
+            )
 """,
         ),
         (
@@ -2657,21 +2775,23 @@ def _make_sglang_eagle_verify_full_hidden_patch(original_method):
             """            logits_output.hidden_states = logits_output.hidden_states[
                 res.accepted_indices
             ]
-            _filter_sglang_drafter_last_hidden_output(logits_output, res.accepted_indices)
+            _filter_sglang_drafter_last_hidden_output(
+                logits_output, res.accepted_indices, positions=getattr(spec_info, "positions", None)
+            )
 """,
         ),
         (
             "        logits_output.hidden_states = logits_output.hidden_states[res.accept_indices]\n",
             (
                 "        logits_output.hidden_states = logits_output.hidden_states[res.accept_indices]\n"
-                "        _filter_sglang_drafter_last_hidden_output(logits_output, res.accept_indices)\n"
+                "        _filter_sglang_drafter_last_hidden_output(logits_output, res.accept_indices, positions=getattr(spec_info, \"positions\", None))\n"
             ),
         ),
         (
             "        logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]\n",
             (
                 "        logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]\n"
-                "        _filter_sglang_drafter_last_hidden_output(logits_output, res.accepted_indices)\n"
+                "        _filter_sglang_drafter_last_hidden_output(logits_output, res.accepted_indices, positions=getattr(spec_info, \"positions\", None))\n"
             ),
         ),
     )
@@ -3185,6 +3305,9 @@ def _copy_sglang_drafter_last_hidden_output(src, dst, index) -> None:
     last_hidden_states = getattr(src, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, None)
     if last_hidden_states is not None and dst is not None:
         setattr(dst, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, last_hidden_states[index])
+        last_hidden_positions = getattr(src, _VERL_DRAFTER_LAST_HIDDEN_POSITIONS_ATTR, None)
+        if _is_torch_tensor(last_hidden_positions):
+            setattr(dst, _VERL_DRAFTER_LAST_HIDDEN_POSITIONS_ATTR, last_hidden_positions[index])
         setattr(
             dst,
             _VERL_DRAFTER_LAST_HIDDEN_FILTERED_ATTR,

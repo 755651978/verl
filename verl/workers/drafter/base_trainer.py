@@ -1138,6 +1138,11 @@ class DrafterBaseTrainer:
             target_logprobs = None
 
         source_tensors = [input_ids, hidden_states]
+        hidden_positions = batch.get("hidden_positions")
+        if isinstance(hidden_positions, torch.Tensor):
+            source_tensors.append(hidden_positions)
+        else:
+            hidden_positions = None
         if target_logprobs is not None:
             source_tensors.append(target_logprobs)
         if "responses" in batch and batch["responses"] is not None:
@@ -1156,6 +1161,9 @@ class DrafterBaseTrainer:
                 cpu_target_logprobs = (
                     target_logprobs.to('cpu', non_blocking=True) if target_logprobs is not None else None
                 )
+                cpu_hidden_positions = (
+                    hidden_positions.to('cpu', non_blocking=True) if hidden_positions is not None else None
+                )
                 cpu_responses = batch.get("responses").to('cpu', non_blocking=True) if "responses" in batch else None
                 cpu_prompts = batch.get("prompts").to('cpu', non_blocking=True) if "prompts" in batch else None
 
@@ -1164,6 +1172,7 @@ class DrafterBaseTrainer:
             cpu_input_ids = input_ids.to('cpu')
             cpu_h_states = hidden_states.to('cpu')
             cpu_target_logprobs = target_logprobs.to('cpu') if target_logprobs is not None else None
+            cpu_hidden_positions = hidden_positions.to('cpu') if hidden_positions is not None else None
             cpu_responses = batch.get("responses").to('cpu') if "responses" in batch else None
             cpu_prompts = batch.get("prompts").to('cpu') if "prompts" in batch else None
 
@@ -1178,8 +1187,28 @@ class DrafterBaseTrainer:
         pad_id = int(getattr(model_config, "pad_token_id", self.pad_token_id) or self.pad_token_id)
         for i in range(batch_size):
             expected_hidden_rows = max(input_seq_length - 1, 0)
+            hidden_positions_item = None
+            if cpu_hidden_positions is not None:
+                hidden_positions_item = cpu_hidden_positions[i].reshape(-1)[:hidden_seq_length].long()
+                if hidden_positions_item.numel() <= 0:
+                    hidden_positions_item = None
             hidden_position_start = _batch_item_int(batch.get("hidden_position_start"), i)
-            if hidden_position_start is None:
+            if hidden_positions_item is not None:
+                contiguous_mask = hidden_positions_item[1:] == hidden_positions_item[:-1] + 1
+                if contiguous_mask.numel() > 0 and not bool(contiguous_mask.all()):
+                    first_break = int(torch.nonzero(~contiguous_mask, as_tuple=False)[0].item()) + 1
+                    logger.warning(
+                        "[Rank %s] Non-contiguous SGLang hidden positions; keeping first run rows=%s/%s "
+                        "start=%s break_at=%s",
+                        self.rank,
+                        first_break,
+                        int(hidden_positions_item.numel()),
+                        int(hidden_positions_item[0].item()),
+                        int(hidden_positions_item[first_break].item()),
+                    )
+                    hidden_positions_item = hidden_positions_item[:first_break]
+                hidden_position_start = max(int(hidden_positions_item[0].item()), 0)
+            elif hidden_position_start is None:
                 hidden_position_start = max(expected_hidden_rows - hidden_seq_length, 0)
             # Hidden rows are next-token features for original positions. If
             # prefix cache reused leading prompt tokens, the first returned
@@ -1187,9 +1216,16 @@ class DrafterBaseTrainer:
             # rows head-aligned from that original position onward.
             feature_start = min(max(hidden_position_start, 0), input_seq_length)
             hidden_start = 0
-            hidden_feature_length = min(hidden_seq_length, max(input_seq_length - feature_start - 1, 0))
+            if hidden_positions_item is not None:
+                hidden_feature_length = min(
+                    int(hidden_positions_item.numel()),
+                    hidden_seq_length,
+                    max(input_seq_length - feature_start, 0),
+                )
+            else:
+                hidden_feature_length = min(hidden_seq_length, max(input_seq_length - feature_start - 1, 0))
             hidden_end = hidden_feature_length
-            feature_end = feature_start + hidden_feature_length + 1
+            feature_end = min(input_seq_length, feature_start + hidden_feature_length + 1)
 
             target_logprobs_position_start = None
             target_logprobs_position_end = None
@@ -1228,7 +1264,7 @@ class DrafterBaseTrainer:
                     feature_end = feature_start + 1
                 else:
                     hidden_end = hidden_start + hidden_feature_length
-                    feature_end = feature_start + hidden_feature_length + 1
+                    feature_end = min(input_seq_length, feature_start + hidden_feature_length + 1)
 
             input_feature_length = feature_end - feature_start
             if input_feature_length <= 0 or hidden_feature_length <= 0:
@@ -1273,7 +1309,7 @@ class DrafterBaseTrainer:
                 "input_ids": cpu_input_ids[i, feature_start:feature_end],
                 "hidden_states": cpu_h_states[i, hidden_start:hidden_end, :],
                 "loss_mask": full_loss_mask[feature_start:feature_end],
-                "position_ids": torch.arange(input_feature_length, dtype=torch.long),
+                "position_ids": torch.arange(feature_start + 1, feature_start + 1 + hidden_feature_length, dtype=torch.long),
                 "target_logprobs": target_logprobs_item,
                 "responses": cpu_responses[i] if cpu_responses is not None else None,
                 "prompts": cpu_prompts[i] if cpu_prompts is not None else None,
@@ -1282,6 +1318,9 @@ class DrafterBaseTrainer:
                 "_verl_hidden_start": hidden_start,
                 "_verl_hidden_end": hidden_end,
                 "_verl_hidden_position_start": hidden_position_start,
+                "_verl_hidden_positions": (
+                    hidden_positions_item[hidden_start:hidden_end] if hidden_positions_item is not None else None
+                ),
                 "_verl_target_start": target_start if cpu_target_logprobs is not None else None,
                 "_verl_target_end": target_end if cpu_target_logprobs is not None else None,
                 "_verl_target_position_start": (
