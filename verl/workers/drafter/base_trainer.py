@@ -1298,6 +1298,7 @@ class DrafterBaseTrainer:
                 "hidden_lm_head_fingerprint": batch.get("hidden_lm_head_fingerprint"),
                 "hidden_last_hidden_logprob_check": batch.get("hidden_last_hidden_logprob_check"),
                 "hidden_last_hidden_filter": batch.get("hidden_last_hidden_filter"),
+                "hidden_last_hidden_select": batch.get("hidden_last_hidden_select"),
                 "global_step": _batch_item_int(batch.get("global_step"), i),
             }
 
@@ -1347,6 +1348,7 @@ class DrafterBaseTrainer:
                             "hidden_lm_head_fingerprint": data_item.get("hidden_lm_head_fingerprint"),
                             "hidden_last_hidden_logprob_check": data_item.get("hidden_last_hidden_logprob_check"),
                             "hidden_last_hidden_filter": data_item.get("hidden_last_hidden_filter"),
+                            "hidden_last_hidden_select": data_item.get("hidden_last_hidden_select"),
                             "item_global_step": data_item.get("global_step"),
                             "prompt_len": prompt_len if cpu_prompts is not None else None,
                             "response_len": response_len if cpu_responses is not None else None,
@@ -1741,6 +1743,7 @@ class DrafterBaseTrainer:
                             "hidden_lm_head_fingerprint": source_item.get("hidden_lm_head_fingerprint"),
                             "hidden_last_hidden_logprob_check": source_item.get("hidden_last_hidden_logprob_check"),
                             "hidden_last_hidden_filter": source_item.get("hidden_last_hidden_filter"),
+                            "hidden_last_hidden_select": source_item.get("hidden_last_hidden_select"),
                             "target_lm_head_weight_step": getattr(self, "_target_lm_head_weight_step", None),
                             "loss_after_shift": int(
                                 (
@@ -2036,6 +2039,7 @@ class DrafterBaseTrainer:
                             item.get("hidden_last_hidden_logprob_check") for item in items[:2]
                         ],
                         "source_last_hidden_filters": [item.get("hidden_last_hidden_filter") for item in items[:2]],
+                        "source_last_hidden_selects": [item.get("hidden_last_hidden_select") for item in items[:2]],
                         "target_lm_head_weight_step": getattr(self, "_target_lm_head_weight_step", None),
                         "packed_tokens_before_shift": packed_tokens_before_shift,
                         "packed_loss_tokens": packed_loss_tokens,

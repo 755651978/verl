@@ -1540,6 +1540,16 @@ def _attach_sglang_last_hidden_logprob_check(logits_processor, logits_output, hi
             vocab = min(int(recomputed_logits.shape[-1]), int(sglang_logits_snapshot.shape[-1]))
             if rows <= 0 or vocab <= 0:
                 return
+            setattr(
+                logits_output,
+                "_verl_drafter_lh_check_logits_shapes",
+                {
+                    "recomputed_logits_shape": tuple(recomputed_logits.shape),
+                    "sglang_logits_shape": tuple(sglang_logits_snapshot.shape),
+                    "compared_rows": rows,
+                    "compared_vocab": vocab,
+                },
+            )
             recomputed_logits = recomputed_logits[:rows, :vocab].float()
             sglang_logits = sglang_logits_snapshot[:rows, :vocab].float()
             recomputed_logprobs = torch.nn.functional.log_softmax(recomputed_logits, dim=-1)
@@ -1593,6 +1603,37 @@ def _attach_sglang_last_hidden_logprob_check_from_graph_runner(graph_runner, log
     )
 
 
+def _select_sglang_last_hidden_for_drafter(logits_processor, logits_output, hidden_states, logits_metadata):
+    next_token_logits = getattr(logits_output, "next_token_logits", None)
+    raw_shape = tuple(hidden_states.shape) if _is_torch_tensor(hidden_states) else None
+    selected = hidden_states
+    source = "raw_hidden_states"
+    try:
+        get_pruned_states = getattr(logits_processor, "_get_pruned_states", None)
+        if callable(get_pruned_states) and _is_torch_tensor(hidden_states):
+            pruned = get_pruned_states(hidden_states, logits_metadata)
+            if _is_torch_tensor(pruned):
+                selected = pruned
+                source = "get_pruned_states"
+    except Exception as exc:  # noqa: BLE001
+        setattr(logits_output, "_verl_drafter_last_hidden_select_error", str(exc))
+
+    selected_shape = tuple(selected.shape) if _is_torch_tensor(selected) else None
+    logits_shape = tuple(next_token_logits.shape) if _is_torch_tensor(next_token_logits) else None
+    setattr(
+        logits_output,
+        "_verl_drafter_last_hidden_select_summary",
+        {
+            "source": source,
+            "raw_shape": raw_shape,
+            "selected_shape": selected_shape,
+            "next_token_logits_shape": logits_shape,
+            "error": getattr(logits_output, "_verl_drafter_last_hidden_select_error", None),
+        },
+    )
+    return selected
+
+
 def _filter_sglang_last_hidden_logprob_check_tensors(logits_output, index) -> None:
     for attr in (
         _VERL_DRAFTER_LH_CHECK_RECOMPUTED_TOP_IDS_ATTR,
@@ -1623,6 +1664,7 @@ def _build_sglang_last_hidden_logprob_check_summary(logits_output, stage: str) -
     sglang_top_ids = getattr(logits_output, _VERL_DRAFTER_LH_CHECK_SGLANG_TOP_IDS_ATTR, None)
     sglang_top_logprobs = getattr(logits_output, _VERL_DRAFTER_LH_CHECK_SGLANG_TOP_LOGPROBS_ATTR, None)
     lm_head_fingerprint = getattr(logits_output, "_verl_drafter_lh_check_lm_head_fingerprint", None)
+    logits_shapes = getattr(logits_output, "_verl_drafter_lh_check_logits_shapes", None)
     if not all(
         _is_torch_tensor(t)
         for t in (
@@ -1671,6 +1713,8 @@ def _build_sglang_last_hidden_logprob_check_summary(logits_output, stage: str) -
                 "sglang_top1_logprob_mean": round(float(sglang_top_logprobs[finite].mean().detach().cpu().item()), 6),
                 "lm_head": lm_head_fingerprint,
             }
+            if isinstance(logits_shapes, dict):
+                summary.update(logits_shapes)
             setattr(logits_output, _VERL_DRAFTER_LH_CHECK_SUMMARY_ATTR, summary)
             return summary
     except Exception as exc:  # noqa: BLE001
@@ -1908,6 +1952,9 @@ def _sglang_hidden_debug_metadata(logits_output) -> dict:
     filter_summary = getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTER_SUMMARY_ATTR, None)
     if isinstance(filter_summary, dict):
         metadata["last_hidden_filter"] = filter_summary
+    select_summary = getattr(logits_output, "_verl_drafter_last_hidden_select_summary", None)
+    if isinstance(select_summary, dict):
+        metadata["last_hidden_select"] = select_summary
     return metadata
 
 
@@ -2865,7 +2912,13 @@ def _make_sglang_drafter_last_hidden_forward_patch(original_method):
             if getattr(output, "hidden_states", None) is not None:
                 _attach_sglang_lm_head_fingerprint(output, lm_head)
                 _attach_sglang_last_hidden_logprob_check(self, output, hidden_states, lm_head, logits_metadata)
-            setattr(output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, hidden_states)
+            last_hidden_for_drafter = _select_sglang_last_hidden_for_drafter(
+                self,
+                output,
+                hidden_states,
+                logits_metadata,
+            )
+            setattr(output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, last_hidden_for_drafter)
             setattr(output, _VERL_DRAFTER_LAST_HIDDEN_FILTERED_ATTR, False)
         return output
 

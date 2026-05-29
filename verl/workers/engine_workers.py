@@ -1087,6 +1087,7 @@ class DrafterWorker(Worker):
                 "hidden_lm_head_fingerprint",
                 "hidden_last_hidden_logprob_check",
                 "hidden_last_hidden_filter",
+                "hidden_last_hidden_select",
                 "target_logprobs_position_start",
                 "target_logprobs_position_end",
                 "global_step",

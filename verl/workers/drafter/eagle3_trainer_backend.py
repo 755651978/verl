@@ -110,7 +110,7 @@ def _log_eagle3_hidden_block_check(full_h: torch.Tensor, h_dim: int, item_idx: i
                 )
             logger.warning(
                 "[drafter hidden block check] item_idx=%s full_shape=%s h_dim=%s blocks=%s block_stats=%s "
-                "hidden_lm_head_fingerprint=%s sglang_lh_check=%s sglang_filter=%s "
+                "hidden_lm_head_fingerprint=%s sglang_lh_check=%s sglang_filter=%s sglang_select=%s "
                 "global_step=%s feature_pos=(%s,%s) target_pos=(%s,%s)",
                 item_idx,
                 tuple(full_h.shape),
@@ -120,6 +120,7 @@ def _log_eagle3_hidden_block_check(full_h: torch.Tensor, h_dim: int, item_idx: i
                 item.get("hidden_lm_head_fingerprint"),
                 item.get("hidden_last_hidden_logprob_check"),
                 item.get("hidden_last_hidden_filter"),
+                item.get("hidden_last_hidden_select"),
                 item.get("global_step"),
                 item.get("_verl_feature_start"),
                 item.get("_verl_feature_end"),
@@ -541,9 +542,28 @@ def _log_last_hidden_logprob_check(
                 except Exception as exc:  # noqa: BLE001
                     weight_stats = {"error": str(exc)}
 
+            topk_stats = None
+            try:
+                top_ids = topk[..., 1].long()
+                valid_ids = top_ids[(top_ids >= 0) & (top_ids < vocab_size)]
+                if valid_ids.numel() > 0:
+                    shard_rows = None
+                    if isinstance(target_head_weight, torch.Tensor) and int(target_head_weight.size(0)) < vocab_size:
+                        shard_rows = int(target_head_weight.size(0))
+                    topk_stats = {
+                        "id_min": int(valid_ids.min().detach().cpu().item()),
+                        "id_max": int(valid_ids.max().detach().cpu().item()),
+                        "ids_ge_target_head_rows": None
+                        if shard_rows is None
+                        else int((valid_ids >= shard_rows).detach().sum().cpu().item()),
+                        "valid_ids": int(valid_ids.numel()),
+                    }
+            except Exception as exc:  # noqa: BLE001
+                topk_stats = {"error": str(exc)}
+
             logger.warning(
                 "[drafter last_hidden logprob check detail] score_shape=%s topk_shape=%s "
-                "score_vocab=%s target_vocab=%s draft_vocab=%s examples=%s target_head=%s",
+                "score_vocab=%s target_vocab=%s draft_vocab=%s examples=%s target_head=%s topk=%s",
                 tuple(scores.shape),
                 tuple(topk.shape),
                 score_vocab_size,
@@ -551,6 +571,7 @@ def _log_last_hidden_logprob_check(
                 draft_vocab_size,
                 examples,
                 weight_stats,
+                topk_stats,
             )
 
 

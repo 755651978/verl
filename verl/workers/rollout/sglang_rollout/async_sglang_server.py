@@ -546,6 +546,9 @@ def _hidden_state_metadata_from_chunk(hidden_state_chunk: Any) -> dict[str, int]
     last_hidden_filter = hidden_state_chunk.get("last_hidden_filter")
     if isinstance(last_hidden_filter, dict):
         metadata["last_hidden_filter"] = last_hidden_filter
+    last_hidden_select = hidden_state_chunk.get("last_hidden_select")
+    if isinstance(last_hidden_select, dict):
+        metadata["last_hidden_select"] = last_hidden_select
     return metadata
 
 
@@ -1252,6 +1255,7 @@ class SGLangHttpServer:
             hidden_lm_head_fingerprint = None
             hidden_last_hidden_logprob_check = None
             hidden_last_hidden_filter = None
+            hidden_last_hidden_select = None
             hidden_crop_mode = "none"
             expected_hidden_rows = _expected_full_hidden_rows(len(prompt_ids), len(token_ids))
             hidden_complete = False
@@ -1292,6 +1296,14 @@ class SGLangHttpServer:
                             metadata.get("last_hidden_filter")
                             for metadata in reversed(hidden_states_metadata)
                             if metadata.get("last_hidden_filter") is not None
+                        ),
+                        None,
+                    )
+                    hidden_last_hidden_select = next(
+                        (
+                            metadata.get("last_hidden_select")
+                            for metadata in reversed(hidden_states_metadata)
+                            if metadata.get("last_hidden_select") is not None
                         ),
                         None,
                     )
@@ -1345,6 +1357,7 @@ class SGLangHttpServer:
                     "hidden_lm_head_fingerprint": hidden_lm_head_fingerprint,
                     "hidden_last_hidden_logprob_check": hidden_last_hidden_logprob_check,
                     "hidden_last_hidden_filter": hidden_last_hidden_filter,
+                    "hidden_last_hidden_select": hidden_last_hidden_select,
                     "target_logprobs": target_logprobs.unsqueeze(0).cpu() if target_logprobs is not None else None,
                     "target_logprobs_position_start": target_logprobs_position_start,
                     "target_logprobs_position_end": target_logprobs_position_end,
@@ -1405,6 +1418,7 @@ class SGLangHttpServer:
                         "hidden_lm_head_fingerprint": hidden_lm_head_fingerprint,
                         "hidden_last_hidden_logprob_check": hidden_last_hidden_logprob_check,
                         "hidden_last_hidden_filter": hidden_last_hidden_filter,
+                        "hidden_last_hidden_select": hidden_last_hidden_select,
                         "sampling_debug": sampling_debug,
                         "hidden_crop_mode": hidden_crop_mode,
                         "hidden_front_max": getattr(
