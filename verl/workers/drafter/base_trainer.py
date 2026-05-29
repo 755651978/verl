@@ -47,7 +47,6 @@ _ALIGNMENT_DEBUG_EVERY_N_STEPS_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_EVERY_N_STEPS
 _ALIGNMENT_DEBUG_MAX_SAMPLES_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_MAX_SAMPLES_PER_STEP"
 _ALIGNMENT_DEBUG_TOKEN_WINDOW_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_TOKEN_WINDOW"
 _ALIGNMENT_DEBUG_RANKS_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_RANKS"
-_LAST_HIDDEN_LOGPROB_CHECK_ENV = "VERL_DRAFTER_LAST_HIDDEN_LOGPROB_CHECK"
 
 
 def _env_flag_enabled(name: str, default: bool = False) -> bool:
@@ -75,10 +74,6 @@ def _env_int(name: str, default: int, minimum: int) -> int:
 
 def alignment_debug_enabled() -> bool:
     return _env_flag_enabled(_ALIGNMENT_DEBUG_ENV, default=False)
-
-
-def last_hidden_logprob_check_enabled() -> bool:
-    return _env_flag_enabled(_LAST_HIDDEN_LOGPROB_CHECK_ENV, default=False)
 
 
 def alignment_debug_every_n_steps() -> int:
@@ -1137,7 +1132,13 @@ class DrafterBaseTrainer:
             return
 
         # 1、异步拷贝，GPU在后台进行数据搬运，避免阻塞Rollout Stream
-        if target_logprobs is not None and not isinstance(target_logprobs, torch.Tensor):
+        use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))
+        if not use_logits:
+            # Phase 4: use_logits=False reconstructs supervision from the
+            # synced target_lm_head(last_hidden_states). Do not keep stale
+            # SGLang output_top_logprobs payloads in collected samples.
+            target_logprobs = None
+        elif target_logprobs is not None and not isinstance(target_logprobs, torch.Tensor):
             logger.warning(f"[Rank {self.rank}] Unsupported target_logprobs type: {type(target_logprobs)}")
             target_logprobs = None
 

@@ -76,7 +76,6 @@ _VERL_HIDDEN_STATE_PROMPT_LEN_PARAM = "_verl_prompt_len"
 _VERL_DRAFTER_RETURN_LAST_HIDDEN_ENV = "VERL_SGLANG_DRAFTER_RETURN_LAST_HIDDEN"
 _VERL_DRAFTER_RETURN_LAST_HIDDEN_PARAM = "_verl_drafter_return_last_hidden"
 _VERL_DFLASH_RETURN_AUX_HIDDEN_PARAM = "_verl_dflash_return_aux_hidden"
-_VERL_DRAFTER_LAST_HIDDEN_LOGPROB_CHECK_ENV = "VERL_DRAFTER_LAST_HIDDEN_LOGPROB_CHECK"
 _VERL_TOP_LOGPROBS_TENSOR_PARAM = "_verl_top_logprobs_tensor_output"
 _VERL_OUTPUT_TOP_LOGPROBS_TENSOR_KEY = "_verl_output_top_logprobs_tensor"
 _VERL_TOP_LOGPROBS_OUTPUT_ROW_START_PARAM = "_verl_top_logprobs_output_row_start"
@@ -112,13 +111,6 @@ def _drafter_uses_dflash_aux_hidden(drafter_cfg) -> bool:
         and getattr(drafter_cfg, "enable_drafter_training", False)
         and getattr(training_cfg, "collect_hidden_states_from_sgl", False)
         and not getattr(training_cfg, "use_logits", False)
-    )
-
-
-def _drafter_last_hidden_logprob_check_enabled(drafter_cfg) -> bool:
-    return (
-        _env_flag_enabled(_VERL_DRAFTER_LAST_HIDDEN_LOGPROB_CHECK_ENV, default=False)
-        and _drafter_uses_eagle_last_hidden(drafter_cfg)
     )
 
 

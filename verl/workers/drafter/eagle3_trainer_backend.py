@@ -739,7 +739,7 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
                 res['last_h_states'].append(last_h_states[start:end])
             res['masks'].append(item_loss_mask[start:end])
             target_logprobs_item = None
-            if item.get("target_logprobs") is not None:
+            if use_logits and item.get("target_logprobs") is not None:
                 target_end = max(start, end - 1)
                 target_logprobs_item = item["target_logprobs"].to(device, dtype=torch.float32)[start:target_end]
             res["target_logprobs"].append(target_logprobs_item)
@@ -844,7 +844,7 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
                     ).unsqueeze(0)
             else:
                 if last_hidden_states is None:
-                    raise ValueError("last_hidden_states is required when use_target_model=False")
+                    raise ValueError("last_hidden_states is required when use_logits=False")
                 last_hidden_states = gather_outputs_and_unpad(
                     last_hidden_states.squeeze(0),
                     gather_dim=0,
@@ -881,7 +881,7 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
                     ).unsqueeze(0)
             else:
                 if last_hidden_states is None:
-                    raise ValueError("last_hidden_states is required when use_target_model=False")
+                    raise ValueError("last_hidden_states is required when use_logits=False")
                 with torch.no_grad():
                     target_scores = self.target_model(last_hidden_states)
         
