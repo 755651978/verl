@@ -505,6 +505,9 @@ def _hidden_state_metadata_from_chunk(hidden_state_chunk: Any) -> dict[str, int]
         value = _positive_int_or_none(hidden_state_chunk.get(source_key))
         if value is not None or hidden_state_chunk.get(source_key) == 0:
             metadata[target_key] = int(hidden_state_chunk[source_key])
+    lm_head_fingerprint = hidden_state_chunk.get("lm_head_fingerprint")
+    if isinstance(lm_head_fingerprint, dict):
+        metadata["lm_head_fingerprint"] = lm_head_fingerprint
     return metadata
 
 
@@ -1206,6 +1209,7 @@ class SGLangHttpServer:
             hidden_prefix_cache_rows = 0
             hidden_window_start = None
             hidden_window_end = None
+            hidden_lm_head_fingerprint = None
             hidden_crop_mode = "none"
             expected_hidden_rows = _expected_full_hidden_rows(len(prompt_ids), len(token_ids))
             hidden_complete = False
@@ -1225,6 +1229,7 @@ class SGLangHttpServer:
                     hidden_prefix_cache_rows = int(first_metadata.get("prefix_cache_rows", 0))
                     hidden_window_start = first_metadata.get("window_start")
                     hidden_window_end = first_metadata.get("window_end")
+                    hidden_lm_head_fingerprint = first_metadata.get("lm_head_fingerprint")
                     hidden_crop_mode = "sglang_window"
                     hidden_complete = True
                 else:
@@ -1272,6 +1277,7 @@ class SGLangHttpServer:
                     "hidden_prefix_cache_rows": hidden_prefix_cache_rows,
                     "hidden_window_start": hidden_window_start,
                     "hidden_window_end": hidden_window_end,
+                    "hidden_lm_head_fingerprint": hidden_lm_head_fingerprint,
                     "target_logprobs": target_logprobs.unsqueeze(0).cpu() if target_logprobs is not None else None,
                     "target_logprobs_position_start": target_logprobs_position_start,
                     "target_logprobs_position_end": target_logprobs_position_end,
@@ -1329,6 +1335,7 @@ class SGLangHttpServer:
                         "hidden_position_end": hidden_position_end,
                         "hidden_window_start": hidden_window_start,
                         "hidden_window_end": hidden_window_end,
+                        "hidden_lm_head_fingerprint": hidden_lm_head_fingerprint,
                         "hidden_crop_mode": hidden_crop_mode,
                         "hidden_front_max": getattr(
                             self.config.drafter.training,

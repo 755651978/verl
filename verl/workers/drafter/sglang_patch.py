@@ -1520,6 +1520,31 @@ def _attach_sglang_last_hidden_logprob_check(logits_processor, logits_output, hi
             recomputed_top_logprobs, recomputed_top_ids = recomputed_logprobs.max(dim=-1)
             row_ids = torch.arange(rows, device=recomputed_logprobs.device)
             recomputed_at_sglang_top = recomputed_logprobs[row_ids, sglang_top_ids]
+            lm_head_weight = getattr(lm_head, "weight", None)
+            if _is_torch_tensor(lm_head_weight):
+                try:
+                    weight = lm_head_weight.detach()
+                    block = weight[: min(8, int(weight.shape[0])), : min(8, int(weight.shape[1]))].float()
+                    row0_norm = weight[0].float().norm() if int(weight.shape[0]) > 0 else None
+                    row_last_norm = weight[-1].float().norm() if int(weight.shape[0]) > 0 else None
+                    setattr(
+                        logits_output,
+                        "_verl_drafter_lh_check_lm_head_fingerprint",
+                        {
+                            "shape": tuple(weight.shape),
+                            "dtype": str(weight.dtype),
+                            "device": str(weight.device),
+                            "block_sum": float(block.sum().detach().cpu().item()),
+                            "row0_norm": None
+                            if row0_norm is None
+                            else float(row0_norm.detach().cpu().item()),
+                            "row_last_norm": None
+                            if row_last_norm is None
+                            else float(row_last_norm.detach().cpu().item()),
+                        },
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    setattr(logits_output, "_verl_drafter_lh_check_lm_head_fingerprint", {"error": str(exc)})
             setattr(logits_output, _VERL_DRAFTER_LH_CHECK_RECOMPUTED_TOP_IDS_ATTR, recomputed_top_ids.detach())
             setattr(
                 logits_output,
@@ -1599,6 +1624,7 @@ def _log_sglang_last_hidden_logprob_check(logits_output, stage: str = "filtered"
     recomputed_at_sglang_top = getattr(logits_output, _VERL_DRAFTER_LH_CHECK_RECOMPUTED_AT_SGLANG_TOP_ATTR, None)
     sglang_top_ids = getattr(logits_output, _VERL_DRAFTER_LH_CHECK_SGLANG_TOP_IDS_ATTR, None)
     sglang_top_logprobs = getattr(logits_output, _VERL_DRAFTER_LH_CHECK_SGLANG_TOP_LOGPROBS_ATTR, None)
+    lm_head_fingerprint = getattr(logits_output, "_verl_drafter_lh_check_lm_head_fingerprint", None)
     if not all(
         _is_torch_tensor(t)
         for t in (
@@ -1637,7 +1663,7 @@ def _log_sglang_last_hidden_logprob_check(logits_output, stage: str = "filtered"
                 "[sglang last_hidden logprob check] stage=%s rows=%s valid_rows=%s top1_match=%.6f "
                 "logprob_abs_diff_mean=%.6g logprob_abs_diff_p95=%.6g "
                 "logprob_abs_diff_max=%.6g recomputed_top1_logprob_mean=%.6g "
-                "sglang_top1_logprob_mean=%.6g",
+                "sglang_top1_logprob_mean=%.6g lm_head=%s",
                 stage,
                 rows,
                 int(finite.detach().sum().cpu().item()),
@@ -1647,6 +1673,7 @@ def _log_sglang_last_hidden_logprob_check(logits_output, stage: str = "filtered"
                 float(diff.max().detach().cpu().item()),
                 float(recomputed_top_logprobs[finite].mean().detach().cpu().item()),
                 float(sglang_top_logprobs[finite].mean().detach().cpu().item()),
+                lm_head_fingerprint,
             )
             _SGLANG_LAST_HIDDEN_LOGPROB_CHECK_LOG_COUNT += 1
     except Exception as exc:  # noqa: BLE001
@@ -1662,20 +1689,16 @@ def _filter_sglang_drafter_last_hidden_output(logits_output, index) -> None:
         _log_sglang_last_hidden_logprob_check(logits_output, stage="already_filtered")
         return
 
-    # The verify path may already have applied this filter through a source
-    # patch. Keep this helper idempotent so a wrapper can safely call it again
-    # across SGLang versions whose source layout differs.
+    # Keep this helper idempotent through the explicit filtered flag above.
+    # Equal row counts do not mean the accepted-index filter has already been
+    # applied: EAGLE can accept every row while still requiring a tree-order
+    # reindex, and SGLang only filters logits_output.hidden_states itself.
     try:
         index_len = int(index.numel()) if _is_torch_tensor(index) else len(index)
     except Exception:  # noqa: BLE001
         index_len = None
     if _is_torch_tensor(last_hidden_states) and index_len is not None and last_hidden_states.dim() > 0:
         hidden_rows = int(last_hidden_states.shape[0])
-        if hidden_rows == index_len:
-            setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTERED_ATTR, True)
-            _filter_sglang_last_hidden_logprob_check_tensors(logits_output, index)
-            _log_sglang_last_hidden_logprob_check(logits_output, stage="already_filtered")
-            return
         if hidden_rows < index_len:
             logger.warning(
                 "Skip filtering SGLang drafter last-hidden output: hidden_rows=%s < index_len=%s",
@@ -1778,6 +1801,13 @@ def _append_sglang_hidden_chunk_payload(req, chunk, metadata: dict[str, int] | N
     return appended_rows
 
 
+def _sglang_hidden_debug_metadata(logits_output) -> dict:
+    fingerprint = getattr(logits_output, "_verl_drafter_lh_check_lm_head_fingerprint", None)
+    if isinstance(fingerprint, dict):
+        return {"lm_head_fingerprint": fingerprint}
+    return {}
+
+
 def _mark_sglang_hidden_states_stream_final(req) -> None:
     setattr(req, _VERL_HIDDEN_STATES_STREAM_FINAL_ATTR, True)
 
@@ -1807,6 +1837,7 @@ def _append_sglang_hidden_state_chunk_with_budget(
     *,
     position_start: int | None = None,
     prefix_cache_rows: int | None = None,
+    extra_metadata: dict | None = None,
     batch=None,
 ) -> None:
     if not getattr(req, "return_hidden_states", False):
@@ -1854,6 +1885,7 @@ def _append_sglang_hidden_state_chunk_with_budget(
                 "prefix_cache_rows": window_config["prefix_cache_rows"],
                 "window_start": window_start,
                 "window_end": window_end,
+                **(extra_metadata or {}),
             },
         )
         if clipped_end >= window_end:
@@ -1888,7 +1920,7 @@ def _append_sglang_hidden_state_chunk_with_budget(
             except TypeError:
                 pass
 
-    appended_rows = _append_sglang_hidden_chunk_payload(req, chunk)
+    appended_rows = _append_sglang_hidden_chunk_payload(req, chunk, extra_metadata)
     collected_rows += appended_rows
     setattr(req, "_verl_hidden_state_rows", collected_rows)
     if max_rows is not None and max_rows > 0 and collected_rows >= max_rows:
@@ -1931,6 +1963,7 @@ def _append_sglang_prefill_hidden_states(req, logits_output, hidden_state_offset
         chunk,
         position_start=prefix_cache_rows,
         prefix_cache_rows=prefix_cache_rows,
+        extra_metadata=_sglang_hidden_debug_metadata(logits_output),
         batch=batch,
     )
     return end
@@ -1993,6 +2026,7 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
                     req,
                     hidden_states[hidden_state_offset:end],
                     position_start=position_start,
+                    extra_metadata=_sglang_hidden_debug_metadata(logits_output),
                     batch=batch,
                 )
                 return end
@@ -2019,6 +2053,7 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
                 req,
                 chunk,
                 position_start=position_start,
+                extra_metadata=_sglang_hidden_debug_metadata(logits_output),
                 batch=batch,
             )
             return hidden_state_offset + rows
@@ -2040,6 +2075,7 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
                 req,
                 chunk,
                 position_start=position_start,
+                extra_metadata=_sglang_hidden_debug_metadata(logits_output),
                 batch=batch,
             )
             return end
@@ -2069,6 +2105,7 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
             req,
             chunk,
             position_start=position_start,
+            extra_metadata=_sglang_hidden_debug_metadata(logits_output),
             batch=batch,
         )
     else:
@@ -2076,6 +2113,7 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
             req,
             hidden_states[req_index],
             position_start=position_start,
+            extra_metadata=_sglang_hidden_debug_metadata(logits_output),
             batch=batch,
         )
     return hidden_state_offset
