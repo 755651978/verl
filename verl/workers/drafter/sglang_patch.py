@@ -2080,7 +2080,50 @@ def _find_sglang_accepted_indices(*candidates):
             value = _sglang_nested_attr(obj, (name,))
             if value is not None:
                 return value
+        reconstructed = _reconstruct_sglang_accepted_indices_from_lens(obj)
+        if reconstructed is not None:
+            return reconstructed
     return None
+
+
+def _sglang_int_list(value) -> list[int] | None:
+    if value is None:
+        return None
+    try:
+        if _is_torch_tensor(value):
+            value = value.detach().cpu().reshape(-1).tolist()
+        return [int(item) for item in list(value)]
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _reconstruct_sglang_accepted_indices_from_lens(obj):
+    draft_tokens = _sglang_nested_attr(obj, ("speculative_num_draft_tokens",))
+    try:
+        draft_tokens = int(draft_tokens)
+    except (TypeError, ValueError):
+        return None
+    if draft_tokens <= 0:
+        return None
+
+    accept_lens = _sglang_int_list(_sglang_nested_attr(obj, ("accept_lens",)))
+    if accept_lens is None:
+        num_correct = _sglang_int_list(_sglang_nested_attr(obj, ("num_correct_drafts_per_req_cpu",)))
+        if num_correct is not None:
+            accept_lens = [max(int(value) + 1, 1) for value in num_correct]
+    if not accept_lens:
+        return None
+
+    accepted = []
+    for req_idx, accept_len in enumerate(accept_lens):
+        keep = min(max(int(accept_len), 0), draft_tokens)
+        if keep <= 0:
+            continue
+        start = req_idx * draft_tokens
+        accepted.extend(range(start, start + keep))
+    if not accepted:
+        return None
+    return torch.tensor(accepted, dtype=torch.long)
 
 
 def _find_sglang_verify_positions(*candidates):
