@@ -1776,7 +1776,21 @@ def _filter_sglang_drafter_last_hidden_output(logits_output, index) -> None:
     if last_hidden_states is None:
         return
     if bool(getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTERED_ATTR, False)):
-        _filter_sglang_last_hidden_logprob_check_tensors(logits_output, index)
+        try:
+            index_len = int(index.numel()) if _is_torch_tensor(index) else len(index)
+        except Exception:  # noqa: BLE001
+            index_len = None
+        hidden_shape = tuple(last_hidden_states.shape) if _is_torch_tensor(last_hidden_states) else None
+        setattr(
+            logits_output,
+            _VERL_DRAFTER_LAST_HIDDEN_FILTER_SUMMARY_ATTR,
+            {
+                "stage": "already_filtered",
+                "hidden_rows": _sglang_hidden_state_rows(last_hidden_states),
+                "index_len": index_len,
+                "hidden_shape": hidden_shape,
+            },
+        )
         _log_sglang_last_hidden_logprob_check(logits_output, stage="already_filtered")
         return
 
@@ -1872,6 +1886,15 @@ def _filter_sglang_drafter_last_hidden_output(logits_output, index) -> None:
         setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTER_SUMMARY_ATTR, filter_summary)
     _filter_sglang_last_hidden_logprob_check_tensors(logits_output, index)
     _log_sglang_last_hidden_logprob_check(logits_output, stage="filtered")
+
+
+def _filter_sglang_drafter_last_hidden_from_verify_result(logits_output, result) -> None:
+    accepted_indices = getattr(result, "accept_indices", None)
+    if accepted_indices is None:
+        accepted_indices = getattr(result, "accepted_indices", None)
+    if accepted_indices is None:
+        return
+    _filter_sglang_drafter_last_hidden_output(logits_output, accepted_indices)
 
 
 def _sglang_hidden_chunk_rows(chunk) -> int:
@@ -2178,6 +2201,7 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
             )
             setattr(req, "_verl_logged_missing_decode_hidden_states", True)
         return hidden_state_offset
+    _filter_sglang_drafter_last_hidden_from_verify_result(logits_output, result)
 
     accept_rows_per_req = _sglang_decode_accept_rows_per_req(result)
     if accept_rows_per_req is not None and req_index < len(accept_rows_per_req) and _is_torch_tensor(hidden_states):
