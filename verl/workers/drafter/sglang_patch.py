@@ -2275,8 +2275,48 @@ def _filter_sglang_drafter_last_hidden_output(logits_output, index, positions=No
     if last_hidden_states is None:
         if bool(getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTERED_ATTR, False)):
             return
+        filtered_positions = None
+        if positions is not None:
+            try:
+                if _is_torch_tensor(positions):
+                    positions_tensor = positions.to(dtype=torch.long).reshape(-1)
+                else:
+                    positions_tensor = torch.tensor(list(positions), dtype=torch.long).reshape(-1)
+                if index_len > 0:
+                    position_index = index_tensor.to(device=positions_tensor.device, dtype=torch.long)
+                    if int(positions_tensor.numel()) > int(position_index.max().item()):
+                        filtered_positions = positions_tensor[position_index].detach()
+                        setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_POSITIONS_ATTR, filtered_positions)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to filter SGLang drafter positions without last_hidden: %s", exc)
         _filter_sglang_last_hidden_logprob_check_tensors(logits_output, index_tensor)
         setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTERED_ATTR, True)
+        pos_head, pos_tail = _sglang_tensor_head_tail(filtered_positions)
+        contiguous_rows, positions_contiguous, first_break = _sglang_first_contiguous_position_len(filtered_positions)
+        raw_topk_logprobs = getattr(logits_output, _VERL_DRAFTER_LH_CHECK_RAW_TOPK_LOGPROBS_ATTR, None)
+        _set_sglang_last_hidden_filter_summary(
+            logits_output,
+            {
+                "stage": "filtered_no_last_hidden",
+                "hidden_rows_before": None,
+                "hidden_rows_after": None,
+                "base_hidden_rows_after": _sglang_hidden_state_rows(getattr(logits_output, "hidden_states", None)),
+                "raw_topk_rows_after": (
+                    int(raw_topk_logprobs.shape[0])
+                    if _is_torch_tensor(raw_topk_logprobs) and raw_topk_logprobs.dim() > 0
+                    else None
+                ),
+                "index_len": index_len,
+                "accept_indices_head": accept_head,
+                "accept_indices_tail": accept_tail,
+                "positions_len": int(filtered_positions.numel()) if _is_torch_tensor(filtered_positions) else None,
+                "positions_contiguous": positions_contiguous,
+                "first_contiguous_rows": contiguous_rows,
+                "first_break": first_break,
+                "positions_head": pos_head,
+                "positions_tail": pos_tail,
+            },
+        )
         return
     if bool(getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTERED_ATTR, False)):
         filtered_positions = getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_POSITIONS_ATTR, None)
