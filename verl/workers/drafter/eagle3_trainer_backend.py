@@ -643,7 +643,15 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
         """
         针对单条数据：裁剪窗口、生成Mask、确保维度对齐
         """
-        res = {'ids':[], 'h_states':[], 'masks': [], 'position_ids': [], 'last_h_states': [], 'target_logprobs': []}
+        res = {
+            'ids': [],
+            'h_states': [],
+            'masks': [],
+            'hidden_positions': [],
+            'position_ids': [],
+            'last_h_states': [],
+            'target_logprobs': [],
+        }
         pad_id = int(getattr(model_config, "pad_token_id", 0) or 0)
         h_dim = getattr(model_config, "target_hidden_size", model_config.hidden_size)
         num_aux_hidden_states = getattr(model_config, "num_aux_hidden_states", None)
@@ -707,9 +715,15 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
                     item_loss_mask[:] = 1.0
             else:
                 item_loss_mask = item["loss_mask"].to(device, dtype=torch.float32, non_blocking=True)
+            item_hidden_positions = item.get("hidden_positions")
+            if item_hidden_positions is not None:
+                item_hidden_positions = item_hidden_positions.to(device, dtype=torch.long, non_blocking=True)
             item_position_ids = item.get("position_ids")
             if item_position_ids is None:
-                item_position_ids = torch.arange(full_len, device=device, dtype=torch.long)
+                if item_hidden_positions is not None:
+                    item_position_ids = item_hidden_positions + 1
+                else:
+                    item_position_ids = torch.arange(full_len, device=device, dtype=torch.long)
             else:
                 item_position_ids = item_position_ids.to(device, dtype=torch.long, non_blocking=True)
             
@@ -717,6 +731,9 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
             end = full_len
             res['ids'].append(ids[start:end])
             res['h_states'].append(h_states[start:end])
+            res['hidden_positions'].append(
+                item_hidden_positions[start:end] if item_hidden_positions is not None else None
+            )
             res['position_ids'].append(item_position_ids[start:end])
             if not use_logits:
                 res['last_h_states'].append(last_h_states[start:end])

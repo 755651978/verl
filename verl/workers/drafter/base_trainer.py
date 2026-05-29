@@ -239,7 +239,11 @@ def _target_top_ids(target_logprobs: torch.Tensor, row: int, limit: int) -> list
 
 
 def _eagle_target_logprobs_train_start(source_item: dict) -> int:
-    feature_start = source_item.get("_verl_feature_start")
+    hidden_positions = source_item.get("hidden_positions")
+    if isinstance(hidden_positions, torch.Tensor) and int(hidden_positions.numel()) > 0:
+        feature_start = int(hidden_positions.reshape(-1)[0].item())
+    else:
+        feature_start = source_item.get("_verl_feature_start")
     target_position_start = source_item.get("_verl_target_position_start")
     try:
         return max(int(feature_start) + 1 - int(target_position_start), 0)
@@ -1193,6 +1197,7 @@ class DrafterBaseTrainer:
                 if hidden_positions_item.numel() <= 0:
                     hidden_positions_item = None
             hidden_position_start = _batch_item_int(batch.get("hidden_position_start"), i)
+            uses_hidden_positions = hidden_positions_item is not None
             if hidden_positions_item is not None:
                 contiguous_mask = hidden_positions_item[1:] == hidden_positions_item[:-1] + 1
                 if contiguous_mask.numel() > 0 and not bool(contiguous_mask.all()):
@@ -1208,24 +1213,29 @@ class DrafterBaseTrainer:
                     )
                     hidden_positions_item = hidden_positions_item[:first_break]
                 hidden_position_start = max(int(hidden_positions_item[0].item()), 0)
-            elif hidden_position_start is None:
-                hidden_position_start = max(expected_hidden_rows - hidden_seq_length, 0)
-            # Hidden rows are next-token features for original positions. If
-            # prefix cache reused leading prompt tokens, the first returned
-            # hidden row starts after that reused prefix; keep the remaining
-            # rows head-aligned from that original position onward.
-            feature_start = min(max(hidden_position_start, 0), input_seq_length)
-            hidden_start = 0
-            if hidden_positions_item is not None:
-                hidden_feature_length = min(
+                # Phase 3: SGLang hidden_positions is the source of truth.
+                # Hidden row p supervises token p+1 and target row p+1, and
+                # the loss row is p+2, so keep only rows with that token window.
+                max_hidden_rows = min(
                     int(hidden_positions_item.numel()),
                     hidden_seq_length,
-                    max(input_seq_length - feature_start, 0),
+                    max(input_seq_length - hidden_position_start - 1, 0),
                 )
+                hidden_start = 0
+                hidden_feature_length = max_hidden_rows
+                hidden_end = hidden_feature_length
+                feature_start = hidden_position_start
+                feature_end = min(input_seq_length, feature_start + hidden_feature_length + 1)
             else:
+                if hidden_position_start is None:
+                    hidden_position_start = max(expected_hidden_rows - hidden_seq_length, 0)
+                # Legacy fallback for non-SGLang or older buffered samples.
+                # New SGLang EAGLE3 samples should always carry hidden_positions.
+                feature_start = min(max(hidden_position_start, 0), input_seq_length)
+                hidden_start = 0
                 hidden_feature_length = min(hidden_seq_length, max(input_seq_length - feature_start - 1, 0))
-            hidden_end = hidden_feature_length
-            feature_end = min(input_seq_length, feature_start + hidden_feature_length + 1)
+                hidden_end = hidden_feature_length
+                feature_end = min(input_seq_length, feature_start + hidden_feature_length + 1)
 
             target_logprobs_position_start = None
             target_logprobs_position_end = None
@@ -1305,11 +1315,21 @@ class DrafterBaseTrainer:
                 target_end = min(max(feature_end - 1 - target_base, target_start), target_limit)
                 target_logprobs_item = cpu_target_logprobs[i, target_start:target_end, ...]
 
+            kept_hidden_positions = (
+                hidden_positions_item[hidden_start:hidden_end] if hidden_positions_item is not None else None
+            )
+            item_position_ids = (
+                kept_hidden_positions + 1
+                if kept_hidden_positions is not None
+                else torch.arange(feature_start + 1, feature_start + 1 + hidden_feature_length, dtype=torch.long)
+            )
+
             data_item = {
                 "input_ids": cpu_input_ids[i, feature_start:feature_end],
                 "hidden_states": cpu_h_states[i, hidden_start:hidden_end, :],
+                "hidden_positions": kept_hidden_positions,
                 "loss_mask": full_loss_mask[feature_start:feature_end],
-                "position_ids": torch.arange(feature_start + 1, feature_start + 1 + hidden_feature_length, dtype=torch.long),
+                "position_ids": item_position_ids,
                 "target_logprobs": target_logprobs_item,
                 "responses": cpu_responses[i] if cpu_responses is not None else None,
                 "prompts": cpu_prompts[i] if cpu_prompts is not None else None,
@@ -1318,9 +1338,8 @@ class DrafterBaseTrainer:
                 "_verl_hidden_start": hidden_start,
                 "_verl_hidden_end": hidden_end,
                 "_verl_hidden_position_start": hidden_position_start,
-                "_verl_hidden_positions": (
-                    hidden_positions_item[hidden_start:hidden_end] if hidden_positions_item is not None else None
-                ),
+                "_verl_uses_hidden_positions": uses_hidden_positions,
+                "_verl_hidden_positions": kept_hidden_positions,
                 "_verl_target_start": target_start if cpu_target_logprobs is not None else None,
                 "_verl_target_end": target_end if cpu_target_logprobs is not None else None,
                 "_verl_target_position_start": (
@@ -1700,6 +1719,42 @@ class DrafterBaseTrainer:
                     train_target_logprobs = target_logprobs_item[
                         target_logprobs_train_start : target_logprobs_train_start + train_seq_len
                     ]
+                source_hidden_positions = source_item.get("hidden_positions")
+                if source_hidden_positions is None:
+                    source_hidden_positions = source_item.get("_verl_hidden_positions")
+                if isinstance(source_hidden_positions, torch.Tensor):
+                    source_hidden_positions = source_hidden_positions.reshape(-1)
+                    train_hidden_positions = source_hidden_positions[:train_seq_len]
+                    base_hidden_position_start = (
+                        int(train_hidden_positions[0].item()) if int(train_hidden_positions.numel()) > 0 else None
+                    )
+                    base_hidden_position_end = (
+                        int(train_hidden_positions[-1].item()) + 1 if int(train_hidden_positions.numel()) > 0 else None
+                    )
+                    last_hidden_position_start = (
+                        int(source_hidden_positions[1].item())
+                        if uses_shifted_eagle_inputs and int(source_hidden_positions.numel()) > 1
+                        else None
+                    )
+                    last_hidden_position_end = (
+                        int(source_hidden_positions[train_seq_len].item()) + 1
+                        if uses_shifted_eagle_inputs and int(source_hidden_positions.numel()) > train_seq_len
+                        else None
+                    )
+                else:
+                    base_hidden_position_start = source_item.get("_verl_feature_start")
+                    base_hidden_position_end = int(source_item.get("_verl_feature_start", 0) or 0) + train_seq_len
+                    last_hidden_position_start = (
+                        int(source_item.get("_verl_feature_start", 0) or 0) + 1
+                    ) if uses_shifted_eagle_inputs else None
+                    last_hidden_position_end = (
+                        int(source_item.get("_verl_feature_start", 0) or 0) + 1 + train_seq_len
+                    ) if uses_shifted_eagle_inputs else None
+                effective_target_position_start = source_item.get("_verl_target_position_start")
+                effective_target_position_end = source_item.get("_verl_target_position_end")
+                if self.backend.model_type == "eagle3" and not use_logits:
+                    effective_target_position_start = last_hidden_position_start
+                    effective_target_position_end = last_hidden_position_end
                 row_valid_count = None
                 active_rows = None
                 active_valid = None
@@ -1737,24 +1792,15 @@ class DrafterBaseTrainer:
                             "hidden_start": source_item.get("_verl_hidden_start"),
                             "hidden_end": source_item.get("_verl_hidden_end"),
                             "hidden_position_start": source_item.get("_verl_hidden_position_start"),
-                            "base_hidden_position_start": source_item.get("_verl_feature_start"),
-                            "base_hidden_position_end": (
-                                int(source_item.get("_verl_feature_start", 0) or 0) + train_seq_len
-                            ),
-                            "last_hidden_position_start": (
-                                int(source_item.get("_verl_feature_start", 0) or 0) + 1
-                            )
-                            if uses_shifted_eagle_inputs
-                            else None,
-                            "last_hidden_position_end": (
-                                int(source_item.get("_verl_feature_start", 0) or 0) + 1 + train_seq_len
-                            )
-                            if uses_shifted_eagle_inputs
-                            else None,
+                            "uses_hidden_positions": source_item.get("_verl_uses_hidden_positions"),
+                            "base_hidden_position_start": base_hidden_position_start,
+                            "base_hidden_position_end": base_hidden_position_end,
+                            "last_hidden_position_start": last_hidden_position_start,
+                            "last_hidden_position_end": last_hidden_position_end,
                             "target_start": source_item.get("_verl_target_start"),
                             "target_end": source_item.get("_verl_target_end"),
-                            "target_position_start": source_item.get("_verl_target_position_start"),
-                            "target_position_end": source_item.get("_verl_target_position_end"),
+                            "target_position_start": effective_target_position_start,
+                            "target_position_end": effective_target_position_end,
                             "target_train_start": target_logprobs_train_start,
                             "target_train_position_start": (
                                 int(source_item.get("_verl_target_position_start", 0) or 0)
