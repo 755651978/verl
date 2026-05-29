@@ -76,6 +76,7 @@ _VERL_HIDDEN_STATE_PROMPT_LEN_PARAM = "_verl_prompt_len"
 _VERL_DRAFTER_RETURN_LAST_HIDDEN_ENV = "VERL_SGLANG_DRAFTER_RETURN_LAST_HIDDEN"
 _VERL_DRAFTER_RETURN_LAST_HIDDEN_PARAM = "_verl_drafter_return_last_hidden"
 _VERL_DFLASH_RETURN_AUX_HIDDEN_PARAM = "_verl_dflash_return_aux_hidden"
+_VERL_DRAFTER_RAW_TOP_LOGPROBS_ENV = "VERL_DRAFTER_RAW_TOP_LOGPROBS"
 _VERL_TOP_LOGPROBS_TENSOR_PARAM = "_verl_top_logprobs_tensor_output"
 _VERL_OUTPUT_TOP_LOGPROBS_TENSOR_KEY = "_verl_output_top_logprobs_tensor"
 _VERL_TOP_LOGPROBS_OUTPUT_ROW_START_PARAM = "_verl_top_logprobs_output_row_start"
@@ -873,6 +874,16 @@ class SGLangHttpServer:
         os.environ[_VERL_DRAFTER_RETURN_LAST_HIDDEN_ENV] = (
             "1" if return_last_hidden_for_drafter else "0"
         )
+        os.environ[_VERL_DRAFTER_RAW_TOP_LOGPROBS_ENV] = (
+            "1"
+            if (
+                self.config.drafter.enable
+                and self.config.drafter.enable_drafter_training
+                and self.config.drafter.training.collect_hidden_states_from_sgl
+                and self.config.drafter.training.use_logits
+            )
+            else "0"
+        )
 
         # NOTE: We can't directly call SGLang's launch_server since it's not an async function.
         # https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/entrypoints/http_server.py
@@ -1394,6 +1405,27 @@ class SGLangHttpServer:
                         tail_tokens=max_hidden_tokens,
                     )
                 hidden_kept_len = int(hidden_states.size(0))
+                if collect_target_logprobs and torch.is_tensor(hidden_raw_target_logprobs):
+                    # Prefer raw logprobs captured directly from SGLang
+                    # next_token_logits. These rows align with hidden row p and
+                    # supervise token position p + 1, matching the EAGLE shift
+                    # used later in collect_online_data().
+                    target_logprobs = hidden_raw_target_logprobs
+                    target_logprobs_position_start = int(hidden_position_start) + 1
+                    target_logprobs_position_end = target_logprobs_position_start + int(target_logprobs.size(0))
+                    target_logprobs_dropped_rows = 0
+                    output_top_len = int(target_logprobs.size(0))
+                elif collect_target_logprobs:
+                    if target_logprobs is not None:
+                        logger.warning(
+                            "Discard SGLang output_top_logprobs for drafter logits training because "
+                            "raw next_token_logits metadata is missing"
+                        )
+                    target_logprobs = None
+                    target_logprobs_position_start = None
+                    target_logprobs_position_end = None
+                    target_logprobs_dropped_rows = 0
+                    output_top_len = None
                 if collect_target_logprobs and target_logprobs is not None:
                     target_window_start = int(hidden_position_start) + 1
                     target_window_end = min(
