@@ -20,6 +20,8 @@ device_name = get_device_name()
 _LAST_HIDDEN_LOGPROB_CHECK_ENV = "VERL_DRAFTER_LAST_HIDDEN_LOGPROB_CHECK"
 _LAST_HIDDEN_LOGPROB_CHECK_MAX_LOGS_ENV = "VERL_DRAFTER_LAST_HIDDEN_LOGPROB_CHECK_MAX_LOGS"
 _HIDDEN_BLOCK_DEBUG_LOG_COUNT = 0
+_RAW_TOPK_DEBUG_LOG_COUNT = 0
+_RAW_HIDDEN_METADATA_SOURCE = "raw_hidden_metadata"
 
 
 class _SyncedTargetHead(torch.nn.Module):
@@ -130,6 +132,64 @@ def _log_eagle3_hidden_block_check(full_h: torch.Tensor, h_dim: int, item_idx: i
             _HIDDEN_BLOCK_DEBUG_LOG_COUNT += 1
     except Exception as exc:  # noqa: BLE001
         logger.warning("[drafter hidden block check] failed: %s", exc)
+
+
+def _log_eagle3_raw_topk_check(last_h_states: torch.Tensor, target_model, item_idx: int, item: dict) -> None:
+    global _RAW_TOPK_DEBUG_LOG_COUNT
+    if not _last_hidden_logprob_check_enabled():
+        return
+    if _RAW_TOPK_DEBUG_LOG_COUNT >= _last_hidden_logprob_check_max_logs():
+        return
+    if item.get("hidden_target_logprobs_source") != _RAW_HIDDEN_METADATA_SOURCE:
+        return
+    raw_target_logprobs = item.get("hidden_raw_target_logprobs")
+    if not torch.is_tensor(raw_target_logprobs) or raw_target_logprobs.dim() != 3 or raw_target_logprobs.size(-1) < 2:
+        return
+    if target_model is None:
+        logger.warning("[drafter raw topk check] skip item_idx=%s: missing synced target_model", item_idx)
+        return
+    try:
+        with torch.no_grad():
+            rows = min(int(last_h_states.size(0)), int(raw_target_logprobs.size(0)), 128)
+            if rows <= 0:
+                return
+            target_device = next(target_model.parameters()).device
+            check_hidden = last_h_states[:rows].to(device=target_device)
+            target_scores = target_model(check_hidden).float()
+            raw_top1_ids = raw_target_logprobs[:rows, 0, 1].to(device=target_scores.device, dtype=torch.long)
+            raw_top1_logprobs = raw_target_logprobs[:rows, 0, 0].to(device=target_scores.device, dtype=torch.float32)
+            valid = (raw_top1_ids >= 0) & (raw_top1_ids < int(target_scores.size(-1)))
+            if not bool(valid.any()):
+                logger.warning(
+                    "[drafter raw topk check] no valid raw ids item_idx=%s rows=%s target_vocab=%s raw_shape=%s",
+                    item_idx,
+                    rows,
+                    int(target_scores.size(-1)),
+                    tuple(raw_target_logprobs.shape),
+                )
+                _RAW_TOPK_DEBUG_LOG_COUNT += 1
+                return
+            target_logprobs = F.log_softmax(target_scores, dim=-1)
+            target_top1_ids = target_logprobs.argmax(dim=-1)
+            row_ids = torch.arange(rows, device=target_scores.device)
+            target_at_raw_top1 = target_logprobs[row_ids[valid], raw_top1_ids[valid]]
+            diff = (target_at_raw_top1 - raw_top1_logprobs[valid]).abs()
+            top1_match = (target_top1_ids[valid] == raw_top1_ids[valid]).float().mean()
+            logger.warning(
+                "[drafter raw topk check] source=%s item_idx=%s rows=%s valid_rows=%s top1_match=%.6f "
+                "logprob_abs_diff_mean=%.6g raw_topk=%s sglang_attach=%s",
+                item.get("hidden_target_logprobs_source"),
+                item_idx,
+                rows,
+                int(valid.detach().sum().cpu().item()),
+                float(top1_match.detach().cpu().item()),
+                float(diff.mean().detach().cpu().item()),
+                int(raw_target_logprobs.size(1)),
+                item.get("hidden_raw_topk_logprob_check"),
+            )
+            _RAW_TOPK_DEBUG_LOG_COUNT += 1
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[drafter raw topk check] failed: %s", exc)
 
 
 def _masked_soft_cross_entropy(
@@ -694,6 +754,7 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
             h_states = full_h[:, :aux_hidden_size]
             if not use_logits:
                 last_h_states = full_h[:, aux_hidden_size : aux_hidden_size + h_dim]
+                _log_eagle3_raw_topk_check(last_h_states, getattr(self, "target_model", None), item_idx, item)
 
             # Compute loss_mask if not present (for DataBuffer items)
             full_len = ids.size(0)

@@ -547,6 +547,23 @@ def _hidden_state_metadata_from_chunk(hidden_state_chunk: Any) -> dict[str, int]
     last_hidden_logprob_check = hidden_state_chunk.get("last_hidden_logprob_check")
     if isinstance(last_hidden_logprob_check, dict):
         metadata["last_hidden_logprob_check"] = last_hidden_logprob_check
+    target_logprobs_source = hidden_state_chunk.get("target_logprobs_source")
+    if isinstance(target_logprobs_source, str):
+        metadata["target_logprobs_source"] = target_logprobs_source
+    raw_topk_logprob_check = hidden_state_chunk.get("raw_topk_logprob_check")
+    if isinstance(raw_topk_logprob_check, dict):
+        metadata["raw_topk_logprob_check"] = raw_topk_logprob_check
+    raw_target_logprobs = hidden_state_chunk.get("raw_target_logprobs")
+    if raw_target_logprobs is not None:
+        try:
+            if torch.is_tensor(raw_target_logprobs):
+                raw_tensor = raw_target_logprobs.detach().to(device="cpu", dtype=torch.float32)
+            else:
+                raw_tensor = torch.tensor(raw_target_logprobs, dtype=torch.float32)
+            if raw_tensor.dim() == 3 and raw_tensor.size(-1) >= 2:
+                metadata["raw_target_logprobs"] = raw_tensor.contiguous()
+        except Exception:  # noqa: BLE001
+            logger.warning("Failed to normalize raw top-k target logprobs metadata; ignoring raw debug top-k")
     last_hidden_filter = hidden_state_chunk.get("last_hidden_filter")
     if isinstance(last_hidden_filter, dict):
         metadata["last_hidden_filter"] = last_hidden_filter
@@ -1255,6 +1272,9 @@ class SGLangHttpServer:
             hidden_window_end = None
             hidden_lm_head_fingerprint = None
             hidden_last_hidden_logprob_check = None
+            hidden_target_logprobs_source = None
+            hidden_raw_topk_logprob_check = None
+            hidden_raw_target_logprobs = None
             hidden_last_hidden_filter = None
             hidden_last_hidden_select = None
             hidden_positions = None
@@ -1310,6 +1330,36 @@ class SGLangHttpServer:
                         ),
                         None,
                     )
+                    hidden_target_logprobs_source = next(
+                        (
+                            metadata.get("target_logprobs_source")
+                            for metadata in reversed(hidden_states_metadata)
+                            if metadata.get("target_logprobs_source") is not None
+                        ),
+                        None,
+                    )
+                    hidden_raw_topk_logprob_check = next(
+                        (
+                            metadata.get("raw_topk_logprob_check")
+                            for metadata in reversed(hidden_states_metadata)
+                            if metadata.get("raw_topk_logprob_check") is not None
+                        ),
+                        None,
+                    )
+                    raw_target_logprob_chunks = [
+                        metadata.get("raw_target_logprobs")
+                        for metadata in hidden_states_metadata
+                        if torch.is_tensor(metadata.get("raw_target_logprobs"))
+                    ]
+                    if raw_target_logprob_chunks:
+                        hidden_raw_target_logprobs = torch.cat(raw_target_logprob_chunks, dim=0).contiguous()
+                        if int(hidden_raw_target_logprobs.size(0)) != hidden_raw_len:
+                            logger.warning(
+                                "Drop raw top-k debug metadata with mismatched rows: raw_rows=%s hidden_rows=%s",
+                                int(hidden_raw_target_logprobs.size(0)),
+                                hidden_raw_len,
+                            )
+                            hidden_raw_target_logprobs = None
                     hidden_last_hidden_filter = next(
                         (
                             metadata.get("last_hidden_filter")
@@ -1376,6 +1426,13 @@ class SGLangHttpServer:
                     "hidden_window_end": hidden_window_end,
                     "hidden_lm_head_fingerprint": hidden_lm_head_fingerprint,
                     "hidden_last_hidden_logprob_check": hidden_last_hidden_logprob_check,
+                    "hidden_target_logprobs_source": hidden_target_logprobs_source,
+                    "hidden_raw_topk_logprob_check": hidden_raw_topk_logprob_check,
+                    "hidden_raw_target_logprobs": (
+                        hidden_raw_target_logprobs.unsqueeze(0).cpu()
+                        if torch.is_tensor(hidden_raw_target_logprobs)
+                        else None
+                    ),
                     "hidden_last_hidden_filter": hidden_last_hidden_filter,
                     "hidden_last_hidden_select": hidden_last_hidden_select,
                     "target_logprobs": target_logprobs.unsqueeze(0).cpu() if target_logprobs is not None else None,
@@ -1437,6 +1494,9 @@ class SGLangHttpServer:
                         "hidden_window_end": hidden_window_end,
                         "hidden_lm_head_fingerprint": hidden_lm_head_fingerprint,
                         "hidden_last_hidden_logprob_check": hidden_last_hidden_logprob_check,
+                        "hidden_target_logprobs_source": hidden_target_logprobs_source,
+                        "hidden_raw_topk_logprob_check": hidden_raw_topk_logprob_check,
+                        "hidden_raw_target_shape": _tensor_shape(hidden_raw_target_logprobs),
                         "hidden_last_hidden_filter": hidden_last_hidden_filter,
                         "hidden_last_hidden_select": hidden_last_hidden_select,
                         "sampling_debug": sampling_debug,

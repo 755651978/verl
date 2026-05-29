@@ -1148,6 +1148,11 @@ class DrafterBaseTrainer:
             source_tensors.append(hidden_positions)
         else:
             hidden_positions = None
+        hidden_raw_target_logprobs = batch.get("hidden_raw_target_logprobs")
+        if isinstance(hidden_raw_target_logprobs, torch.Tensor):
+            source_tensors.append(hidden_raw_target_logprobs)
+        else:
+            hidden_raw_target_logprobs = None
         if target_logprobs is not None:
             source_tensors.append(target_logprobs)
         if "responses" in batch and batch["responses"] is not None:
@@ -1169,6 +1174,11 @@ class DrafterBaseTrainer:
                 cpu_hidden_positions = (
                     hidden_positions.to('cpu', non_blocking=True) if hidden_positions is not None else None
                 )
+                cpu_hidden_raw_target_logprobs = (
+                    hidden_raw_target_logprobs.to('cpu', non_blocking=True)
+                    if hidden_raw_target_logprobs is not None
+                    else None
+                )
                 cpu_responses = batch.get("responses").to('cpu', non_blocking=True) if "responses" in batch else None
                 cpu_prompts = batch.get("prompts").to('cpu', non_blocking=True) if "prompts" in batch else None
 
@@ -1178,6 +1188,9 @@ class DrafterBaseTrainer:
             cpu_h_states = hidden_states.to('cpu')
             cpu_target_logprobs = target_logprobs.to('cpu') if target_logprobs is not None else None
             cpu_hidden_positions = hidden_positions.to('cpu') if hidden_positions is not None else None
+            cpu_hidden_raw_target_logprobs = (
+                hidden_raw_target_logprobs.to('cpu') if hidden_raw_target_logprobs is not None else None
+            )
             cpu_responses = batch.get("responses").to('cpu') if "responses" in batch else None
             cpu_prompts = batch.get("prompts").to('cpu') if "prompts" in batch else None
 
@@ -1319,6 +1332,9 @@ class DrafterBaseTrainer:
             kept_hidden_positions = (
                 hidden_positions_item[hidden_start:hidden_end] if hidden_positions_item is not None else None
             )
+            hidden_raw_target_logprobs_item = None
+            if cpu_hidden_raw_target_logprobs is not None:
+                hidden_raw_target_logprobs_item = cpu_hidden_raw_target_logprobs[i, hidden_start:hidden_end, ...]
             item_position_ids = (
                 kept_hidden_positions + 1
                 if kept_hidden_positions is not None
@@ -1356,6 +1372,9 @@ class DrafterBaseTrainer:
                 "_verl_input_seq_length": input_seq_length,
                 "hidden_lm_head_fingerprint": batch.get("hidden_lm_head_fingerprint"),
                 "hidden_last_hidden_logprob_check": batch.get("hidden_last_hidden_logprob_check"),
+                "hidden_target_logprobs_source": batch.get("hidden_target_logprobs_source"),
+                "hidden_raw_topk_logprob_check": batch.get("hidden_raw_topk_logprob_check"),
+                "hidden_raw_target_logprobs": hidden_raw_target_logprobs_item,
                 "hidden_last_hidden_filter": batch.get("hidden_last_hidden_filter"),
                 "hidden_last_hidden_select": batch.get("hidden_last_hidden_select"),
                 "global_step": _batch_item_int(batch.get("global_step"), i),
@@ -1406,6 +1425,9 @@ class DrafterBaseTrainer:
                             "target_tensor_position_end": target_logprobs_position_end,
                             "hidden_lm_head_fingerprint": data_item.get("hidden_lm_head_fingerprint"),
                             "hidden_last_hidden_logprob_check": data_item.get("hidden_last_hidden_logprob_check"),
+                            "hidden_target_logprobs_source": data_item.get("hidden_target_logprobs_source"),
+                            "hidden_raw_topk_logprob_check": data_item.get("hidden_raw_topk_logprob_check"),
+                            "hidden_raw_target_shape": _tensor_shape(data_item.get("hidden_raw_target_logprobs")),
                             "hidden_last_hidden_filter": data_item.get("hidden_last_hidden_filter"),
                             "hidden_last_hidden_select": data_item.get("hidden_last_hidden_select"),
                             "item_global_step": data_item.get("global_step"),
@@ -1821,6 +1843,9 @@ class DrafterBaseTrainer:
                             "item_global_step": source_item.get("global_step"),
                             "hidden_lm_head_fingerprint": source_item.get("hidden_lm_head_fingerprint"),
                             "hidden_last_hidden_logprob_check": source_item.get("hidden_last_hidden_logprob_check"),
+                            "hidden_target_logprobs_source": source_item.get("hidden_target_logprobs_source"),
+                            "hidden_raw_topk_logprob_check": source_item.get("hidden_raw_topk_logprob_check"),
+                            "hidden_raw_target_shape": _tensor_shape(source_item.get("hidden_raw_target_logprobs")),
                             "hidden_last_hidden_filter": source_item.get("hidden_last_hidden_filter"),
                             "hidden_last_hidden_select": source_item.get("hidden_last_hidden_select"),
                             "target_lm_head_weight_step": getattr(self, "_target_lm_head_weight_step", None),
@@ -2081,6 +2106,12 @@ class DrafterBaseTrainer:
                         ],
                         "source_last_hidden_logprob_checks": [
                             item.get("hidden_last_hidden_logprob_check") for item in items[:2]
+                        ],
+                        "source_target_logprobs_sources": [
+                            item.get("hidden_target_logprobs_source") for item in items[:2]
+                        ],
+                        "source_raw_topk_checks": [
+                            item.get("hidden_raw_topk_logprob_check") for item in items[:2]
                         ],
                         "source_last_hidden_filters": [item.get("hidden_last_hidden_filter") for item in items[:2]],
                         "source_last_hidden_selects": [item.get("hidden_last_hidden_select") for item in items[:2]],
