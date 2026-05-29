@@ -51,6 +51,7 @@ _EAGLE_TOP_K_RENORM_FAST_PATH_ENV = "VERL_SGLANG_NPU_EAGLE_TOP_K_RENORM_FAST_PAT
 _DRAFTER_RETURN_LAST_HIDDEN_ENV = "VERL_SGLANG_DRAFTER_RETURN_LAST_HIDDEN"
 _DRAFTER_LAST_HIDDEN_LOGPROB_CHECK_ENV = "VERL_DRAFTER_LAST_HIDDEN_LOGPROB_CHECK"
 _DRAFTER_LAST_HIDDEN_LOGPROB_CHECK_MAX_LOGS_ENV = "VERL_DRAFTER_LAST_HIDDEN_LOGPROB_CHECK_MAX_LOGS"
+_SGLANG_RETURN_ORIGINAL_LOGPROB_ENV = "SGLANG_RETURN_ORIGINAL_LOGPROB"
 _DISABLE_SGLANG_PATCH_ENV = "VERL_DISABLE_SGLANG_PATCH"
 _SGLANG_PATCHES_ENV = "VERL_SGLANG_PATCHES"
 
@@ -100,6 +101,16 @@ _VERL_DRAFTER_LH_CHECK_SGLANG_TOP_IDS_ATTR = "_verl_drafter_lh_check_sglang_top_
 _VERL_DRAFTER_LH_CHECK_SGLANG_TOP_LOGPROBS_ATTR = "_verl_drafter_lh_check_sglang_top_logprobs"
 _VERL_DRAFTER_LH_CHECK_SUMMARY_ATTR = "_verl_drafter_lh_check_summary"
 _VERL_DRAFTER_LAST_HIDDEN_FILTER_SUMMARY_ATTR = "_verl_drafter_last_hidden_filter_summary"
+
+
+def enable_sglang_original_logprob_return() -> None:
+    """Make SGLang return pre-temperature/top-p/top-k logprobs when logprobs are requested."""
+    os.environ[_SGLANG_RETURN_ORIGINAL_LOGPROB_ENV] = "1"
+    try:
+        sampler_module = importlib.import_module("sglang.srt.layers.sampler")
+        setattr(sampler_module, _SGLANG_RETURN_ORIGINAL_LOGPROB_ENV, True)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Could not sync SGLang original-logprob sampler flag yet: %s", exc)
 
 
 def configure_sglang_eagle_weight_update_patch(
@@ -3595,6 +3606,9 @@ def _apply_sglang_child_process_patches() -> None:
     if _sglang_verl_patches_disabled():
         logger.warning("Skip all verl SGLang patches because %s=1.", _DISABLE_SGLANG_PATCH_ENV)
         return
+
+    if os.getenv(_SGLANG_RETURN_ORIGINAL_LOGPROB_ENV) == "1":
+        enable_sglang_original_logprob_return()
 
     logger.warning("Applying verl SGLang patches in scheduler subprocess.")
     _apply_selected_sglang_patches()

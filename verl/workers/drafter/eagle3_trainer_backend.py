@@ -348,233 +348,6 @@ def _log_topk_draft_vocab_coverage(
         )
 
 
-def _log_last_hidden_logprob_check(
-    target_scores: torch.Tensor,
-    target_topk_logprobs: torch.Tensor,
-    t2d: torch.Tensor,
-    loss_mask: torch.Tensor,
-    target_head_weight: torch.Tensor | None = None,
-) -> None:
-    if (
-        not isinstance(target_scores, torch.Tensor)
-        or not isinstance(target_topk_logprobs, torch.Tensor)
-        or target_topk_logprobs.numel() == 0
-    ):
-        return
-
-    with torch.no_grad():
-        scores = target_scores.detach()
-        if scores.dim() == 3:
-            scores = scores.squeeze(0)
-        topk = target_topk_logprobs.detach()
-        if topk.dim() == 4:
-            topk = topk.squeeze(0)
-        mask = loss_mask.detach()
-        if mask.dim() == 2:
-            mask = mask.squeeze(0)
-        if scores.dim() != 2 or topk.dim() != 3 or topk.size(-1) < 2 or mask.dim() != 1:
-            return
-
-        rows = min(int(scores.size(0)), int(topk.size(0)), int(mask.size(0)))
-        if rows <= 0:
-            return
-        scores = scores[:rows].float()
-        topk = topk[:rows].to(device=scores.device)
-        active_rows = mask[:rows].to(device=scores.device) > 0
-
-        t2d = t2d.to(device=scores.device, dtype=torch.bool)
-        vocab_size = int(t2d.numel())
-        draft_vocab_size = int(t2d.sum().detach().item())
-        score_vocab_size = int(scores.size(-1))
-        if score_vocab_size == vocab_size:
-            selected_full_ids = None
-            target_to_score = None
-        elif score_vocab_size == draft_vocab_size:
-            selected_full_ids = torch.nonzero(t2d, as_tuple=False).flatten()
-            target_to_score = torch.cumsum(t2d.to(torch.long), dim=0) - 1
-        else:
-            logger.warning(
-                "[drafter last_hidden logprob check] skip: target_scores_vocab=%s target_vocab=%s draft_vocab=%s",
-                score_vocab_size,
-                vocab_size,
-                draft_vocab_size,
-            )
-            return
-
-        sglang_top1_logprob = topk[:, 0, 0].float()
-        sglang_top1_id = topk[:, 0, 1].long()
-        sglang_top1_in_range = (sglang_top1_id >= 0) & (sglang_top1_id < vocab_size)
-        safe_sglang_top1_id = sglang_top1_id.clamp(min=0, max=max(vocab_size - 1, 0))
-        if target_to_score is None:
-            sglang_score_id = safe_sglang_top1_id
-            sglang_top1_mappable = sglang_top1_in_range
-        else:
-            sglang_top1_mappable = sglang_top1_in_range & t2d[safe_sglang_top1_id]
-            sglang_score_id = target_to_score[safe_sglang_top1_id].clamp(min=0)
-
-        valid_top1 = active_rows & torch.isfinite(sglang_top1_logprob) & sglang_top1_mappable
-        log_probs = F.log_softmax(scores, dim=-1)
-        target_top1_logprob, target_top1_score_id = log_probs.max(dim=-1)
-        if selected_full_ids is None:
-            target_top1_full_id = target_top1_score_id
-        else:
-            target_top1_full_id = selected_full_ids[target_top1_score_id]
-
-        def _shift_stats(shift: int) -> tuple[int, float, float]:
-            if shift >= 0:
-                score_start = shift
-                topk_start = 0
-                count = rows - shift
-            else:
-                score_start = 0
-                topk_start = -shift
-                count = rows + shift
-            if count <= 0:
-                return 0, 0.0, float("inf")
-            score_slice = slice(score_start, score_start + count)
-            topk_slice = slice(topk_start, topk_start + count)
-            valid = valid_top1[topk_slice]
-            if not valid.any():
-                return 0, 0.0, float("inf")
-            score_ids = sglang_score_id[topk_slice].clamp(min=0, max=score_vocab_size - 1)
-            row_ids = torch.arange(count, device=scores.device)
-            target_lp = log_probs[score_slice][row_ids, score_ids]
-            diff = (target_lp[valid] - sglang_top1_logprob[topk_slice][valid]).abs()
-            match = target_top1_full_id[score_slice][valid] == sglang_top1_id[topk_slice][valid]
-            return int(valid.sum().detach().cpu().item()), float(match.float().mean().detach().cpu().item()), float(
-                diff.mean().detach().cpu().item()
-            )
-
-        valid_count, top1_match, diff_mean = _shift_stats(0)
-        if valid_count <= 0:
-            logger.warning(
-                "[drafter last_hidden logprob check] no comparable active rows: rows=%s active_rows=%s",
-                rows,
-                int(active_rows.sum().detach().cpu().item()),
-            )
-            return
-
-        zero_shift_target_lp = log_probs[torch.arange(rows, device=scores.device), sglang_score_id.clamp(min=0, max=score_vocab_size - 1)]
-        zero_diff = (zero_shift_target_lp[valid_top1] - sglang_top1_logprob[valid_top1]).abs()
-        p95 = torch.quantile(zero_diff, 0.95) if zero_diff.numel() > 1 else zero_diff.max()
-        shift_entries = []
-        best_shift = 0
-        best_match = top1_match
-        best_diff = diff_mean
-        best_rows = valid_count
-        for shift in range(-3, 4):
-            shift_rows, shift_match, shift_diff = _shift_stats(shift)
-            shift_entries.append(f"{shift}:{shift_match:.4f}/{shift_diff:.4g}/{shift_rows}")
-            if shift_rows > 0 and (shift_match > best_match or (shift_match == best_match and shift_diff < best_diff)):
-                best_shift = shift
-                best_match = shift_match
-                best_diff = shift_diff
-                best_rows = shift_rows
-
-        logger.warning(
-            "[drafter last_hidden logprob check] rows=%s active_rows=%s comparable_rows=%s "
-            "top1_match=%.6f logprob_abs_diff_mean=%.6g logprob_abs_diff_p95=%.6g "
-            "logprob_abs_diff_max=%.6g target_top1_logprob_mean=%.6g sglang_top1_logprob_mean=%.6g",
-            rows,
-            int(active_rows.sum().detach().cpu().item()),
-            valid_count,
-            top1_match,
-            diff_mean,
-            float(p95.detach().cpu().item()),
-            float(zero_diff.max().detach().cpu().item()),
-            float(target_top1_logprob[valid_top1].mean().detach().cpu().item()),
-            float(sglang_top1_logprob[valid_top1].mean().detach().cpu().item()),
-        )
-        logger.warning(
-            "[drafter last_hidden logprob check shift_scan] best_shift=%s best_top1_match=%.6f "
-            "best_diff_mean=%.6g best_rows=%s shifts=%s",
-            best_shift,
-            best_match,
-            best_diff,
-            best_rows,
-            ", ".join(shift_entries),
-        )
-        mismatch_rows = torch.nonzero(valid_top1 & (target_top1_full_id != sglang_top1_id), as_tuple=False).view(-1)
-        if mismatch_rows.numel() > 0:
-            examples = []
-            for row in mismatch_rows[:3].detach().cpu().tolist():
-                sglang_id = int(sglang_top1_id[row].detach().cpu().item())
-                target_id = int(target_top1_full_id[row].detach().cpu().item())
-                sglang_lp = float(sglang_top1_logprob[row].detach().cpu().item())
-                target_lp = float(target_top1_logprob[row].detach().cpu().item())
-                target_at_sglang = float(
-                    log_probs[row, sglang_score_id[row].clamp(min=0, max=score_vocab_size - 1)]
-                    .detach()
-                    .cpu()
-                    .item()
-                )
-                examples.append(
-                    {
-                        "row": row,
-                        "sglang_top1": sglang_id,
-                        "target_top1": target_id,
-                        "sglang_lp": round(sglang_lp, 6),
-                        "target_lp": round(target_lp, 6),
-                        "target_at_sglang": round(target_at_sglang, 6),
-                    }
-                )
-
-            weight_stats = None
-            if isinstance(target_head_weight, torch.Tensor):
-                weight = target_head_weight.detach()
-                try:
-                    ids = torch.tensor(
-                        [examples[0]["sglang_top1"], examples[0]["target_top1"]],
-                        device=weight.device,
-                        dtype=torch.long,
-                    )
-                    ids = ids[(ids >= 0) & (ids < int(weight.size(0)))]
-                    row_norms = weight.index_select(0, ids).float().norm(dim=-1).detach().cpu().tolist()
-                    block = weight[: min(8, int(weight.size(0))), : min(8, int(weight.size(1)))].float()
-                    weight_stats = {
-                        "shape": tuple(weight.shape),
-                        "dtype": str(weight.dtype),
-                        "device": str(weight.device),
-                        "sample_ids": [int(x) for x in ids.detach().cpu().tolist()],
-                        "sample_row_norms": [round(float(x), 6) for x in row_norms],
-                        "block_sum": round(float(block.sum().detach().cpu().item()), 6),
-                    }
-                except Exception as exc:  # noqa: BLE001
-                    weight_stats = {"error": str(exc)}
-
-            topk_stats = None
-            try:
-                top_ids = topk[..., 1].long()
-                valid_ids = top_ids[(top_ids >= 0) & (top_ids < vocab_size)]
-                if valid_ids.numel() > 0:
-                    shard_rows = None
-                    if isinstance(target_head_weight, torch.Tensor) and int(target_head_weight.size(0)) < vocab_size:
-                        shard_rows = int(target_head_weight.size(0))
-                    topk_stats = {
-                        "id_min": int(valid_ids.min().detach().cpu().item()),
-                        "id_max": int(valid_ids.max().detach().cpu().item()),
-                        "ids_ge_target_head_rows": None
-                        if shard_rows is None
-                        else int((valid_ids >= shard_rows).detach().sum().cpu().item()),
-                        "valid_ids": int(valid_ids.numel()),
-                    }
-            except Exception as exc:  # noqa: BLE001
-                topk_stats = {"error": str(exc)}
-
-            logger.warning(
-                "[drafter last_hidden logprob check detail] score_shape=%s topk_shape=%s "
-                "score_vocab=%s target_vocab=%s draft_vocab=%s examples=%s target_head=%s topk=%s",
-                tuple(scores.shape),
-                tuple(topk.shape),
-                score_vocab_size,
-                vocab_size,
-                draft_vocab_size,
-                examples,
-                weight_stats,
-                topk_stats,
-            )
-
-
 def _build_topk_draft_vocab_coverage_mask(
     target_topk_logprobs: torch.Tensor,
     t2d: torch.Tensor,
@@ -998,7 +771,6 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
         all_step_position_mask = outputs["position_masks"]
         target_scores = None
         target_topk_logprobs_for_loss = None
-        debug_target_topk_logprobs = None
 
         # Gather outputs if using Ulysses SP
         if getattr(self, "use_ulysses_sp", False):
@@ -1062,13 +834,6 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
                     unpad_dim=0,
                     padding_size=_current_pad_size,
                 ).unsqueeze(0)
-                if _last_hidden_logprob_check_enabled() and batch.get("target_logprobs") is not None:
-                    debug_target_topk_logprobs = gather_outputs_and_unpad(
-                        batch["target_logprobs"].squeeze(0),
-                        gather_dim=0,
-                        unpad_dim=0,
-                        padding_size=_current_pad_size,
-                    ).unsqueeze(0)
                 with torch.no_grad():
                     target_scores = self.target_model(last_hidden_states)
         else:
@@ -1100,8 +865,6 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
             else:
                 if last_hidden_states is None:
                     raise ValueError("last_hidden_states is required when use_target_model=False")
-                if _last_hidden_logprob_check_enabled():
-                    debug_target_topk_logprobs = batch.get("target_logprobs")
                 with torch.no_grad():
                     target_scores = self.target_model(last_hidden_states)
         
@@ -1121,18 +884,6 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
         target_device = all_step_logits[0].device
         if loss_mask.device != target_device:
             loss_mask = loss_mask.to(target_device)
-
-        if not use_logits and debug_target_topk_logprobs is not None:
-            log_count = int(getattr(self, "_last_hidden_logprob_check_count", 0))
-            if log_count < _last_hidden_logprob_check_max_logs():
-                _log_last_hidden_logprob_check(
-                    target_scores=target_scores,
-                    target_topk_logprobs=debug_target_topk_logprobs,
-                    t2d=draft_model.t2d,
-                    loss_mask=loss_mask,
-                    target_head_weight=getattr(getattr(self.target_model, "fc", None), "weight", None),
-                )
-                self._last_hidden_logprob_check_count = log_count + 1
 
         target_p_padded = None
         target_position_mask_padded = None

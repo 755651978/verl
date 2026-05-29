@@ -47,7 +47,10 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_visible_devices_keyword
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.utils.profiler import DistProfiler, build_sglang_profiler_args
-from verl.workers.drafter.sglang_patch import install_sglang_verl_patches
+from verl.workers.drafter.sglang_patch import (
+    enable_sglang_original_logprob_return,
+    install_sglang_verl_patches,
+)
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
 from verl.workers.rollout.sglang_rollout.sglang_rollout import (
@@ -842,6 +845,8 @@ class SGLangHttpServer:
         # drafter
         return_last_hidden_for_drafter = False
         if self.config.drafter.enable:
+            if self.config.drafter.training.use_logits:
+                enable_sglang_original_logprob_return()
             return_last_hidden_for_drafter = _drafter_uses_eagle_last_hidden(self.config.drafter)
             args["speculative_algorithm"] = self.config.drafter.speculative_algorithm
             cuda_graph_max_bs = getattr(self.config.drafter.rollout, "cuda_graph_max_bs", None)
@@ -1121,12 +1126,10 @@ class SGLangHttpServer:
             )
             if front_hidden_tokens is not None:
                 custom_params[_VERL_HIDDEN_STATE_FRONT_TOKENS_PARAM] = int(front_hidden_tokens)
-            collect_last_hidden_logprob_check = _drafter_last_hidden_logprob_check_enabled(self.config.drafter)
-            if self.config.drafter.training.use_logits or collect_last_hidden_logprob_check:
+            if self.config.drafter.training.use_logits:
                 custom_params[_VERL_TOP_LOGPROBS_TENSOR_PARAM] = True
-                # EAGLE-style training/checking aligns hidden row p with the
-                # target logprob row at p + 1. Keep the leading anchor row out
-                # of the side-channel and record the resulting row start.
+                # EAGLE-style logits training aligns hidden row p with the
+                # target logprob row at p + 1.
                 custom_params[_VERL_TOP_LOGPROBS_OUTPUT_ROW_START_PARAM] = 1
                 if front_hidden_tokens is not None:
                     custom_params[_VERL_TOP_LOGPROBS_OUTPUT_ROW_END_PARAM] = max(
@@ -1212,10 +1215,7 @@ class SGLangHttpServer:
             target_logprobs_dropped_rows = 0
             output_token_logprobs = output.get("meta_info", {}).get("output_token_logprobs", []) or []
             sampled_token_mismatch = _count_sampled_token_mismatches(output_token_logprobs, list(token_ids))
-            collect_target_logprobs = bool(
-                self.config.drafter.training.use_logits
-                or _drafter_last_hidden_logprob_check_enabled(self.config.drafter)
-            )
+            collect_target_logprobs = bool(self.config.drafter.training.use_logits)
             if collect_target_logprobs:
                 logits_topk = int(self.config.drafter.training.logits_topk)
                 target_logprobs_position_start = max(len(prompt_ids) - 1, 0)
