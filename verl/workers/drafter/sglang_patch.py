@@ -2453,6 +2453,27 @@ def _wrap_sglang_eagle_verify_last_hidden_filter(method):
     return patched_verify_last_hidden_filter
 
 
+def _wrap_sglang_eagle_verify_input_last_hidden_filter(method):
+    if getattr(method, "_verl_patched_drafter_last_hidden_filter", False):
+        return method
+
+    @wraps(method)
+    def patched_verify_input_last_hidden_filter(self, batch, logits_output, *args, **kwargs):
+        result = method(self, batch, logits_output, *args, **kwargs)
+        try:
+            accepted_indices = getattr(result, "accept_indices", None)
+            if accepted_indices is None:
+                accepted_indices = getattr(result, "accepted_indices", None)
+            if accepted_indices is not None:
+                _filter_sglang_drafter_last_hidden_output(logits_output, accepted_indices)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to apply SGLang drafter last-hidden verify-input filter: %s", exc)
+        return result
+
+    patched_verify_input_last_hidden_filter._verl_patched_drafter_last_hidden_filter = True
+    return patched_verify_input_last_hidden_filter
+
+
 def _make_sglang_eagle_verify_full_hidden_patch(original_method):
     try:
         source = inspect.getsource(original_method)
@@ -2578,6 +2599,19 @@ def patch_sglang_eagle_verify_hidden_states_full() -> None:
     if _SGLANG_EAGLE_VERIFY_HIDDEN_STATES_PATCHED:
         return
 
+    verify_input_patched = False
+    try:
+        eagle_info_module = importlib.import_module("sglang.srt.speculative.eagle_info")
+        verify_input_cls = getattr(eagle_info_module, "EagleVerifyInput")
+        original_verify_input = getattr(verify_input_cls, "verify", None)
+        if original_verify_input is not None:
+            wrapped_verify_input = _wrap_sglang_eagle_verify_input_last_hidden_filter(original_verify_input)
+            if wrapped_verify_input is not original_verify_input:
+                setattr(verify_input_cls, "verify", wrapped_verify_input)
+            verify_input_patched = True
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Skip SGLang EagleVerifyInput last-hidden filter patch: %s", exc)
+
     targets = (
         ("sglang.srt.speculative.eagle_worker", "EAGLEWorker"),
         ("sglang.srt.speculative.multi_layer_eagle_worker", "MultiLayerEagleWorker"),
@@ -2617,8 +2651,10 @@ def patch_sglang_eagle_verify_hidden_states_full() -> None:
         setattr(worker_cls, "verify", patched_method)
         patched_targets.append(f"{module_name}.{class_name}.verify")
 
-    if patched_targets:
+    if patched_targets or verify_input_patched:
         _SGLANG_EAGLE_VERIFY_HIDDEN_STATES_PATCHED = True
+        if verify_input_patched:
+            patched_targets.append("sglang.srt.speculative.eagle_info.EagleVerifyInput.verify[last-hidden-filter]")
         logger.info("Patched SGLang EAGLE verify full hidden states for %s", ", ".join(patched_targets))
 
 
