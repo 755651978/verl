@@ -86,6 +86,7 @@ _VERL_HIDDEN_STATES_STREAM_FINAL_ATTR = "_verl_hidden_states_stream_final"
 _VERL_DRAFTER_RETURN_LAST_HIDDEN_PARAM = "_verl_drafter_return_last_hidden"
 _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR = "_verl_drafter_last_hidden_states"
 _VERL_DRAFTER_LAST_HIDDEN_FILTERED_ATTR = "_verl_drafter_last_hidden_filtered_by_accept_indices"
+_VERL_DRAFTER_LAST_HIDDEN_MATERIALIZED_ATTR = "_verl_drafter_last_hidden_materialized"
 _VERL_DFLASH_RETURN_AUX_HIDDEN_PARAM = "_verl_dflash_return_aux_hidden"
 _VERL_TOP_LOGPROBS_TENSOR_PARAM = "_verl_top_logprobs_tensor_output"
 _VERL_OUTPUT_TOP_LOGPROBS_TENSOR_KEY = "_verl_output_top_logprobs_tensor"
@@ -1454,6 +1455,8 @@ def _normalize_sglang_dflash_aux_hidden_states(aux_hidden_states):
 def _sglang_concat_last_hidden_for_drafter(req, logits_output, hidden_chunk, last_hidden_chunk):
     if not _sglang_req_requests_last_hidden_for_drafter(req):
         return hidden_chunk
+    if bool(getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_MATERIALIZED_ATTR, False)):
+        return hidden_chunk
     if last_hidden_chunk is None:
         raise RuntimeError("SGLang did not return final target hidden states for drafter training.")
     if not (_is_torch_tensor(hidden_chunk) and _is_torch_tensor(last_hidden_chunk)):
@@ -1476,6 +1479,56 @@ def _slice_sglang_drafter_last_hidden_output(logits_output, index):
     if last_hidden_states is None:
         return None
     return last_hidden_states[index]
+
+
+def _materialize_sglang_drafter_last_hidden_output(logits_output, stage: str) -> bool:
+    if logits_output is None:
+        return False
+    if bool(getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_MATERIALIZED_ATTR, False)):
+        return True
+    base_hidden_states = getattr(logits_output, "hidden_states", None)
+    last_hidden_states = getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, None)
+    if not _is_torch_tensor(last_hidden_states):
+        return False
+    if base_hidden_states is None:
+        logits_output.hidden_states = last_hidden_states
+        materialized_shape = tuple(last_hidden_states.shape)
+    elif _is_torch_tensor(base_hidden_states):
+        if tuple(base_hidden_states.shape[:-1]) != tuple(last_hidden_states.shape[:-1]):
+            logger.warning(
+                "Skip materializing SGLang drafter final hidden: stage=%s "
+                "base_shape=%s last_hidden_shape=%s",
+                stage,
+                tuple(base_hidden_states.shape),
+                tuple(last_hidden_states.shape),
+            )
+            return False
+        if last_hidden_states.device != base_hidden_states.device:
+            last_hidden_states = last_hidden_states.to(base_hidden_states.device)
+        logits_output.hidden_states = torch.cat((base_hidden_states, last_hidden_states), dim=-1)
+        materialized_shape = tuple(logits_output.hidden_states.shape)
+    else:
+        logger.warning(
+            "Skip materializing SGLang drafter final hidden: stage=%s base_type=%s last_hidden_shape=%s",
+            stage,
+            type(base_hidden_states).__name__,
+            tuple(last_hidden_states.shape),
+        )
+        return False
+
+    setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_MATERIALIZED_ATTR, True)
+    select_summary = getattr(logits_output, "_verl_drafter_last_hidden_select_summary", None)
+    if isinstance(select_summary, dict):
+        setattr(
+            logits_output,
+            "_verl_drafter_last_hidden_select_summary",
+            {
+                **select_summary,
+                "materialized_stage": stage,
+                "materialized_shape": materialized_shape,
+            },
+        )
+    return True
 
 
 def _sglang_forward_mode_is_target_verify(logits_metadata) -> bool:
@@ -1625,30 +1678,59 @@ def _select_sglang_last_hidden_for_drafter(
 ):
     next_token_logits = getattr(logits_output, "next_token_logits", None)
     raw_shape = tuple(hidden_states.shape) if _is_torch_tensor(hidden_states) else None
+    output_hidden_states = getattr(logits_output, "hidden_states", None)
+    output_hidden_shape = tuple(output_hidden_states.shape) if _is_torch_tensor(output_hidden_states) else None
     selected = hidden_states
     pruned_shape = None
+    sample_indices_shape = None
+    store_shape = None
     source = "raw_hidden_states"
     logits_metadata_view = _sglang_logits_metadata_view(logits_metadata)
     try:
         get_pruned_states = getattr(logits_processor, "_get_pruned_states", None)
-        if callable(get_pruned_states) and _is_torch_tensor(hidden_states):
+        get_hidden_states_to_store = getattr(logits_processor, "_get_hidden_states_to_store", None)
+        if callable(get_pruned_states) and callable(get_hidden_states_to_store) and _is_torch_tensor(hidden_states):
             try:
-                pruned = get_pruned_states(
+                pruned_result = get_pruned_states(
                     hidden_states,
-                    hidden_states_before_norm,
-                    aux_hidden_states,
+                    None,
+                    None,
                     logits_metadata_view,
                 )
-                source = "get_pruned_states"
+                source = "sglang_hidden_states_to_store_final"
             except TypeError:
                 try:
-                    pruned = get_pruned_states(input_ids, hidden_states, aux_hidden_states, logits_metadata_view)
-                    source = "get_pruned_states_input_ids"
+                    pruned_result = get_pruned_states(input_ids, hidden_states, None, logits_metadata_view)
+                    source = "sglang_hidden_states_to_store_final_input_ids"
                 except TypeError:
-                    pruned = get_pruned_states(hidden_states, logits_metadata_view)
-                    source = "get_pruned_states_legacy"
-            if _is_torch_tensor(pruned):
-                pruned_shape = tuple(pruned.shape)
+                    pruned_result = get_pruned_states(hidden_states, logits_metadata_view)
+                    source = "sglang_hidden_states_to_store_final_legacy"
+
+            if isinstance(pruned_result, tuple):
+                pruned_states = pruned_result[0] if len(pruned_result) > 0 else None
+                sample_indices = pruned_result[3] if len(pruned_result) > 3 else None
+            else:
+                pruned_states = pruned_result
+                sample_indices = None
+            if _is_torch_tensor(pruned_states):
+                pruned_shape = tuple(pruned_states.shape)
+                if _is_torch_tensor(sample_indices):
+                    sample_indices_shape = tuple(sample_indices.shape)
+                stored = get_hidden_states_to_store(
+                    hidden_states,
+                    None,
+                    None,
+                    pruned_states,
+                    None,
+                    None,
+                    sample_indices,
+                    logits_metadata_view,
+                )
+                if _is_torch_tensor(stored):
+                    selected = stored
+                    store_shape = tuple(stored.shape)
+                else:
+                    source = f"{source}_no_store"
     except Exception as exc:  # noqa: BLE001
         setattr(logits_output, "_verl_drafter_last_hidden_select_error", str(exc))
 
@@ -1661,7 +1743,10 @@ def _select_sglang_last_hidden_for_drafter(
             "source": source,
             "raw_shape": raw_shape,
             "pruned_shape": pruned_shape,
+            "store_shape": store_shape,
             "selected_shape": selected_shape,
+            "output_hidden_shape": output_hidden_shape,
+            "sample_indices_shape": sample_indices_shape,
             "next_token_logits_shape": logits_shape,
             "logits_metadata_type": type(logits_metadata).__name__,
             "logits_metadata_view_type": type(logits_metadata_view).__name__,
@@ -2382,6 +2467,9 @@ def _sglang_eagle_verify_last_hidden_incomplete(batch, spec_info, logits_output)
     if not _sglang_batch_requests_last_hidden_for_drafter(batch):
         return False
     expected_rows = _sglang_eagle_verify_expected_hidden_rows(batch, spec_info)
+    if bool(getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_MATERIALIZED_ATTR, False)):
+        hidden_states = getattr(logits_output, "hidden_states", None)
+        return hidden_states is None or (expected_rows > 0 and _sglang_hidden_state_rows(hidden_states) < expected_rows)
     last_hidden_states = getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, None)
     if last_hidden_states is None:
         return True
@@ -2472,6 +2560,26 @@ def _wrap_sglang_eagle_verify_input_last_hidden_filter(method):
 
     patched_verify_input_last_hidden_filter._verl_patched_drafter_last_hidden_filter = True
     return patched_verify_input_last_hidden_filter
+
+
+def _wrap_sglang_eagle_forward_generation_last_hidden_materialize(method):
+    if getattr(method, "_verl_patched_drafter_last_hidden_materialize", False):
+        return method
+
+    @wraps(method)
+    def patched_forward_generation_last_hidden_materialize(self, *args, **kwargs):
+        result = method(self, *args, **kwargs)
+        try:
+            _materialize_sglang_drafter_last_hidden_output(
+                getattr(result, "logits_output", None),
+                stage="eagle_forward_generation_result",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to materialize SGLang drafter final hidden at EAGLE output boundary: %s", exc)
+        return result
+
+    patched_forward_generation_last_hidden_materialize._verl_patched_drafter_last_hidden_materialize = True
+    return patched_forward_generation_last_hidden_materialize
 
 
 def _make_sglang_eagle_verify_full_hidden_patch(original_method):
@@ -2627,6 +2735,18 @@ def patch_sglang_eagle_verify_hidden_states_full() -> None:
             continue
         if original_method is None:
             continue
+        original_forward_generation = getattr(worker_cls, "forward_batch_generation", None)
+        if original_forward_generation is not None and not getattr(
+            original_forward_generation,
+            "_verl_patched_drafter_last_hidden_materialize",
+            False,
+        ):
+            setattr(
+                worker_cls,
+                "forward_batch_generation",
+                _wrap_sglang_eagle_forward_generation_last_hidden_materialize(original_forward_generation),
+            )
+            patched_targets.append(f"{module_name}.{class_name}.forward_batch_generation[last-hidden-materialize]")
         if getattr(original_method, "_verl_patched_eagle_verify_full_hidden_states", False):
             wrapped_method = _wrap_sglang_eagle_verify_last_hidden_filter(original_method)
             if wrapped_method is not original_method:
@@ -2655,7 +2775,7 @@ def patch_sglang_eagle_verify_hidden_states_full() -> None:
         _SGLANG_EAGLE_VERIFY_HIDDEN_STATES_PATCHED = True
         if verify_input_patched:
             patched_targets.append("sglang.srt.speculative.eagle_info.EagleVerifyInput.verify[last-hidden-filter]")
-        logger.info("Patched SGLang EAGLE verify full hidden states for %s", ", ".join(patched_targets))
+        logger.warning("Patched SGLang EAGLE verify full hidden states for %s", ", ".join(patched_targets))
 
 
 def _sglang_state_custom_params(state) -> dict[str, Any]:
@@ -3074,6 +3194,7 @@ def _copy_sglang_drafter_last_hidden_output(src, dst, index) -> None:
             "_verl_drafter_last_hidden_select_summary",
             "_verl_drafter_lh_check_lm_head_fingerprint",
             "_verl_drafter_lh_check_result",
+            _VERL_DRAFTER_LAST_HIDDEN_MATERIALIZED_ATTR,
         ):
             if hasattr(src, attr_name):
                 setattr(dst, attr_name, getattr(src, attr_name))
