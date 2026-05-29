@@ -1603,7 +1603,14 @@ def _attach_sglang_last_hidden_logprob_check_from_graph_runner(graph_runner, log
     )
 
 
-def _select_sglang_last_hidden_for_drafter(logits_processor, logits_output, hidden_states, logits_metadata):
+def _select_sglang_last_hidden_for_drafter(
+    logits_processor,
+    logits_output,
+    input_ids,
+    hidden_states,
+    aux_hidden_states,
+    logits_metadata,
+):
     next_token_logits = getattr(logits_output, "next_token_logits", None)
     raw_shape = tuple(hidden_states.shape) if _is_torch_tensor(hidden_states) else None
     selected = hidden_states
@@ -1611,10 +1618,18 @@ def _select_sglang_last_hidden_for_drafter(logits_processor, logits_output, hidd
     try:
         get_pruned_states = getattr(logits_processor, "_get_pruned_states", None)
         if callable(get_pruned_states) and _is_torch_tensor(hidden_states):
-            pruned = get_pruned_states(hidden_states, logits_metadata)
+            try:
+                pruned = get_pruned_states(input_ids, hidden_states, aux_hidden_states, logits_metadata)
+                source = "get_pruned_states_input_ids"
+            except TypeError:
+                try:
+                    pruned = get_pruned_states(hidden_states, aux_hidden_states, logits_metadata)
+                    source = "get_pruned_states_aux"
+                except TypeError:
+                    pruned = get_pruned_states(hidden_states, logits_metadata)
+                    source = "get_pruned_states"
             if _is_torch_tensor(pruned):
                 selected = pruned
-                source = "get_pruned_states"
     except Exception as exc:  # noqa: BLE001
         setattr(logits_output, "_verl_drafter_last_hidden_select_error", str(exc))
 
@@ -2915,7 +2930,9 @@ def _make_sglang_drafter_last_hidden_forward_patch(original_method):
             last_hidden_for_drafter = _select_sglang_last_hidden_for_drafter(
                 self,
                 output,
+                input_ids,
                 hidden_states,
+                aux_hidden_states,
                 logits_metadata,
             )
             setattr(output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, last_hidden_for_drafter)
