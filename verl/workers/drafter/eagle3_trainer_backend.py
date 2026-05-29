@@ -19,6 +19,7 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 device_name = get_device_name()
 _LAST_HIDDEN_LOGPROB_CHECK_ENV = "VERL_DRAFTER_LAST_HIDDEN_LOGPROB_CHECK"
 _LAST_HIDDEN_LOGPROB_CHECK_MAX_LOGS_ENV = "VERL_DRAFTER_LAST_HIDDEN_LOGPROB_CHECK_MAX_LOGS"
+_HIDDEN_BLOCK_DEBUG_LOG_COUNT = 0
 
 
 class _SyncedTargetHead(torch.nn.Module):
@@ -85,6 +86,49 @@ def _last_hidden_logprob_check_max_logs() -> int:
         return max(0, int(raw_value))
     except (TypeError, ValueError):
         return 8
+
+
+def _log_eagle3_hidden_block_check(full_h: torch.Tensor, h_dim: int, item_idx: int, item: dict) -> None:
+    global _HIDDEN_BLOCK_DEBUG_LOG_COUNT
+    if not _last_hidden_logprob_check_enabled():
+        return
+    if _HIDDEN_BLOCK_DEBUG_LOG_COUNT >= _last_hidden_logprob_check_max_logs():
+        return
+    try:
+        with torch.no_grad():
+            rows = min(int(full_h.size(0)), 128)
+            blocks = int(full_h.size(-1)) // int(h_dim)
+            block_stats = []
+            for block_idx in range(min(blocks, 6)):
+                block = full_h[:rows, block_idx * h_dim : (block_idx + 1) * h_dim].float()
+                block_stats.append(
+                    {
+                        "block": block_idx,
+                        "mean_row_norm": round(float(block.norm(dim=-1).mean().detach().cpu().item()), 6),
+                        "mean_abs": round(float(block.abs().mean().detach().cpu().item()), 6),
+                    }
+                )
+            logger.warning(
+                "[drafter hidden block check] item_idx=%s full_shape=%s h_dim=%s blocks=%s block_stats=%s "
+                "hidden_lm_head_fingerprint=%s sglang_lh_check=%s sglang_filter=%s "
+                "global_step=%s feature_pos=(%s,%s) target_pos=(%s,%s)",
+                item_idx,
+                tuple(full_h.shape),
+                h_dim,
+                blocks,
+                block_stats,
+                item.get("hidden_lm_head_fingerprint"),
+                item.get("hidden_last_hidden_logprob_check"),
+                item.get("hidden_last_hidden_filter"),
+                item.get("global_step"),
+                item.get("_verl_feature_start"),
+                item.get("_verl_feature_end"),
+                item.get("_verl_target_position_start"),
+                item.get("_verl_target_position_end"),
+            )
+            _HIDDEN_BLOCK_DEBUG_LOG_COUNT += 1
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[drafter hidden block check] failed: %s", exc)
 
 
 def _masked_soft_cross_entropy(
@@ -810,7 +854,7 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
         h_dim = getattr(model_config, "target_hidden_size", model_config.hidden_size)
         use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))
 
-        for item in items:
+        for item_idx, item in enumerate(items):
             # 1. 搬运到GPU
             ids = item["input_ids"].to(device, non_blocking=True)
 
@@ -828,6 +872,8 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
                     f"EAGLE3 expected at least {min_hidden_size} hidden dims "
                     f"({'3' if use_logits else '4'} target layers of size {h_dim}), got {full_h.size(-1)}"
                 )
+            if not use_logits:
+                _log_eagle3_hidden_block_check(full_h, h_dim, item_idx, item)
 
             h_states = full_h[:, : 3 * h_dim]
             if not use_logits:

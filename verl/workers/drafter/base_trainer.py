@@ -1295,6 +1295,10 @@ class DrafterBaseTrainer:
                 "_verl_prompt_len": prompt_len if cpu_prompts is not None else None,
                 "_verl_response_len": response_len if cpu_responses is not None else None,
                 "_verl_input_seq_length": input_seq_length,
+                "hidden_lm_head_fingerprint": batch.get("hidden_lm_head_fingerprint"),
+                "hidden_last_hidden_logprob_check": batch.get("hidden_last_hidden_logprob_check"),
+                "hidden_last_hidden_filter": batch.get("hidden_last_hidden_filter"),
+                "global_step": _batch_item_int(batch.get("global_step"), i),
             }
 
             if alignment_debug_enabled():
@@ -1340,6 +1344,10 @@ class DrafterBaseTrainer:
                             "target_position_end": data_item.get("_verl_target_position_end"),
                             "target_tensor_position_start": target_logprobs_position_start,
                             "target_tensor_position_end": target_logprobs_position_end,
+                            "hidden_lm_head_fingerprint": data_item.get("hidden_lm_head_fingerprint"),
+                            "hidden_last_hidden_logprob_check": data_item.get("hidden_last_hidden_logprob_check"),
+                            "hidden_last_hidden_filter": data_item.get("hidden_last_hidden_filter"),
+                            "item_global_step": data_item.get("global_step"),
                             "prompt_len": prompt_len if cpu_prompts is not None else None,
                             "response_len": response_len if cpu_responses is not None else None,
                             "loss_before": int(full_loss_mask.sum().item()),
@@ -1695,13 +1703,45 @@ class DrafterBaseTrainer:
                             "hidden_start": source_item.get("_verl_hidden_start"),
                             "hidden_end": source_item.get("_verl_hidden_end"),
                             "hidden_position_start": source_item.get("_verl_hidden_position_start"),
+                            "base_hidden_position_start": source_item.get("_verl_feature_start"),
+                            "base_hidden_position_end": (
+                                int(source_item.get("_verl_feature_start", 0) or 0) + train_seq_len
+                            ),
+                            "last_hidden_position_start": (
+                                int(source_item.get("_verl_feature_start", 0) or 0) + 1
+                            )
+                            if uses_shifted_eagle_inputs
+                            else None,
+                            "last_hidden_position_end": (
+                                int(source_item.get("_verl_feature_start", 0) or 0) + 1 + train_seq_len
+                            )
+                            if uses_shifted_eagle_inputs
+                            else None,
                             "target_start": source_item.get("_verl_target_start"),
                             "target_end": source_item.get("_verl_target_end"),
                             "target_position_start": source_item.get("_verl_target_position_start"),
                             "target_position_end": source_item.get("_verl_target_position_end"),
                             "target_train_start": target_logprobs_train_start,
+                            "target_train_position_start": (
+                                int(source_item.get("_verl_target_position_start", 0) or 0)
+                                + int(target_logprobs_train_start)
+                            )
+                            if source_item.get("_verl_target_position_start") is not None
+                            else None,
+                            "target_train_position_end": (
+                                int(source_item.get("_verl_target_position_start", 0) or 0)
+                                + int(target_logprobs_train_start)
+                                + train_seq_len
+                            )
+                            if source_item.get("_verl_target_position_start") is not None
+                            else None,
                             "target_tensor_position_start": source_item.get("_verl_target_tensor_position_start"),
                             "target_tensor_position_end": source_item.get("_verl_target_tensor_position_end"),
+                            "item_global_step": source_item.get("global_step"),
+                            "hidden_lm_head_fingerprint": source_item.get("hidden_lm_head_fingerprint"),
+                            "hidden_last_hidden_logprob_check": source_item.get("hidden_last_hidden_logprob_check"),
+                            "hidden_last_hidden_filter": source_item.get("hidden_last_hidden_filter"),
+                            "target_lm_head_weight_step": getattr(self, "_target_lm_head_weight_step", None),
                             "loss_after_shift": int(
                                 (
                                     item_loss_mask[2 : 2 + train_seq_len]
@@ -1988,6 +2028,15 @@ class DrafterBaseTrainer:
                         "items_used": items_used,
                         "items_dropped_short": items_dropped_short,
                         "items_dropped_missing_target": items_dropped_missing_target,
+                        "source_global_steps": [item.get("global_step") for item in items[:8]],
+                        "source_hidden_lm_head_fingerprints": [
+                            item.get("hidden_lm_head_fingerprint") for item in items[:2]
+                        ],
+                        "source_last_hidden_logprob_checks": [
+                            item.get("hidden_last_hidden_logprob_check") for item in items[:2]
+                        ],
+                        "source_last_hidden_filters": [item.get("hidden_last_hidden_filter") for item in items[:2]],
+                        "target_lm_head_weight_step": getattr(self, "_target_lm_head_weight_step", None),
                         "packed_tokens_before_shift": packed_tokens_before_shift,
                         "packed_loss_tokens": packed_loss_tokens,
                         "input_shape": _tensor_shape(batch["input_ids"]),

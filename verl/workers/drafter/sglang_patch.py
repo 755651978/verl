@@ -68,6 +68,7 @@ _SGLANG_TOP_LOGPROBS_TENSOR_OUTPUT_PATCHED = False
 _SGLANG_SCHEDULER_PROCESS_PATCHED = False
 _SGLANG_LAST_HIDDEN_LOGPROB_CHECK_LOG_COUNT = 0
 _SGLANG_LAST_HIDDEN_LOGPROB_CHECK_SKIP_LOG_COUNT = 0
+_SGLANG_LAST_HIDDEN_FILTER_DEBUG_LOG_COUNT = 0
 _SCHEDULER_PROCESS_PATCH_ATTR = "_verl_patched_scheduler_process"
 _SGLANG_TOP_K_ALL = 1 << 30
 _SGLANG_PATCH_NAMES = {
@@ -95,6 +96,8 @@ _VERL_DRAFTER_LH_CHECK_RECOMPUTED_TOP_LOGPROBS_ATTR = "_verl_drafter_lh_check_re
 _VERL_DRAFTER_LH_CHECK_RECOMPUTED_AT_SGLANG_TOP_ATTR = "_verl_drafter_lh_check_recomputed_at_sglang_top"
 _VERL_DRAFTER_LH_CHECK_SGLANG_TOP_IDS_ATTR = "_verl_drafter_lh_check_sglang_top_ids"
 _VERL_DRAFTER_LH_CHECK_SGLANG_TOP_LOGPROBS_ATTR = "_verl_drafter_lh_check_sglang_top_logprobs"
+_VERL_DRAFTER_LH_CHECK_SUMMARY_ATTR = "_verl_drafter_lh_check_summary"
+_VERL_DRAFTER_LAST_HIDDEN_FILTER_SUMMARY_ATTR = "_verl_drafter_last_hidden_filter_summary"
 
 
 def configure_sglang_eagle_weight_update_patch(
@@ -1486,6 +1489,31 @@ def _sglang_forward_mode_is_target_verify(logits_metadata) -> bool:
     return False
 
 
+def _attach_sglang_lm_head_fingerprint(logits_output, lm_head) -> None:
+    lm_head_weight = getattr(lm_head, "weight", None)
+    if not _is_torch_tensor(lm_head_weight):
+        return
+    try:
+        weight = lm_head_weight.detach()
+        block = weight[: min(8, int(weight.shape[0])), : min(8, int(weight.shape[1]))].float()
+        row0_norm = weight[0].float().norm() if int(weight.shape[0]) > 0 else None
+        row_last_norm = weight[-1].float().norm() if int(weight.shape[0]) > 0 else None
+        setattr(
+            logits_output,
+            "_verl_drafter_lh_check_lm_head_fingerprint",
+            {
+                "shape": tuple(weight.shape),
+                "dtype": str(weight.dtype),
+                "device": str(weight.device),
+                "block_sum": float(block.sum().detach().cpu().item()),
+                "row0_norm": None if row0_norm is None else float(row0_norm.detach().cpu().item()),
+                "row_last_norm": None if row_last_norm is None else float(row_last_norm.detach().cpu().item()),
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        setattr(logits_output, "_verl_drafter_lh_check_lm_head_fingerprint", {"error": str(exc)})
+
+
 def _attach_sglang_last_hidden_logprob_check(logits_processor, logits_output, hidden_states, lm_head, logits_metadata) -> None:
     if not _sglang_last_hidden_logprob_check_enabled():
         return
@@ -1520,31 +1548,7 @@ def _attach_sglang_last_hidden_logprob_check(logits_processor, logits_output, hi
             recomputed_top_logprobs, recomputed_top_ids = recomputed_logprobs.max(dim=-1)
             row_ids = torch.arange(rows, device=recomputed_logprobs.device)
             recomputed_at_sglang_top = recomputed_logprobs[row_ids, sglang_top_ids]
-            lm_head_weight = getattr(lm_head, "weight", None)
-            if _is_torch_tensor(lm_head_weight):
-                try:
-                    weight = lm_head_weight.detach()
-                    block = weight[: min(8, int(weight.shape[0])), : min(8, int(weight.shape[1]))].float()
-                    row0_norm = weight[0].float().norm() if int(weight.shape[0]) > 0 else None
-                    row_last_norm = weight[-1].float().norm() if int(weight.shape[0]) > 0 else None
-                    setattr(
-                        logits_output,
-                        "_verl_drafter_lh_check_lm_head_fingerprint",
-                        {
-                            "shape": tuple(weight.shape),
-                            "dtype": str(weight.dtype),
-                            "device": str(weight.device),
-                            "block_sum": float(block.sum().detach().cpu().item()),
-                            "row0_norm": None
-                            if row0_norm is None
-                            else float(row0_norm.detach().cpu().item()),
-                            "row_last_norm": None
-                            if row_last_norm is None
-                            else float(row_last_norm.detach().cpu().item()),
-                        },
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    setattr(logits_output, "_verl_drafter_lh_check_lm_head_fingerprint", {"error": str(exc)})
+            _attach_sglang_lm_head_fingerprint(logits_output, lm_head)
             setattr(logits_output, _VERL_DRAFTER_LH_CHECK_RECOMPUTED_TOP_IDS_ATTR, recomputed_top_ids.detach())
             setattr(
                 logits_output,
@@ -1604,7 +1608,7 @@ def _filter_sglang_last_hidden_logprob_check_tensors(logits_output, index) -> No
             index_len = int(index.numel()) if _is_torch_tensor(index) else len(index)
         except Exception:  # noqa: BLE001
             index_len = None
-        if index_len is not None and value.dim() > 0 and int(value.shape[0]) == index_len:
+        if index_len is not None and value.dim() > 0 and int(value.shape[0]) < index_len:
             continue
         try:
             setattr(logits_output, attr, value[index])
@@ -1612,13 +1616,7 @@ def _filter_sglang_last_hidden_logprob_check_tensors(logits_output, index) -> No
             logger.warning("Failed to filter SGLang last-hidden logprob check tensor %s: %s", attr, exc)
 
 
-def _log_sglang_last_hidden_logprob_check(logits_output, stage: str = "filtered") -> None:
-    global _SGLANG_LAST_HIDDEN_LOGPROB_CHECK_LOG_COUNT
-    if not _sglang_last_hidden_logprob_check_enabled():
-        return
-    if _SGLANG_LAST_HIDDEN_LOGPROB_CHECK_LOG_COUNT >= _sglang_last_hidden_logprob_check_max_logs():
-        return
-
+def _build_sglang_last_hidden_logprob_check_summary(logits_output, stage: str) -> dict | None:
     recomputed_top_ids = getattr(logits_output, _VERL_DRAFTER_LH_CHECK_RECOMPUTED_TOP_IDS_ATTR, None)
     recomputed_top_logprobs = getattr(logits_output, _VERL_DRAFTER_LH_CHECK_RECOMPUTED_TOP_LOGPROBS_ATTR, None)
     recomputed_at_sglang_top = getattr(logits_output, _VERL_DRAFTER_LH_CHECK_RECOMPUTED_AT_SGLANG_TOP_ATTR, None)
@@ -1635,7 +1633,7 @@ def _log_sglang_last_hidden_logprob_check(logits_output, stage: str = "filtered"
             sglang_top_logprobs,
         )
     ):
-        return
+        return None
 
     try:
         with torch.no_grad():
@@ -1647,7 +1645,7 @@ def _log_sglang_last_hidden_logprob_check(logits_output, stage: str = "filtered"
                 int(sglang_top_logprobs.numel()),
             )
             if rows <= 0:
-                return
+                return None
             recomputed_top_ids = recomputed_top_ids[:rows].reshape(-1)
             recomputed_top_logprobs = recomputed_top_logprobs[:rows].reshape(-1).float()
             recomputed_at_sglang_top = recomputed_at_sglang_top[:rows].reshape(-1).float()
@@ -1655,25 +1653,57 @@ def _log_sglang_last_hidden_logprob_check(logits_output, stage: str = "filtered"
             sglang_top_logprobs = sglang_top_logprobs[:rows].reshape(-1).float()
             finite = torch.isfinite(recomputed_at_sglang_top) & torch.isfinite(sglang_top_logprobs)
             if not finite.any():
-                return
+                return None
             match = (recomputed_top_ids == sglang_top_ids) & finite
             diff = (recomputed_at_sglang_top[finite] - sglang_top_logprobs[finite]).abs()
             p95 = torch.quantile(diff, 0.95) if diff.numel() > 1 else diff.max()
+            summary = {
+                "stage": stage,
+                "rows": rows,
+                "valid_rows": int(finite.detach().sum().cpu().item()),
+                "top1_match": round(float(match[finite].float().mean().detach().cpu().item()), 6),
+                "logprob_abs_diff_mean": round(float(diff.mean().detach().cpu().item()), 6),
+                "logprob_abs_diff_p95": round(float(p95.detach().cpu().item()), 6),
+                "logprob_abs_diff_max": round(float(diff.max().detach().cpu().item()), 6),
+                "recomputed_top1_logprob_mean": round(
+                    float(recomputed_top_logprobs[finite].mean().detach().cpu().item()), 6
+                ),
+                "sglang_top1_logprob_mean": round(float(sglang_top_logprobs[finite].mean().detach().cpu().item()), 6),
+                "lm_head": lm_head_fingerprint,
+            }
+            setattr(logits_output, _VERL_DRAFTER_LH_CHECK_SUMMARY_ATTR, summary)
+            return summary
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to build SGLang last-hidden logprob check summary: %s", exc)
+        return None
+
+
+def _log_sglang_last_hidden_logprob_check(logits_output, stage: str = "filtered") -> None:
+    global _SGLANG_LAST_HIDDEN_LOGPROB_CHECK_LOG_COUNT
+    if not _sglang_last_hidden_logprob_check_enabled():
+        return
+    summary = _build_sglang_last_hidden_logprob_check_summary(logits_output, stage)
+    if summary is None:
+        return
+    if _SGLANG_LAST_HIDDEN_LOGPROB_CHECK_LOG_COUNT >= _sglang_last_hidden_logprob_check_max_logs():
+        return
+
+    try:
             logger.warning(
                 "[sglang last_hidden logprob check] stage=%s rows=%s valid_rows=%s top1_match=%.6f "
                 "logprob_abs_diff_mean=%.6g logprob_abs_diff_p95=%.6g "
                 "logprob_abs_diff_max=%.6g recomputed_top1_logprob_mean=%.6g "
                 "sglang_top1_logprob_mean=%.6g lm_head=%s",
-                stage,
-                rows,
-                int(finite.detach().sum().cpu().item()),
-                float(match[finite].float().mean().detach().cpu().item()),
-                float(diff.mean().detach().cpu().item()),
-                float(p95.detach().cpu().item()),
-                float(diff.max().detach().cpu().item()),
-                float(recomputed_top_logprobs[finite].mean().detach().cpu().item()),
-                float(sglang_top_logprobs[finite].mean().detach().cpu().item()),
-                lm_head_fingerprint,
+                summary["stage"],
+                summary["rows"],
+                summary["valid_rows"],
+                summary["top1_match"],
+                summary["logprob_abs_diff_mean"],
+                summary["logprob_abs_diff_p95"],
+                summary["logprob_abs_diff_max"],
+                summary["recomputed_top1_logprob_mean"],
+                summary["sglang_top1_logprob_mean"],
+                summary.get("lm_head"),
             )
             _SGLANG_LAST_HIDDEN_LOGPROB_CHECK_LOG_COUNT += 1
     except Exception as exc:  # noqa: BLE001
@@ -1681,6 +1711,7 @@ def _log_sglang_last_hidden_logprob_check(logits_output, stage: str = "filtered"
 
 
 def _filter_sglang_drafter_last_hidden_output(logits_output, index) -> None:
+    global _SGLANG_LAST_HIDDEN_FILTER_DEBUG_LOG_COUNT
     last_hidden_states = getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, None)
     if last_hidden_states is None:
         return
@@ -1699,6 +1730,67 @@ def _filter_sglang_drafter_last_hidden_output(logits_output, index) -> None:
         index_len = None
     if _is_torch_tensor(last_hidden_states) and index_len is not None and last_hidden_states.dim() > 0:
         hidden_rows = int(last_hidden_states.shape[0])
+        filter_summary = {
+            "stage": "before_filter",
+            "hidden_rows": hidden_rows,
+            "index_len": index_len,
+            "hidden_shape": tuple(last_hidden_states.shape),
+        }
+        if (
+            _sglang_last_hidden_logprob_check_enabled()
+            and _SGLANG_LAST_HIDDEN_FILTER_DEBUG_LOG_COUNT < _sglang_last_hidden_logprob_check_max_logs()
+        ):
+            try:
+                index_cpu = index.detach().flatten().to("cpu") if _is_torch_tensor(index) else torch.tensor(list(index))
+                index_head = [int(x) for x in index_cpu[:8].tolist()]
+                index_tail = [int(x) for x in index_cpu[-8:].tolist()] if int(index_cpu.numel()) > 8 else index_head
+                identity_prefix = bool(
+                    int(index_cpu.numel()) > 0
+                    and torch.equal(index_cpu[: min(int(index_cpu.numel()), 16)], torch.arange(min(int(index_cpu.numel()), 16)))
+                )
+                index_min = int(index_cpu.min().item()) if int(index_cpu.numel()) > 0 else None
+                index_max = int(index_cpu.max().item()) if int(index_cpu.numel()) > 0 else None
+            except Exception as exc:  # noqa: BLE001
+                index_head = [f"error:{exc}"]
+                index_tail = index_head
+                identity_prefix = None
+                index_min = None
+                index_max = None
+            filter_summary.update(
+                {
+                    "index_min": index_min,
+                    "index_max": index_max,
+                    "identity_prefix": identity_prefix,
+                    "index_head": index_head,
+                    "index_tail": index_tail,
+                }
+            )
+            logger.warning(
+                "[sglang last_hidden filter check] before hidden_rows=%s index_len=%s index_min=%s "
+                "index_max=%s identity_prefix=%s index_head=%s index_tail=%s hidden_shape=%s",
+                hidden_rows,
+                index_len,
+                index_min,
+                index_max,
+                identity_prefix,
+                index_head,
+                index_tail,
+                tuple(last_hidden_states.shape),
+            )
+            _SGLANG_LAST_HIDDEN_FILTER_DEBUG_LOG_COUNT += 1
+        else:
+            try:
+                index_cpu = index.detach().flatten().to("cpu") if _is_torch_tensor(index) else torch.tensor(list(index))
+                filter_summary.update(
+                    {
+                        "index_min": int(index_cpu.min().item()) if int(index_cpu.numel()) > 0 else None,
+                        "index_max": int(index_cpu.max().item()) if int(index_cpu.numel()) > 0 else None,
+                        "index_head": [int(x) for x in index_cpu[:8].tolist()],
+                    }
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTER_SUMMARY_ATTR, filter_summary)
         if hidden_rows < index_len:
             logger.warning(
                 "Skip filtering SGLang drafter last-hidden output: hidden_rows=%s < index_len=%s",
@@ -1714,6 +1806,10 @@ def _filter_sglang_drafter_last_hidden_output(logits_output, index) -> None:
         return
     setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, filtered_last_hidden_states)
     setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTERED_ATTR, True)
+    filter_summary = getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTER_SUMMARY_ATTR, None)
+    if isinstance(filter_summary, dict):
+        filter_summary = {**filter_summary, "stage": "filtered", "filtered_shape": tuple(filtered_last_hidden_states.shape)}
+        setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTER_SUMMARY_ATTR, filter_summary)
     _filter_sglang_last_hidden_logprob_check_tensors(logits_output, index)
     _log_sglang_last_hidden_logprob_check(logits_output, stage="filtered")
 
@@ -1802,10 +1898,17 @@ def _append_sglang_hidden_chunk_payload(req, chunk, metadata: dict[str, int] | N
 
 
 def _sglang_hidden_debug_metadata(logits_output) -> dict:
+    metadata = {}
     fingerprint = getattr(logits_output, "_verl_drafter_lh_check_lm_head_fingerprint", None)
     if isinstance(fingerprint, dict):
-        return {"lm_head_fingerprint": fingerprint}
-    return {}
+        metadata["lm_head_fingerprint"] = fingerprint
+    lh_check_summary = getattr(logits_output, _VERL_DRAFTER_LH_CHECK_SUMMARY_ATTR, None)
+    if isinstance(lh_check_summary, dict):
+        metadata["last_hidden_logprob_check"] = lh_check_summary
+    filter_summary = getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTER_SUMMARY_ATTR, None)
+    if isinstance(filter_summary, dict):
+        metadata["last_hidden_filter"] = filter_summary
+    return metadata
 
 
 def _mark_sglang_hidden_states_stream_final(req) -> None:
@@ -2760,6 +2863,7 @@ def _make_sglang_drafter_last_hidden_forward_patch(original_method):
                 setattr(output, "_verl_dflash_aux_hidden_states", True)
         if return_last_hidden and hidden_states is not None:
             if getattr(output, "hidden_states", None) is not None:
+                _attach_sglang_lm_head_fingerprint(output, lm_head)
                 _attach_sglang_last_hidden_logprob_check(self, output, hidden_states, lm_head, logits_metadata)
             setattr(output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, hidden_states)
             setattr(output, _VERL_DRAFTER_LAST_HIDDEN_FILTERED_ATTR, False)

@@ -252,6 +252,38 @@ def _tensor_shape(tensor: Any) -> list[int] | None:
     return None
 
 
+def _sampling_params_debug(sampling_params: dict[str, Any], request: dict[str, Any], return_logprob: bool) -> dict[str, Any]:
+    custom_params = sampling_params.get("custom_params")
+    custom_keys = sorted(custom_params.keys()) if isinstance(custom_params, dict) else []
+    debug = {
+        "temperature": sampling_params.get("temperature"),
+        "top_p": sampling_params.get("top_p"),
+        "top_k": sampling_params.get("top_k"),
+        "min_p": sampling_params.get("min_p"),
+        "repetition_penalty": sampling_params.get("repetition_penalty"),
+        "presence_penalty": sampling_params.get("presence_penalty"),
+        "frequency_penalty": sampling_params.get("frequency_penalty"),
+        "logit_bias_keys": sorted(str(key) for key in (sampling_params.get("logit_bias") or {}).keys())
+        if isinstance(sampling_params.get("logit_bias"), dict)
+        else None,
+        "regex": bool(sampling_params.get("regex")),
+        "json_schema": bool(sampling_params.get("json_schema")),
+        "ebnf": bool(sampling_params.get("ebnf")),
+        "custom_logit_processor": bool(sampling_params.get("custom_logit_processor")),
+        "return_logprob": bool(request.get("return_logprob", return_logprob)),
+        "top_logprobs_num": request.get("top_logprobs_num"),
+        "custom_param_keys": custom_keys,
+        "custom_params": {
+            key: custom_params.get(key)
+            for key in custom_keys
+            if key.startswith("_verl_") and isinstance(custom_params.get(key), (bool, int, float, str, type(None)))
+        }
+        if isinstance(custom_params, dict)
+        else None,
+    }
+    return {key: value for key, value in debug.items() if value is not None}
+
+
 def _expected_full_hidden_rows(prompt_len: int, output_len: int) -> int:
     return max(int(prompt_len) + int(output_len) - 1, 0)
 
@@ -508,6 +540,12 @@ def _hidden_state_metadata_from_chunk(hidden_state_chunk: Any) -> dict[str, int]
     lm_head_fingerprint = hidden_state_chunk.get("lm_head_fingerprint")
     if isinstance(lm_head_fingerprint, dict):
         metadata["lm_head_fingerprint"] = lm_head_fingerprint
+    last_hidden_logprob_check = hidden_state_chunk.get("last_hidden_logprob_check")
+    if isinstance(last_hidden_logprob_check, dict):
+        metadata["last_hidden_logprob_check"] = last_hidden_logprob_check
+    last_hidden_filter = hidden_state_chunk.get("last_hidden_filter")
+    if isinstance(last_hidden_filter, dict):
+        metadata["last_hidden_filter"] = last_hidden_filter
     return metadata
 
 
@@ -1091,17 +1129,19 @@ class SGLangHttpServer:
                 elif _drafter_uses_eagle_last_hidden(self.config.drafter):
                     custom_params[_VERL_DRAFTER_RETURN_LAST_HIDDEN_PARAM] = True
             sampling_params["custom_params"] = custom_params
+        sampling_debug = _sampling_params_debug(sampling_params, request, return_logprob)
 
         if self.config.drafter.enable:
             logger.warning(
                 "[sglang generate] request_id=%s server_global_steps=%s request_global_steps=%s "
-                "should_collect=%s return_hidden_states=%s drafter_training=%s",
+                "should_collect=%s return_hidden_states=%s drafter_training=%s sampling_debug=%s",
                 request_id,
                 self.global_steps,
                 collection_global_steps,
                 should_collect,
                 bool(request.get("return_hidden_states", False)),
                 self.config.drafter.enable_drafter_training,
+                sampling_debug,
             )
 
         generate_request = GenerateReqInput(**request)
@@ -1210,6 +1250,8 @@ class SGLangHttpServer:
             hidden_window_start = None
             hidden_window_end = None
             hidden_lm_head_fingerprint = None
+            hidden_last_hidden_logprob_check = None
+            hidden_last_hidden_filter = None
             hidden_crop_mode = "none"
             expected_hidden_rows = _expected_full_hidden_rows(len(prompt_ids), len(token_ids))
             hidden_complete = False
@@ -1229,7 +1271,30 @@ class SGLangHttpServer:
                     hidden_prefix_cache_rows = int(first_metadata.get("prefix_cache_rows", 0))
                     hidden_window_start = first_metadata.get("window_start")
                     hidden_window_end = first_metadata.get("window_end")
-                    hidden_lm_head_fingerprint = first_metadata.get("lm_head_fingerprint")
+                    hidden_lm_head_fingerprint = next(
+                        (
+                            metadata.get("lm_head_fingerprint")
+                            for metadata in hidden_states_metadata
+                            if metadata.get("lm_head_fingerprint") is not None
+                        ),
+                        None,
+                    )
+                    hidden_last_hidden_logprob_check = next(
+                        (
+                            metadata.get("last_hidden_logprob_check")
+                            for metadata in reversed(hidden_states_metadata)
+                            if metadata.get("last_hidden_logprob_check") is not None
+                        ),
+                        None,
+                    )
+                    hidden_last_hidden_filter = next(
+                        (
+                            metadata.get("last_hidden_filter")
+                            for metadata in reversed(hidden_states_metadata)
+                            if metadata.get("last_hidden_filter") is not None
+                        ),
+                        None,
+                    )
                     hidden_crop_mode = "sglang_window"
                     hidden_complete = True
                 else:
@@ -1278,6 +1343,8 @@ class SGLangHttpServer:
                     "hidden_window_start": hidden_window_start,
                     "hidden_window_end": hidden_window_end,
                     "hidden_lm_head_fingerprint": hidden_lm_head_fingerprint,
+                    "hidden_last_hidden_logprob_check": hidden_last_hidden_logprob_check,
+                    "hidden_last_hidden_filter": hidden_last_hidden_filter,
                     "target_logprobs": target_logprobs.unsqueeze(0).cpu() if target_logprobs is not None else None,
                     "target_logprobs_position_start": target_logprobs_position_start,
                     "target_logprobs_position_end": target_logprobs_position_end,
@@ -1336,6 +1403,9 @@ class SGLangHttpServer:
                         "hidden_window_start": hidden_window_start,
                         "hidden_window_end": hidden_window_end,
                         "hidden_lm_head_fingerprint": hidden_lm_head_fingerprint,
+                        "hidden_last_hidden_logprob_check": hidden_last_hidden_logprob_check,
+                        "hidden_last_hidden_filter": hidden_last_hidden_filter,
+                        "sampling_debug": sampling_debug,
                         "hidden_crop_mode": hidden_crop_mode,
                         "hidden_front_max": getattr(
                             self.config.drafter.training,
