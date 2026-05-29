@@ -745,11 +745,9 @@ class SGLangHttpServer:
             args["enable_draft_weights_cpu_backup"] = True
 
         # drafter
-        return_last_hidden_for_drafter = False
         if self.config.drafter.enable:
             if self.config.drafter.training.use_logits:
                 enable_sglang_original_logprob_return()
-            return_last_hidden_for_drafter = _drafter_uses_eagle_last_hidden(self.config.drafter)
             args["speculative_algorithm"] = self.config.drafter.speculative_algorithm
             cuda_graph_max_bs = getattr(self.config.drafter.rollout, "cuda_graph_max_bs", None)
             if cuda_graph_max_bs is not None:
@@ -763,15 +761,15 @@ class SGLangHttpServer:
 
             args["enable_weights_cpu_backup"] = True
             args["enable_draft_weights_cpu_backup"] = True
-        os.environ[_VERL_DRAFTER_RETURN_LAST_HIDDEN_ENV] = (
-            "1" if return_last_hidden_for_drafter else "0"
-        )
-        raw_top_logprobs_for_debug = _env_flag_enabled(_LAST_HIDDEN_LOGPROB_CHECK_ENV, default=False)
+        # Last-hidden capture is only needed for use_logits=False collection
+        # requests. Keep the process-wide switch off and use the per-request
+        # custom parameter set below when should_collect is true.
+        os.environ[_VERL_DRAFTER_RETURN_LAST_HIDDEN_ENV] = "0"
         raw_top_logprobs_enabled = (
             self.config.drafter.enable
             and self.config.drafter.enable_drafter_training
             and self.config.drafter.training.collect_hidden_states_from_sgl
-            and (self.config.drafter.training.use_logits or raw_top_logprobs_for_debug)
+            and self.config.drafter.training.use_logits
         )
         os.environ[_VERL_DRAFTER_RAW_TOP_LOGPROBS_ENV] = "1" if raw_top_logprobs_enabled else "0"
         if raw_top_logprobs_enabled and self.config.drafter.training.use_logits:
@@ -1228,7 +1226,10 @@ class SGLangHttpServer:
                         hidden_raw_target_logprobs = torch.cat(raw_target_logprob_chunks, dim=0).contiguous()
                         raw_target_rows = int(hidden_raw_target_logprobs.size(0))
                         raw_rows_match_hidden = raw_target_rows == hidden_raw_len
-                        raw_rows_match_eagle_shift = collect_target_logprobs and raw_target_rows == max(hidden_raw_len - 1, 0)
+                        # Raw next-token logits may be compact: hidden rows cover
+                        # positions p, while raw rows cover shifted targets p + 1.
+                        # Keep that metadata for debug even when use_logits=False.
+                        raw_rows_match_eagle_shift = raw_target_rows == max(hidden_raw_len - 1, 0)
                         if not (raw_rows_match_hidden or raw_rows_match_eagle_shift):
                             logger.warning(
                                 "Drop raw top-k debug metadata with mismatched rows: raw_rows=%s hidden_rows=%s",

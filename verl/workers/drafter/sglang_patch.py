@@ -1427,6 +1427,28 @@ def _sglang_forward_batch_requests_dflash_aux_hidden(forward_batch) -> bool:
     return False
 
 
+def _sglang_req_requests_drafter_hidden_window(req) -> bool:
+    return _custom_flag_enabled(
+        _sglang_req_custom_params(req).get(_VERL_DRAFTER_HIDDEN_WINDOW_PARAM, False)
+    )
+
+
+def _sglang_forward_batch_requests_raw_top_logprobs(forward_batch) -> bool:
+    reqs = getattr(forward_batch, "reqs", []) or []
+    if not reqs:
+        return bool(getattr(forward_batch, "return_hidden_states", False))
+    for req in reqs:
+        if not getattr(req, "return_hidden_states", False):
+            continue
+        if (
+            _sglang_req_requests_drafter_hidden_window(req)
+            or _sglang_req_requests_last_hidden_for_drafter(req)
+            or _sglang_req_requests_dflash_aux_hidden(req)
+        ):
+            return True
+    return False
+
+
 def _sglang_dflash_should_return_verify_hidden(batch) -> bool:
     return _sglang_forward_batch_requests_dflash_aux_hidden(batch)
 
@@ -3729,7 +3751,7 @@ def _make_sglang_drafter_last_hidden_forward_patch(original_method):
             else:
                 output.hidden_states = dflash_hidden_states
                 setattr(output, "_verl_dflash_aux_hidden_states", True)
-        if _sglang_raw_top_logprobs_enabled():
+        if _sglang_raw_top_logprobs_enabled() and _sglang_forward_batch_requests_raw_top_logprobs(logits_metadata):
             _attach_sglang_raw_top_logprobs(output, logits_metadata)
         if return_last_hidden and hidden_states is not None:
             if getattr(output, "hidden_states", None) is not None:
@@ -3844,7 +3866,7 @@ def _make_sglang_drafter_last_hidden_graph_replay_patch(original_method):
         output = _sglang_graph_replay_output_buffer(self, original_method, forward_batch)
         if output is not None:
             _copy_sglang_drafter_last_hidden_output(output, result, slice(0, self.raw_num_token))
-        if _sglang_raw_top_logprobs_enabled():
+        if _sglang_raw_top_logprobs_enabled() and _sglang_forward_batch_requests_raw_top_logprobs(forward_batch):
             _attach_sglang_raw_top_logprobs(result, forward_batch)
         if output is not None:
             _attach_sglang_last_hidden_logprob_check_from_graph_runner(self, result, forward_batch)
