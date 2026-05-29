@@ -18,7 +18,6 @@ import hashlib
 import json
 import logging
 import os
-import math
 from typing import Any, Optional
 
 import ray
@@ -78,10 +77,7 @@ _VERL_DRAFTER_RETURN_LAST_HIDDEN_ENV = "VERL_SGLANG_DRAFTER_RETURN_LAST_HIDDEN"
 _VERL_DRAFTER_RETURN_LAST_HIDDEN_PARAM = "_verl_drafter_return_last_hidden"
 _VERL_DFLASH_RETURN_AUX_HIDDEN_PARAM = "_verl_dflash_return_aux_hidden"
 _VERL_DRAFTER_RAW_TOP_LOGPROBS_ENV = "VERL_DRAFTER_RAW_TOP_LOGPROBS"
-_VERL_TOP_LOGPROBS_TENSOR_PARAM = "_verl_top_logprobs_tensor_output"
-_VERL_OUTPUT_TOP_LOGPROBS_TENSOR_KEY = "_verl_output_top_logprobs_tensor"
-_VERL_TOP_LOGPROBS_OUTPUT_ROW_START_PARAM = "_verl_top_logprobs_output_row_start"
-_VERL_TOP_LOGPROBS_OUTPUT_ROW_END_PARAM = "_verl_top_logprobs_output_row_end"
+_VERL_DRAFTER_RAW_TOP_LOGPROBS_TOPK_ENV = "VERL_DRAFTER_RAW_TOP_LOGPROBS_TOPK"
 
 
 def _drafter_uses_eagle_last_hidden(drafter_cfg) -> bool:
@@ -381,111 +377,6 @@ def _count_sampled_token_mismatches(output_token_logprobs: list, token_ids: list
         if logged_token_id != int(token_id):
             mismatch_count += 1
     return mismatch_count
-
-
-def _top_logprobs_to_tensor(top_logprobs: list, topk: int) -> Optional[torch.Tensor]:
-    if topk <= 0:
-        return None
-
-    rows = []
-    for step_top_logprobs in top_logprobs:
-        if isinstance(step_top_logprobs, dict):
-            entries = list(step_top_logprobs.values())
-        else:
-            entries = list(step_top_logprobs or [])
-
-        row = []
-        for entry in entries[:topk]:
-            if isinstance(entry, dict):
-                logprob = entry.get("logprob", entry.get("log_probs", entry.get("log_prob")))
-                token_id = entry.get("token_id", entry.get("idx", entry.get("id")))
-            elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
-                logprob, token_id = entry[0], entry[1]
-            else:
-                continue
-
-            try:
-                row.append([float(logprob), float(int(token_id))])
-            except (TypeError, ValueError):
-                continue
-
-        if not row:
-            row = [[-math.inf, -1.0] for _ in range(topk)]
-        while len(row) < topk:
-            row.append([-math.inf, -1.0])
-        rows.append(row)
-
-    if not rows:
-        return None
-    return torch.tensor(rows, dtype=torch.float32)
-
-
-def _normalize_output_top_logprobs_tensor(output_top_logprobs: Any, topk: int) -> Optional[torch.Tensor]:
-    if topk <= 0 or output_top_logprobs is None:
-        return None
-
-    if isinstance(output_top_logprobs, dict):
-        values = output_top_logprobs.get("values")
-        indices = output_top_logprobs.get("indices")
-        if values is None or indices is None:
-            return None
-        if not torch.is_tensor(values):
-            values = torch.tensor(values, dtype=torch.float32)
-        else:
-            values = values.detach().cpu().to(dtype=torch.float32)
-        if not torch.is_tensor(indices):
-            indices = torch.tensor(indices, dtype=torch.float32)
-        else:
-            indices = indices.detach().cpu().to(dtype=torch.float32)
-        if values.dim() != 2 or indices.dim() != 2:
-            return None
-        rows = min(values.size(0), indices.size(0))
-        cols = min(values.size(1), indices.size(1), topk)
-        if rows <= 0 or cols <= 0:
-            return None
-        values = values[:rows, :cols]
-        indices = indices[:rows, :cols]
-        tensor = torch.empty((rows, topk, 2), dtype=torch.float32)
-        tensor[..., 0] = float("-inf")
-        tensor[..., 1] = -1.0
-        tensor[:, :cols, 0] = values
-        tensor[:, :cols, 1] = indices
-        return tensor
-
-    if not torch.is_tensor(output_top_logprobs):
-        return None
-
-    tensor = output_top_logprobs.detach().cpu().to(dtype=torch.float32)
-    if tensor.dim() != 3 or tensor.size(-1) < 2:
-        return None
-
-    rows = tensor.size(0)
-    cols = min(tensor.size(1), topk)
-    if rows <= 0 or cols <= 0:
-        return None
-
-    if tensor.size(1) == topk and tensor.size(-1) == 2:
-        return tensor.contiguous()
-
-    normalized = torch.empty((rows, topk, 2), dtype=torch.float32)
-    normalized[..., 0] = float("-inf")
-    normalized[..., 1] = -1.0
-    normalized[:, :cols, :] = tensor[:, :cols, :2]
-    return normalized.contiguous()
-
-
-def _output_top_logprobs_output_row_start(output_top_logprobs: Any) -> Optional[int]:
-    if not isinstance(output_top_logprobs, dict):
-        return None
-    for key in ("output_row_start", "row_start"):
-        value = output_top_logprobs.get(key)
-        if value is None:
-            continue
-        try:
-            return max(int(value), 0)
-        except (TypeError, ValueError):
-            return None
-    return None
 
 
 def _crop_target_logprobs_to_position_window(
@@ -876,16 +767,17 @@ class SGLangHttpServer:
             "1" if return_last_hidden_for_drafter else "0"
         )
         raw_top_logprobs_for_debug = _env_flag_enabled(_LAST_HIDDEN_LOGPROB_CHECK_ENV, default=False)
-        os.environ[_VERL_DRAFTER_RAW_TOP_LOGPROBS_ENV] = (
-            "1"
-            if (
-                self.config.drafter.enable
-                and self.config.drafter.enable_drafter_training
-                and self.config.drafter.training.collect_hidden_states_from_sgl
-                and (self.config.drafter.training.use_logits or raw_top_logprobs_for_debug)
-            )
-            else "0"
+        raw_top_logprobs_enabled = (
+            self.config.drafter.enable
+            and self.config.drafter.enable_drafter_training
+            and self.config.drafter.training.collect_hidden_states_from_sgl
+            and (self.config.drafter.training.use_logits or raw_top_logprobs_for_debug)
         )
+        os.environ[_VERL_DRAFTER_RAW_TOP_LOGPROBS_ENV] = "1" if raw_top_logprobs_enabled else "0"
+        if raw_top_logprobs_enabled and self.config.drafter.training.use_logits:
+            os.environ[_VERL_DRAFTER_RAW_TOP_LOGPROBS_TOPK_ENV] = str(
+                max(int(self.config.drafter.training.logits_topk), 1)
+            )
 
         # NOTE: We can't directly call SGLang's launch_server since it's not an async function.
         # https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/entrypoints/http_server.py
@@ -1148,18 +1040,6 @@ class SGLangHttpServer:
             )
             if front_hidden_tokens is not None:
                 custom_params[_VERL_HIDDEN_STATE_FRONT_TOKENS_PARAM] = int(front_hidden_tokens)
-            if self.config.drafter.training.use_logits:
-                custom_params[_VERL_TOP_LOGPROBS_TENSOR_PARAM] = True
-                # EAGLE-style logits training aligns hidden row p with the
-                # target logprob row at p + 1.
-                custom_params[_VERL_TOP_LOGPROBS_OUTPUT_ROW_START_PARAM] = 1
-                if front_hidden_tokens is not None:
-                    custom_params[_VERL_TOP_LOGPROBS_OUTPUT_ROW_END_PARAM] = max(
-                        int(front_hidden_tokens),
-                        1,
-                    )
-                request.update({"return_logprob": True})
-                request.update({"top_logprobs_num": self.config.drafter.training.logits_topk})
             if not self.config.drafter.training.use_logits:
                 if _drafter_uses_dflash_aux_hidden(self.config.drafter):
                     custom_params[_VERL_DFLASH_RETURN_AUX_HIDDEN_PARAM] = True
@@ -1230,7 +1110,6 @@ class SGLangHttpServer:
         drafter_sample = None
         if should_collect:
             target_logprobs = None
-            output_top = []
             output_top_len = None
             target_logprobs_position_start = None
             target_logprobs_position_end = None
@@ -1238,25 +1117,6 @@ class SGLangHttpServer:
             output_token_logprobs = output.get("meta_info", {}).get("output_token_logprobs", []) or []
             sampled_token_mismatch = _count_sampled_token_mismatches(output_token_logprobs, list(token_ids))
             collect_target_logprobs = bool(self.config.drafter.training.use_logits)
-            if collect_target_logprobs:
-                logits_topk = int(self.config.drafter.training.logits_topk)
-                target_logprobs_position_start = max(len(prompt_ids) - 1, 0)
-                output_top_tensor = meta_info.pop(_VERL_OUTPUT_TOP_LOGPROBS_TENSOR_KEY, None)
-                target_logprobs = _normalize_output_top_logprobs_tensor(output_top_tensor, logits_topk)
-                if target_logprobs is not None:
-                    output_row_start = _output_top_logprobs_output_row_start(output_top_tensor)
-                    if output_row_start is not None:
-                        target_logprobs_position_start = max(len(prompt_ids) - 1, 0) + output_row_start
-                    output_top_len = int(target_logprobs.size(0))
-                if target_logprobs is None:
-                    output_top = output.get("meta_info", {}).get("output_top_logprobs", [])
-                    output_top_len = len(output_top) if output_top else None
-                    target_logprobs = _top_logprobs_to_tensor(output_top, logits_topk)
-                if target_logprobs is None:
-                    logger.warning("Failed to convert output top_logprobs to tensor; skip target_logprobs collection")
-                    target_logprobs_position_start = None
-                else:
-                    target_logprobs_position_end = target_logprobs_position_start + int(target_logprobs.size(0))
 
             hidden_states_data = meta_info.pop("hidden_states", [])
             hidden_states_raw_type = type(hidden_states_data).__name__
@@ -1366,13 +1226,35 @@ class SGLangHttpServer:
                     ]
                     if raw_target_logprob_chunks:
                         hidden_raw_target_logprobs = torch.cat(raw_target_logprob_chunks, dim=0).contiguous()
-                        if int(hidden_raw_target_logprobs.size(0)) != hidden_raw_len:
+                        raw_target_rows = int(hidden_raw_target_logprobs.size(0))
+                        raw_rows_match_hidden = raw_target_rows == hidden_raw_len
+                        raw_rows_match_eagle_shift = collect_target_logprobs and raw_target_rows == max(hidden_raw_len - 1, 0)
+                        if not (raw_rows_match_hidden or raw_rows_match_eagle_shift):
                             logger.warning(
                                 "Drop raw top-k debug metadata with mismatched rows: raw_rows=%s hidden_rows=%s",
-                                int(hidden_raw_target_logprobs.size(0)),
+                                raw_target_rows,
                                 hidden_raw_len,
                             )
                             hidden_raw_target_logprobs = None
+                            if hidden_target_logprobs_source == "raw_hidden_metadata":
+                                hidden_target_logprobs_source = None
+                            hidden_raw_topk_logprob_check = None
+                        elif hidden_raw_target_logprobs.dim() == 3 and int(hidden_raw_target_logprobs.size(0)) > 0:
+                            hidden_raw_topk_logprob_check = {
+                                "target_logprobs_source": "raw_hidden_metadata",
+                                "shape": tuple(hidden_raw_target_logprobs.shape),
+                                "rows": raw_target_rows,
+                                "topk": int(hidden_raw_target_logprobs.size(1)),
+                                "top1_ids_head": [
+                                    int(x)
+                                    for x in hidden_raw_target_logprobs[
+                                        : min(raw_target_rows, 8), 0, 1
+                                    ].detach().cpu().tolist()
+                                ],
+                            }
+                    elif hidden_target_logprobs_source == "raw_hidden_metadata":
+                        hidden_target_logprobs_source = None
+                        hidden_raw_topk_logprob_check = None
                     hidden_last_hidden_filter = next(
                         (
                             metadata.get("last_hidden_filter")
@@ -1418,11 +1300,10 @@ class SGLangHttpServer:
                     target_logprobs_dropped_rows = 0
                     output_top_len = int(target_logprobs.size(0))
                 elif collect_target_logprobs:
-                    if target_logprobs is not None:
-                        logger.warning(
-                            "Discard SGLang output_top_logprobs for drafter logits training because "
-                            "raw next_token_logits metadata is missing"
-                        )
+                    logger.warning(
+                        "Missing SGLang raw next_token_logits metadata for drafter logits training; "
+                        "skip target_logprobs collection"
+                    )
                     target_logprobs = None
                     target_logprobs_position_start = None
                     target_logprobs_position_end = None
@@ -1545,7 +1426,7 @@ class SGLangHttpServer:
                             "hidden_state_max_tokens_per_sample",
                             None,
                         ),
-                        "output_top_len": output_top_len if output_top_len is not None else len(output_top),
+                        "output_top_len": output_top_len,
                         "collect_target_logprobs": collect_target_logprobs,
                         "output_token_logprob_len": len(output_token_logprobs),
                         "target_shape": _tensor_shape(target_logprobs),
