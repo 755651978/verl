@@ -1888,20 +1888,77 @@ def _log_sglang_last_hidden_logprob_check(logits_output, stage: str = "filtered"
         logger.warning("Failed to log SGLang last-hidden logprob check: %s", exc)
 
 
+def _sglang_tensor_head_tail(value, limit: int = 8) -> tuple[list[int] | None, list[int] | None]:
+    if value is None:
+        return None, None
+    try:
+        tensor = value.detach().flatten().to("cpu") if _is_torch_tensor(value) else torch.tensor(list(value)).flatten()
+        if int(tensor.numel()) <= 0:
+            return [], []
+        head = [int(x) for x in tensor[:limit].tolist()]
+        tail = [int(x) for x in tensor[-limit:].tolist()] if int(tensor.numel()) > limit else head
+        return head, tail
+    except Exception as exc:  # noqa: BLE001
+        error = [f"error:{exc}"]
+        return error, error
+
+
+def _sglang_first_contiguous_position_len(positions) -> tuple[int | None, bool | None, int | None]:
+    if not _is_torch_tensor(positions):
+        return None, None, None
+    flat = positions.detach().flatten()
+    rows = int(flat.numel())
+    if rows <= 1:
+        return rows, True, None
+    contiguous = flat[1:] == flat[:-1] + 1
+    breaks = torch.nonzero(~contiguous, as_tuple=False).flatten()
+    if int(breaks.numel()) <= 0:
+        return rows, True, None
+    first_break = int(breaks[0].detach().cpu().item()) + 1
+    return first_break, False, first_break
+
+
+def _truncate_sglang_last_hidden_logprob_check_tensors(logits_output, rows: int) -> None:
+    for attr in (
+        _VERL_DRAFTER_LH_CHECK_RECOMPUTED_TOP_IDS_ATTR,
+        _VERL_DRAFTER_LH_CHECK_RECOMPUTED_TOP_LOGPROBS_ATTR,
+        _VERL_DRAFTER_LH_CHECK_RECOMPUTED_AT_SGLANG_TOP_ATTR,
+        _VERL_DRAFTER_LH_CHECK_SGLANG_TOP_IDS_ATTR,
+        _VERL_DRAFTER_LH_CHECK_SGLANG_TOP_LOGPROBS_ATTR,
+    ):
+        value = getattr(logits_output, attr, None)
+        if _is_torch_tensor(value) and value.dim() > 0 and int(value.shape[0]) > rows:
+            setattr(logits_output, attr, value[:rows])
+
+
 def _filter_sglang_drafter_last_hidden_output(logits_output, index, positions=None) -> None:
     global _SGLANG_LAST_HIDDEN_FILTER_DEBUG_LOG_COUNT
+    try:
+        index_tensor = index if _is_torch_tensor(index) else torch.tensor(list(index))
+        index_tensor = index_tensor.to(dtype=torch.long).reshape(-1)
+        index_len = int(index_tensor.numel())
+        index_cpu = index_tensor.detach().to("cpu")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to normalize SGLang drafter accepted indices: %s", exc)
+        return
+    accept_head, accept_tail = _sglang_tensor_head_tail(index_cpu)
+
     base_hidden_states = getattr(logits_output, "hidden_states", None)
+    base_hidden_filtered = None
     if (
         _is_torch_tensor(base_hidden_states)
         and not bool(getattr(logits_output, "_verl_drafter_base_hidden_filtered_by_accept_indices", False))
     ):
         try:
-            index_tensor = index if _is_torch_tensor(index) else torch.tensor(list(index), device=base_hidden_states.device)
-            index_tensor = index_tensor.to(device=base_hidden_states.device, dtype=torch.long).reshape(-1)
+            base_index = index_tensor.to(device=base_hidden_states.device, dtype=torch.long)
             if base_hidden_states.dim() == 3:
                 base_hidden_states = base_hidden_states.reshape(-1, base_hidden_states.shape[-1])
-            if int(index_tensor.numel()) > 0 and int(base_hidden_states.shape[0]) > int(index_tensor.max().item()):
-                setattr(logits_output, "hidden_states", base_hidden_states[index_tensor])
+            if index_len > 0 and int(base_hidden_states.shape[0]) > int(base_index.max().item()):
+                base_hidden_filtered = base_hidden_states[base_index]
+                setattr(logits_output, "hidden_states", base_hidden_filtered)
+                setattr(logits_output, "_verl_drafter_base_hidden_filtered_by_accept_indices", True)
+            elif int(base_hidden_states.shape[0]) == index_len:
+                base_hidden_filtered = base_hidden_states
                 setattr(logits_output, "_verl_drafter_base_hidden_filtered_by_accept_indices", True)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to filter SGLang drafter base hidden states by accepted indices: %s", exc)
@@ -1909,51 +1966,53 @@ def _filter_sglang_drafter_last_hidden_output(logits_output, index, positions=No
     last_hidden_states = getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, None)
     if last_hidden_states is None:
         return
-    if positions is not None:
-        setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_POSITIONS_ATTR, positions)
     if bool(getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTERED_ATTR, False)):
-        try:
-            index_len = int(index.numel()) if _is_torch_tensor(index) else len(index)
-        except Exception:  # noqa: BLE001
-            index_len = None
+        filtered_positions = getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_POSITIONS_ATTR, None)
+        pos_head, pos_tail = _sglang_tensor_head_tail(filtered_positions)
         hidden_shape = tuple(last_hidden_states.shape) if _is_torch_tensor(last_hidden_states) else None
+        existing_summary = getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTER_SUMMARY_ATTR, None)
+        if not isinstance(existing_summary, dict):
+            existing_summary = {}
         setattr(
             logits_output,
             _VERL_DRAFTER_LAST_HIDDEN_FILTER_SUMMARY_ATTR,
             {
+                **existing_summary,
                 "stage": "already_filtered",
-                "hidden_rows": _sglang_hidden_state_rows(last_hidden_states),
+                "hidden_rows_after": _sglang_hidden_state_rows(last_hidden_states),
                 "index_len": index_len,
                 "hidden_shape": hidden_shape,
+                "accept_indices_head": accept_head,
+                "accept_indices_tail": accept_tail,
+                "positions_len": int(filtered_positions.numel()) if _is_torch_tensor(filtered_positions) else None,
+                "positions_head": pos_head,
+                "positions_tail": pos_tail,
             },
         )
         _log_sglang_last_hidden_logprob_check(logits_output, stage="already_filtered")
         return
+    if positions is not None:
+        setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_POSITIONS_ATTR, positions)
 
     # Keep this helper idempotent through the explicit filtered flag above.
     # Equal row counts do not mean the accepted-index filter has already been
     # applied: EAGLE can accept every row while still requiring a tree-order
     # reindex, and SGLang only filters logits_output.hidden_states itself.
-    try:
-        index_len = int(index.numel()) if _is_torch_tensor(index) else len(index)
-    except Exception:  # noqa: BLE001
-        index_len = None
-    if _is_torch_tensor(last_hidden_states) and index_len is not None and last_hidden_states.dim() > 0:
+    if _is_torch_tensor(last_hidden_states) and last_hidden_states.dim() > 0:
         hidden_rows = int(last_hidden_states.shape[0])
         filter_summary = {
             "stage": "before_filter",
-            "hidden_rows": hidden_rows,
+            "hidden_rows_before": hidden_rows,
             "index_len": index_len,
             "hidden_shape": tuple(last_hidden_states.shape),
+            "accept_indices_head": accept_head,
+            "accept_indices_tail": accept_tail,
         }
         if (
             _sglang_last_hidden_logprob_check_enabled()
             and _SGLANG_LAST_HIDDEN_FILTER_DEBUG_LOG_COUNT < _sglang_last_hidden_logprob_check_max_logs()
         ):
             try:
-                index_cpu = index.detach().flatten().to("cpu") if _is_torch_tensor(index) else torch.tensor(list(index))
-                index_head = [int(x) for x in index_cpu[:8].tolist()]
-                index_tail = [int(x) for x in index_cpu[-8:].tolist()] if int(index_cpu.numel()) > 8 else index_head
                 identity_prefix = bool(
                     int(index_cpu.numel()) > 0
                     and torch.equal(index_cpu[: min(int(index_cpu.numel()), 16)], torch.arange(min(int(index_cpu.numel()), 16)))
@@ -1971,31 +2030,30 @@ def _filter_sglang_drafter_last_hidden_output(logits_output, index, positions=No
                     "index_min": index_min,
                     "index_max": index_max,
                     "identity_prefix": identity_prefix,
-                    "index_head": index_head,
-                    "index_tail": index_tail,
+                    "index_head": accept_head,
+                    "index_tail": accept_tail,
                 }
             )
             logger.warning(
                 "[sglang last_hidden filter check] before hidden_rows=%s index_len=%s index_min=%s "
-                "index_max=%s identity_prefix=%s index_head=%s index_tail=%s hidden_shape=%s",
+                "index_max=%s identity_prefix=%s accept_indices_head=%s accept_indices_tail=%s hidden_shape=%s",
                 hidden_rows,
                 index_len,
                 index_min,
                 index_max,
                 identity_prefix,
-                index_head,
-                index_tail,
+                accept_head,
+                accept_tail,
                 tuple(last_hidden_states.shape),
             )
             _SGLANG_LAST_HIDDEN_FILTER_DEBUG_LOG_COUNT += 1
         else:
             try:
-                index_cpu = index.detach().flatten().to("cpu") if _is_torch_tensor(index) else torch.tensor(list(index))
                 filter_summary.update(
                     {
                         "index_min": int(index_cpu.min().item()) if int(index_cpu.numel()) > 0 else None,
                         "index_max": int(index_cpu.max().item()) if int(index_cpu.numel()) > 0 else None,
-                        "index_head": [int(x) for x in index_cpu[:8].tolist()],
+                        "index_head": accept_head,
                     }
                 )
             except Exception:  # noqa: BLE001
@@ -2010,23 +2068,76 @@ def _filter_sglang_drafter_last_hidden_output(logits_output, index, positions=No
             return
 
     try:
-        filtered_last_hidden_states = last_hidden_states[index]
+        last_hidden_index = index_tensor.to(device=last_hidden_states.device, dtype=torch.long)
+        filtered_last_hidden_states = last_hidden_states[last_hidden_index]
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to filter SGLang drafter last-hidden output by accepted indices: %s", exc)
         return
     setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, filtered_last_hidden_states)
     last_hidden_positions = getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_POSITIONS_ATTR, None)
+    filtered_positions = None
     if _is_torch_tensor(last_hidden_positions):
         try:
-            setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_POSITIONS_ATTR, last_hidden_positions[index].detach())
+            position_index = index_tensor.to(device=last_hidden_positions.device, dtype=torch.long)
+            filtered_positions = last_hidden_positions[position_index].detach()
+            setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_POSITIONS_ATTR, filtered_positions)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to filter SGLang drafter last-hidden positions by accepted indices: %s", exc)
+    _filter_sglang_last_hidden_logprob_check_tensors(logits_output, index_tensor)
+    contiguous_rows, positions_contiguous, first_break = _sglang_first_contiguous_position_len(filtered_positions)
+    if contiguous_rows is not None and contiguous_rows < int(filtered_last_hidden_states.shape[0]):
+        logger.warning(
+            "[sglang last_hidden filter check] positions are not contiguous; keep first segment rows=%s/%s "
+            "first_break=%s positions_head=%s positions_tail=%s",
+            contiguous_rows,
+            int(filtered_last_hidden_states.shape[0]),
+            first_break,
+            *_sglang_tensor_head_tail(filtered_positions),
+        )
+        filtered_last_hidden_states = filtered_last_hidden_states[:contiguous_rows]
+        setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, filtered_last_hidden_states)
+        if _is_torch_tensor(base_hidden_filtered):
+            setattr(logits_output, "hidden_states", base_hidden_filtered[:contiguous_rows])
+        if _is_torch_tensor(filtered_positions):
+            filtered_positions = filtered_positions[:contiguous_rows]
+            setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_POSITIONS_ATTR, filtered_positions)
+        _truncate_sglang_last_hidden_logprob_check_tensors(logits_output, contiguous_rows)
     setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTERED_ATTR, True)
     filter_summary = getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTER_SUMMARY_ATTR, None)
     if isinstance(filter_summary, dict):
-        filter_summary = {**filter_summary, "stage": "filtered", "filtered_shape": tuple(filtered_last_hidden_states.shape)}
+        pos_head, pos_tail = _sglang_tensor_head_tail(filtered_positions)
+        filter_summary = {
+            **filter_summary,
+            "stage": "filtered",
+            "hidden_rows_after": int(filtered_last_hidden_states.shape[0]),
+            "positions_len": int(filtered_positions.numel()) if _is_torch_tensor(filtered_positions) else None,
+            "positions_contiguous": positions_contiguous,
+            "first_contiguous_rows": contiguous_rows,
+            "first_break": first_break,
+            "positions_head": pos_head,
+            "positions_tail": pos_tail,
+            "filtered_shape": tuple(filtered_last_hidden_states.shape),
+        }
         setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTER_SUMMARY_ATTR, filter_summary)
-    _filter_sglang_last_hidden_logprob_check_tensors(logits_output, index)
+        if (
+            _sglang_last_hidden_logprob_check_enabled()
+            and _SGLANG_LAST_HIDDEN_FILTER_DEBUG_LOG_COUNT < _sglang_last_hidden_logprob_check_max_logs()
+        ):
+            logger.warning(
+                "[sglang last_hidden filter check] after hidden_rows_before=%s hidden_rows_after=%s "
+                "accept_len=%s accept_indices_head=%s accept_indices_tail=%s positions_len=%s "
+                "positions_contiguous=%s positions_head=%s positions_tail=%s",
+                filter_summary.get("hidden_rows_before"),
+                filter_summary.get("hidden_rows_after"),
+                index_len,
+                accept_head,
+                accept_tail,
+                filter_summary.get("positions_len"),
+                positions_contiguous,
+                pos_head,
+                pos_tail,
+            )
+            _SGLANG_LAST_HIDDEN_FILTER_DEBUG_LOG_COUNT += 1
     _log_sglang_last_hidden_logprob_check(logits_output, stage="filtered")
 
 
@@ -2441,38 +2552,15 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
                     f"offset={hidden_state_offset}, required_rows={rows}."
                 )
 
-        if hidden_states.dim() == 3 and req_index < int(hidden_states.shape[0]):
-            rows = min(rows, int(hidden_states.shape[1]))
-            if rows <= 0:
-                return hidden_state_offset
-            position_start = _sglang_decode_hidden_position_start(req, rows)
-            chunk = hidden_states[req_index, :rows]
-            chunk = _sglang_concat_last_hidden_for_drafter(
-                req,
-                logits_output,
-                chunk,
-                _slice_sglang_drafter_last_hidden_output(logits_output, (req_index, slice(0, rows))),
-            )
-            _append_sglang_hidden_state_chunk_with_budget(
-                req,
-                chunk,
-                position_start=position_start,
-                positions=(
-                    hidden_positions[req_index, :rows]
-                    if _is_torch_tensor(hidden_positions) and hidden_positions.dim() == 2
-                    else None
-                ),
-                extra_metadata=_sglang_hidden_debug_metadata(logits_output),
-                batch=batch,
-            )
-            return hidden_state_offset + rows
-
         total_hidden = int(hidden_states.shape[0])
-        position_start = _sglang_decode_hidden_position_start(req, rows)
         expected_rows = sum(accept_rows_per_req)
-        end = hidden_state_offset + rows
-        has_expected_rows = total_hidden >= expected_rows and end <= total_hidden
-        if hidden_states.dim() >= 2 and has_expected_rows:
+        available_rows = max(total_hidden - hidden_state_offset, 0)
+        append_rows = min(rows, available_rows)
+        end = hidden_state_offset + append_rows
+        filter_summary = getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTER_SUMMARY_ATTR, None)
+        positions_truncated = isinstance(filter_summary, dict) and filter_summary.get("positions_contiguous") is False
+        if hidden_states.dim() >= 2 and append_rows > 0:
+            position_start = _sglang_decode_hidden_position_start(req, append_rows)
             chunk = hidden_states[hidden_state_offset:end]
             chunk = _sglang_concat_last_hidden_for_drafter(
                 req,
@@ -2494,12 +2582,13 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
             )
             return end
 
-        if getattr(req, "return_hidden_states", False):
+        if getattr(req, "return_hidden_states", False) and not positions_truncated:
             raise RuntimeError(
                 "SGLang EAGLE verify hidden states are incomplete for accepted tokens: "
                 f"shape={tuple(hidden_states.shape)}, req_index={req_index}, "
                 f"offset={hidden_state_offset}, required_rows={rows}, expected_total_rows={expected_rows}."
             )
+        return hidden_state_offset
 
     if not getattr(req, "return_hidden_states", False):
         return hidden_state_offset
