@@ -100,6 +100,7 @@ _VERL_DRAFTER_LH_CHECK_RAW_TOPK_IDS_ATTR = "_verl_drafter_lh_check_raw_topk_ids"
 _VERL_DRAFTER_LH_CHECK_RAW_TOPK_LOGPROBS_ATTR = "_verl_drafter_lh_check_raw_topk_logprobs"
 _VERL_DRAFTER_LH_CHECK_SUMMARY_ATTR = "_verl_drafter_lh_check_summary"
 _VERL_DRAFTER_LAST_HIDDEN_FILTER_SUMMARY_ATTR = "_verl_drafter_last_hidden_filter_summary"
+_VERL_DRAFTER_RETURN_LAST_HIDDEN_BATCH_ATTR = "_verl_drafter_return_last_hidden_batch"
 _VERL_DRAFTER_RAW_TOPK_REQUESTED_TOPK_ATTR = "_verl_drafter_raw_topk_requested_topk"
 _VERL_DRAFTER_RAW_TOPK_ROW_INDEX_ATTR = "_verl_drafter_raw_topk_row_index"
 _VERL_RAW_TARGET_LOGPROBS_METADATA_KEY = "raw_target_logprobs"
@@ -1403,6 +1404,8 @@ def _sglang_req_requests_last_hidden_for_drafter(req) -> bool:
 
 def _sglang_forward_batch_requests_last_hidden_for_drafter(forward_batch) -> bool:
     if _sglang_drafter_return_last_hidden_enabled():
+        return True
+    if bool(getattr(forward_batch, _VERL_DRAFTER_RETURN_LAST_HIDDEN_BATCH_ATTR, False)):
         return True
     for req in getattr(forward_batch, "reqs", []) or []:
         if (
@@ -3215,6 +3218,11 @@ def _sglang_batch_requests_hidden_states(batch) -> bool:
 def _ensure_sglang_eagle_verify_full_hidden_mode(batch, spec_info) -> None:
     if not _sglang_batch_requests_hidden_states(batch):
         return
+    setattr(
+        batch,
+        _VERL_DRAFTER_RETURN_LAST_HIDDEN_BATCH_ATTR,
+        _sglang_batch_requests_last_hidden_for_drafter(batch),
+    )
     try:
         from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
     except Exception as exc:  # noqa: BLE001
