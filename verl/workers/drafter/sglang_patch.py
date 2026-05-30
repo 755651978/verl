@@ -2413,6 +2413,8 @@ def _maybe_attach_sglang_raw_top_logprobs_after_filter(
 ) -> None:
     if batch is None or not _sglang_raw_top_logprobs_enabled(batch):
         return
+    if _sglang_forward_mode_is_target_verify(batch):
+        return
     if _is_torch_tensor(getattr(logits_output, _VERL_DRAFTER_LH_CHECK_RAW_TOPK_LOGPROBS_ATTR, None)):
         return
 
@@ -4031,9 +4033,7 @@ def _make_sglang_drafter_last_hidden_forward_patch(original_method):
             else:
                 output.hidden_states = dflash_hidden_states
                 setattr(output, "_verl_dflash_aux_hidden_states", True)
-        if _sglang_raw_top_logprobs_enabled(logits_metadata) and not _sglang_forward_mode_is_target_verify(
-            logits_metadata
-        ):
+        if _sglang_raw_top_logprobs_enabled(logits_metadata):
             _attach_sglang_raw_top_logprobs(output, logits_metadata)
         if return_last_hidden and hidden_states is not None:
             if getattr(output, "hidden_states", None) is not None:
@@ -4164,7 +4164,7 @@ def _make_sglang_drafter_last_hidden_graph_replay_patch(original_method):
             _copy_sglang_drafter_last_hidden_output(output, result, slice(0, self.raw_num_token))
             if _sglang_forward_mode_is_target_verify(forward_batch):
                 _clear_sglang_raw_top_logprobs(result)
-        if _sglang_raw_top_logprobs_enabled(forward_batch) and not _sglang_forward_mode_is_target_verify(forward_batch):
+        if _sglang_raw_top_logprobs_enabled(forward_batch):
             _attach_sglang_raw_top_logprobs(result, forward_batch)
         if output is not None:
             _attach_sglang_last_hidden_logprob_check_from_graph_runner(self, result, forward_batch)
