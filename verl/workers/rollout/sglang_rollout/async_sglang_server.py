@@ -76,6 +76,7 @@ _VERL_HIDDEN_STATE_PROMPT_LEN_PARAM = "_verl_prompt_len"
 _VERL_DRAFTER_RETURN_LAST_HIDDEN_ENV = "VERL_SGLANG_DRAFTER_RETURN_LAST_HIDDEN"
 _VERL_DRAFTER_RETURN_LAST_HIDDEN_PARAM = "_verl_drafter_return_last_hidden"
 _VERL_DFLASH_RETURN_AUX_HIDDEN_PARAM = "_verl_dflash_return_aux_hidden"
+_VERL_DRAFTER_RAW_TOP_LOGPROBS_PARAM = "_verl_drafter_raw_top_logprobs"
 _VERL_DRAFTER_RAW_TOP_LOGPROBS_ENV = "VERL_DRAFTER_RAW_TOP_LOGPROBS"
 _VERL_DRAFTER_RAW_TOP_LOGPROBS_TOPK_ENV = "VERL_DRAFTER_RAW_TOP_LOGPROBS_TOPK"
 
@@ -1040,6 +1041,8 @@ class SGLangHttpServer:
             )
             if front_hidden_tokens is not None:
                 custom_params[_VERL_HIDDEN_STATE_FRONT_TOKENS_PARAM] = int(front_hidden_tokens)
+            if _env_flag_enabled(_VERL_DRAFTER_RAW_TOP_LOGPROBS_ENV, default=False):
+                custom_params[_VERL_DRAFTER_RAW_TOP_LOGPROBS_PARAM] = True
             if not self.config.drafter.training.use_logits:
                 if _drafter_uses_dflash_aux_hidden(self.config.drafter):
                     custom_params[_VERL_DFLASH_RETURN_AUX_HIDDEN_PARAM] = True
