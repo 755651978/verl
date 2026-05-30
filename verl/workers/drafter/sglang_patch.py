@@ -1671,6 +1671,14 @@ def _attach_sglang_raw_top_logprobs(logits_output, logits_metadata, *, topk: int
         return False
 
 
+def _ensure_sglang_raw_top_logprobs_requested(logits_output) -> None:
+    if not _sglang_raw_top_logprobs_enabled():
+        return
+    if getattr(logits_output, _VERL_DRAFTER_RAW_TOPK_REQUESTED_TOPK_ATTR, None) is not None:
+        return
+    _attach_sglang_raw_top_logprobs(logits_output, None)
+
+
 def _attach_sglang_last_hidden_logprob_check(logits_processor, logits_output, hidden_states, lm_head, logits_metadata) -> None:
     if not _sglang_last_hidden_logprob_check_enabled():
         return
@@ -2736,6 +2744,7 @@ def _slice_sglang_row_aligned_metadata(metadata: dict | None, start: int, end: i
 
 def _sglang_hidden_debug_metadata(logits_output, row_slice=None) -> dict:
     metadata = {}
+    _ensure_sglang_raw_top_logprobs_requested(logits_output)
     fingerprint = getattr(logits_output, "_verl_drafter_lh_check_lm_head_fingerprint", None)
     if isinstance(fingerprint, dict):
         metadata["lm_head_fingerprint"] = fingerprint
@@ -2759,39 +2768,6 @@ def _sglang_hidden_debug_metadata(logits_output, row_slice=None) -> dict:
     if isinstance(select_summary, dict):
         metadata["last_hidden_select"] = select_summary
     return metadata
-
-
-def _sglang_hidden_debug_metadata_builder(logits_output, row_offset: int = 0):
-    def build(local_start: int, local_end: int) -> dict:
-        start = int(row_offset) + int(local_start)
-        end = int(row_offset) + int(local_end)
-        return _sglang_hidden_debug_metadata(logits_output, row_slice=slice(start, end))
-
-    return build
-
-
-def _resolve_sglang_row_aligned_metadata(
-    extra_metadata: dict | None,
-    extra_metadata_builder,
-    start: int,
-    end: int,
-    keep_mask=None,
-) -> dict | None:
-    if callable(extra_metadata_builder):
-        try:
-            metadata = extra_metadata_builder(start, end)
-            if _is_torch_tensor(keep_mask):
-                metadata = _slice_sglang_row_aligned_metadata(
-                    metadata,
-                    0,
-                    max(int(end) - int(start), 0),
-                    keep_mask=keep_mask,
-                )
-            return metadata
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to build SGLang hidden debug metadata: %s", exc)
-            return None
-    return _slice_sglang_row_aligned_metadata(extra_metadata, start, end, keep_mask=keep_mask)
 
 
 def _mark_sglang_hidden_states_stream_final(req) -> None:
@@ -2825,7 +2801,6 @@ def _append_sglang_hidden_state_chunk_with_budget(
     positions=None,
     prefix_cache_rows: int | None = None,
     extra_metadata: dict | None = None,
-    extra_metadata_builder=None,
     batch=None,
 ) -> None:
     if not getattr(req, "return_hidden_states", False):
@@ -2885,19 +2860,13 @@ def _append_sglang_hidden_state_chunk_with_budget(
             local_end = int(keep_idx[-1].item()) + 1
             clipped_chunk = _slice_sglang_hidden_chunk(chunk, local_start, local_end)
             clipped_positions = positions[local_start:local_end]
-            clipped_metadata = _resolve_sglang_row_aligned_metadata(
-                extra_metadata,
-                extra_metadata_builder,
-                local_start,
-                local_end,
-            )
+            clipped_metadata = _slice_sglang_row_aligned_metadata(extra_metadata, local_start, local_end)
             if not bool(keep_mask[local_start:local_end].all()):
                 local_keep_mask = keep_mask[local_start:local_end]
                 clipped_chunk = clipped_chunk[local_keep_mask]
                 clipped_positions = clipped_positions[local_keep_mask]
-                clipped_metadata = _resolve_sglang_row_aligned_metadata(
+                clipped_metadata = _slice_sglang_row_aligned_metadata(
                     extra_metadata,
-                    extra_metadata_builder,
                     local_start,
                     local_end,
                     keep_mask=local_keep_mask,
@@ -2928,12 +2897,7 @@ def _append_sglang_hidden_state_chunk_with_budget(
         local_start = clipped_start - position_start
         local_end = clipped_end - position_start
         clipped_chunk = _slice_sglang_hidden_chunk(chunk, local_start, local_end)
-        clipped_metadata = _resolve_sglang_row_aligned_metadata(
-            extra_metadata,
-            extra_metadata_builder,
-            local_start,
-            local_end,
-        )
+        clipped_metadata = _slice_sglang_row_aligned_metadata(extra_metadata, local_start, local_end)
         _append_sglang_hidden_chunk_payload(
             req,
             clipped_chunk,
@@ -2982,9 +2946,8 @@ def _append_sglang_hidden_state_chunk_with_budget(
             except TypeError:
                 pass
 
-    metadata = _resolve_sglang_row_aligned_metadata(
+    metadata = _slice_sglang_row_aligned_metadata(
         extra_metadata,
-        extra_metadata_builder,
         0,
         _sglang_hidden_chunk_rows(chunk),
     )
@@ -3039,7 +3002,7 @@ def _append_sglang_prefill_hidden_states(req, logits_output, hidden_state_offset
         position_start=prefix_cache_rows,
         positions=torch.arange(prefix_cache_rows, prefix_cache_rows + _sglang_hidden_chunk_rows(chunk), dtype=torch.long),
         prefix_cache_rows=prefix_cache_rows,
-        extra_metadata_builder=_sglang_hidden_debug_metadata_builder(logits_output, hidden_state_offset),
+        extra_metadata=_sglang_hidden_debug_metadata(logits_output, row_slice=slice(hidden_state_offset, end)),
         batch=batch,
     )
     return end
@@ -3123,7 +3086,7 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
                         if _is_torch_tensor(hidden_positions)
                         else None
                     ),
-                    extra_metadata_builder=_sglang_hidden_debug_metadata_builder(logits_output, hidden_state_offset),
+                    extra_metadata=_sglang_hidden_debug_metadata(logits_output, row_slice=slice(hidden_state_offset, end)),
                     batch=batch,
                 )
                 return end
@@ -3162,7 +3125,7 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
                     if _is_torch_tensor(hidden_positions)
                     else None
                 ),
-                extra_metadata_builder=_sglang_hidden_debug_metadata_builder(logits_output, hidden_state_offset),
+                extra_metadata=_sglang_hidden_debug_metadata(logits_output, row_slice=slice(hidden_state_offset, end)),
                 batch=batch,
             )
             return end
@@ -3194,7 +3157,7 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
                 else int(hidden_positions[req_index].detach().cpu().item())
             ),
             positions=(hidden_positions[req_index] if _is_torch_tensor(hidden_positions) else None),
-            extra_metadata_builder=_sglang_hidden_debug_metadata_builder(logits_output, req_index),
+            extra_metadata=_sglang_hidden_debug_metadata(logits_output, row_slice=req_index),
             batch=batch,
         )
     else:
@@ -3202,7 +3165,7 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
             req,
             hidden_states[req_index],
             position_start=None,
-            extra_metadata_builder=_sglang_hidden_debug_metadata_builder(logits_output, req_index),
+            extra_metadata=_sglang_hidden_debug_metadata(logits_output, row_slice=req_index),
             batch=batch,
         )
     return hidden_state_offset
@@ -3872,6 +3835,7 @@ def _copy_sglang_drafter_last_hidden_output(src, dst, index) -> None:
         _VERL_DRAFTER_LH_CHECK_SGLANG_TOP_LOGPROBS_ATTR,
         _VERL_DRAFTER_LH_CHECK_RAW_TOPK_IDS_ATTR,
         _VERL_DRAFTER_LH_CHECK_RAW_TOPK_LOGPROBS_ATTR,
+        _VERL_DRAFTER_RAW_TOPK_ROW_INDEX_ATTR,
     ):
         value = getattr(src, attr_name, None)
         if _is_torch_tensor(value):
@@ -3882,9 +3846,11 @@ def _copy_sglang_drafter_last_hidden_output(src, dst, index) -> None:
     for attr_name in (
         "_verl_drafter_last_hidden_select_summary",
         "_verl_drafter_lh_check_lm_head_fingerprint",
+        "_verl_drafter_lh_check_logits_shapes",
         _VERL_DRAFTER_LH_CHECK_SUMMARY_ATTR,
         _VERL_DRAFTER_LAST_HIDDEN_FILTER_SUMMARY_ATTR,
         _VERL_DRAFTER_LAST_HIDDEN_MATERIALIZED_ATTR,
+        _VERL_DRAFTER_RAW_TOPK_REQUESTED_TOPK_ATTR,
     ):
         if hasattr(src, attr_name):
             setattr(dst, attr_name, getattr(src, attr_name))
