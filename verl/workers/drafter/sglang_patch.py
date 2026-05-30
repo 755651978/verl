@@ -1674,6 +1674,14 @@ def _attach_sglang_raw_top_logprobs(logits_output, logits_metadata, *, topk: int
         return False
 
 
+def _ensure_sglang_raw_top_logprobs_requested(logits_output) -> None:
+    if not _sglang_raw_top_logprobs_enabled():
+        return
+    if getattr(logits_output, _VERL_DRAFTER_RAW_TOPK_REQUESTED_TOPK_ATTR, None) is not None:
+        return
+    _attach_sglang_raw_top_logprobs(logits_output, None)
+
+
 def _attach_sglang_last_hidden_logprob_check(logits_processor, logits_output, hidden_states, lm_head, logits_metadata) -> None:
     if not _sglang_last_hidden_logprob_check_enabled():
         return
@@ -2739,6 +2747,7 @@ def _slice_sglang_row_aligned_metadata(metadata: dict | None, start: int, end: i
 
 def _sglang_hidden_debug_metadata(logits_output, row_slice=None) -> dict:
     metadata = {}
+    _ensure_sglang_raw_top_logprobs_requested(logits_output)
     fingerprint = getattr(logits_output, "_verl_drafter_lh_check_lm_head_fingerprint", None)
     if isinstance(fingerprint, dict):
         metadata["lm_head_fingerprint"] = fingerprint
@@ -3835,7 +3844,7 @@ def _make_sglang_drafter_last_hidden_forward_patch(original_method):
             else:
                 output.hidden_states = dflash_hidden_states
                 setattr(output, "_verl_dflash_aux_hidden_states", True)
-        if _sglang_raw_top_logprobs_enabled() and _sglang_forward_batch_requests_raw_top_logprobs(logits_metadata):
+        if _sglang_raw_top_logprobs_enabled():
             _attach_sglang_raw_top_logprobs(output, logits_metadata)
         if return_last_hidden and hidden_states is not None:
             if getattr(output, "hidden_states", None) is not None:
@@ -3880,6 +3889,7 @@ def _copy_sglang_drafter_last_hidden_output(src, dst, index) -> None:
         _VERL_DRAFTER_LH_CHECK_SGLANG_TOP_LOGPROBS_ATTR,
         _VERL_DRAFTER_LH_CHECK_RAW_TOPK_IDS_ATTR,
         _VERL_DRAFTER_LH_CHECK_RAW_TOPK_LOGPROBS_ATTR,
+        _VERL_DRAFTER_RAW_TOPK_ROW_INDEX_ATTR,
     ):
         value = getattr(src, attr_name, None)
         if _is_torch_tensor(value):
@@ -3890,9 +3900,11 @@ def _copy_sglang_drafter_last_hidden_output(src, dst, index) -> None:
     for attr_name in (
         "_verl_drafter_last_hidden_select_summary",
         "_verl_drafter_lh_check_lm_head_fingerprint",
+        "_verl_drafter_lh_check_logits_shapes",
         _VERL_DRAFTER_LH_CHECK_SUMMARY_ATTR,
         _VERL_DRAFTER_LAST_HIDDEN_FILTER_SUMMARY_ATTR,
         _VERL_DRAFTER_LAST_HIDDEN_MATERIALIZED_ATTR,
+        _VERL_DRAFTER_RAW_TOPK_REQUESTED_TOPK_ATTR,
     ):
         if hasattr(src, attr_name):
             setattr(dst, attr_name, getattr(src, attr_name))
@@ -3950,7 +3962,7 @@ def _make_sglang_drafter_last_hidden_graph_replay_patch(original_method):
         output = _sglang_graph_replay_output_buffer(self, original_method, forward_batch)
         if output is not None:
             _copy_sglang_drafter_last_hidden_output(output, result, slice(0, self.raw_num_token))
-        if _sglang_raw_top_logprobs_enabled() and _sglang_forward_batch_requests_raw_top_logprobs(forward_batch):
+        if _sglang_raw_top_logprobs_enabled():
             _attach_sglang_raw_top_logprobs(result, forward_batch)
         if output is not None:
             _attach_sglang_last_hidden_logprob_check_from_graph_runner(self, result, forward_batch)
