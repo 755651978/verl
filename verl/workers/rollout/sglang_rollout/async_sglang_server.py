@@ -1291,15 +1291,26 @@ class SGLangHttpServer:
                     )
                 hidden_kept_len = int(hidden_states.size(0))
                 if collect_target_logprobs and torch.is_tensor(hidden_raw_target_logprobs):
-                    # Prefer raw logprobs captured directly from SGLang
-                    # next_token_logits. These rows align with hidden row p and
-                    # supervise token position p + 1, matching the EAGLE shift
-                    # used later in collect_online_data().
-                    target_logprobs = hidden_raw_target_logprobs
-                    target_logprobs_position_start = int(hidden_position_start) + 1
-                    target_logprobs_position_end = target_logprobs_position_start + int(target_logprobs.size(0))
-                    target_logprobs_dropped_rows = 0
-                    output_top_len = int(target_logprobs.size(0))
+                    # SGLang next_token_logits row p is computed from target
+                    # hidden row p and predicts token p + 1. EAGLE3 trains
+                    # draft row p with token p + 1 as input, so its teacher
+                    # distribution must come from target row p + 1.
+                    if int(hidden_raw_target_logprobs.size(0)) == int(hidden_kept_len):
+                        target_logprobs = hidden_raw_target_logprobs[1:].contiguous()
+                        target_logprobs_dropped_rows = 1
+                    else:
+                        target_logprobs = hidden_raw_target_logprobs
+                        target_logprobs_dropped_rows = 0
+                    if int(target_logprobs.size(0)) <= 0:
+                        target_logprobs = None
+                    if target_logprobs is not None:
+                        target_logprobs_position_start = int(hidden_position_start) + 1
+                        target_logprobs_position_end = target_logprobs_position_start + int(target_logprobs.size(0))
+                        output_top_len = int(target_logprobs.size(0))
+                    else:
+                        target_logprobs_position_start = None
+                        target_logprobs_position_end = None
+                        output_top_len = None
                 elif collect_target_logprobs:
                     logger.warning(
                         "Missing SGLang raw next_token_logits metadata for drafter logits training; "
@@ -1316,6 +1327,7 @@ class SGLangHttpServer:
                         int(hidden_position_end),
                         max(len(prompt_ids) - 1, 0) + len(token_ids),
                     )
+                    shifted_dropped_rows = int(target_logprobs_dropped_rows)
                     (
                         target_logprobs,
                         target_logprobs_position_start,
@@ -1327,6 +1339,7 @@ class SGLangHttpServer:
                         desired_position_start=target_window_start,
                         desired_position_end=target_window_end,
                     )
+                    target_logprobs_dropped_rows += shifted_dropped_rows
                     if target_logprobs is not None:
                         output_top_len = int(target_logprobs.size(0))
                 drafter_sample = {
