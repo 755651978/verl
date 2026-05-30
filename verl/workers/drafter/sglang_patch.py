@@ -100,8 +100,6 @@ _VERL_DRAFTER_LH_CHECK_RAW_TOPK_IDS_ATTR = "_verl_drafter_lh_check_raw_topk_ids"
 _VERL_DRAFTER_LH_CHECK_RAW_TOPK_LOGPROBS_ATTR = "_verl_drafter_lh_check_raw_topk_logprobs"
 _VERL_DRAFTER_LH_CHECK_SUMMARY_ATTR = "_verl_drafter_lh_check_summary"
 _VERL_DRAFTER_LAST_HIDDEN_FILTER_SUMMARY_ATTR = "_verl_drafter_last_hidden_filter_summary"
-_VERL_DRAFTER_RAW_TOPK_REQUESTED_TOPK_ATTR = "_verl_drafter_raw_topk_requested_topk"
-_VERL_DRAFTER_RAW_TOPK_ROW_INDEX_ATTR = "_verl_drafter_raw_topk_row_index"
 _VERL_RAW_TARGET_LOGPROBS_METADATA_KEY = "raw_target_logprobs"
 _VERL_TARGET_LOGPROBS_SOURCE_METADATA_KEY = "target_logprobs_source"
 _VERL_RAW_TOPK_LOGPROB_CHECK_METADATA_KEY = "raw_topk_logprob_check"
@@ -1429,28 +1427,6 @@ def _sglang_forward_batch_requests_dflash_aux_hidden(forward_batch) -> bool:
     return False
 
 
-def _sglang_req_requests_drafter_hidden_window(req) -> bool:
-    return _custom_flag_enabled(
-        _sglang_req_custom_params(req).get(_VERL_DRAFTER_HIDDEN_WINDOW_PARAM, False)
-    )
-
-
-def _sglang_forward_batch_requests_raw_top_logprobs(forward_batch) -> bool:
-    reqs = getattr(forward_batch, "reqs", []) or []
-    if not reqs:
-        return bool(getattr(forward_batch, "return_hidden_states", False))
-    for req in reqs:
-        if not getattr(req, "return_hidden_states", False):
-            continue
-        if (
-            _sglang_req_requests_drafter_hidden_window(req)
-            or _sglang_req_requests_last_hidden_for_drafter(req)
-            or _sglang_req_requests_dflash_aux_hidden(req)
-        ):
-            return True
-    return False
-
-
 def _sglang_dflash_should_return_verify_hidden(batch) -> bool:
     return _sglang_forward_batch_requests_dflash_aux_hidden(batch)
 
@@ -1652,7 +1628,10 @@ def _attach_sglang_raw_top_logprobs(logits_output, logits_metadata, *, topk: int
             raw_topk = min(max(int(topk), 1), vocab)
             if rows <= 0 or raw_topk <= 0:
                 return False
-            setattr(logits_output, _VERL_DRAFTER_RAW_TOPK_REQUESTED_TOPK_ATTR, raw_topk)
+            sglang_logprobs = torch.nn.functional.log_softmax(next_token_logits.detach().float(), dim=-1)
+            raw_topk_logprobs, raw_topk_ids = torch.topk(sglang_logprobs, k=raw_topk, dim=-1)
+            setattr(logits_output, _VERL_DRAFTER_LH_CHECK_RAW_TOPK_IDS_ATTR, raw_topk_ids.detach())
+            setattr(logits_output, _VERL_DRAFTER_LH_CHECK_RAW_TOPK_LOGPROBS_ATTR, raw_topk_logprobs.detach())
             logits_shapes = getattr(logits_output, "_verl_drafter_lh_check_logits_shapes", None)
             if not isinstance(logits_shapes, dict):
                 logits_shapes = {}
@@ -1661,7 +1640,6 @@ def _attach_sglang_raw_top_logprobs(logits_output, logits_metadata, *, topk: int
                     "raw_logits_shape": tuple(next_token_logits.shape),
                     "raw_topk": raw_topk,
                     "raw_topk_source": "next_token_logits",
-                    "raw_topk_deferred": True,
                 }
             )
             setattr(logits_output, "_verl_drafter_lh_check_logits_shapes", logits_shapes)
@@ -1669,14 +1647,6 @@ def _attach_sglang_raw_top_logprobs(logits_output, logits_metadata, *, topk: int
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to attach SGLang raw top-logprobs: %s", exc)
         return False
-
-
-def _ensure_sglang_raw_top_logprobs_requested(logits_output) -> None:
-    if not _sglang_raw_top_logprobs_enabled():
-        return
-    if getattr(logits_output, _VERL_DRAFTER_RAW_TOPK_REQUESTED_TOPK_ATTR, None) is not None:
-        return
-    _attach_sglang_raw_top_logprobs(logits_output, None)
 
 
 def _attach_sglang_last_hidden_logprob_check(logits_processor, logits_output, hidden_states, lm_head, logits_metadata) -> None:
@@ -1874,16 +1844,6 @@ def _select_sglang_last_hidden_for_drafter(
 
 
 def _filter_sglang_last_hidden_logprob_check_tensors(logits_output, index) -> None:
-    try:
-        index_tensor = index.detach().to("cpu", dtype=torch.long).reshape(-1) if _is_torch_tensor(index) else torch.tensor(list(index), dtype=torch.long)
-        existing_index = getattr(logits_output, _VERL_DRAFTER_RAW_TOPK_ROW_INDEX_ATTR, None)
-        if _is_torch_tensor(existing_index):
-            setattr(logits_output, _VERL_DRAFTER_RAW_TOPK_ROW_INDEX_ATTR, existing_index.reshape(-1)[index_tensor])
-        else:
-            setattr(logits_output, _VERL_DRAFTER_RAW_TOPK_ROW_INDEX_ATTR, index_tensor)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to record SGLang raw top-k row filter: %s", exc)
-
     for attr in (
         _VERL_DRAFTER_LH_CHECK_RECOMPUTED_TOP_IDS_ATTR,
         _VERL_DRAFTER_LH_CHECK_RECOMPUTED_TOP_LOGPROBS_ATTR,
@@ -2271,7 +2231,6 @@ def _truncate_sglang_last_hidden_logprob_check_tensors(logits_output, rows: int)
         _VERL_DRAFTER_LH_CHECK_SGLANG_TOP_LOGPROBS_ATTR,
         _VERL_DRAFTER_LH_CHECK_RAW_TOPK_IDS_ATTR,
         _VERL_DRAFTER_LH_CHECK_RAW_TOPK_LOGPROBS_ATTR,
-        _VERL_DRAFTER_RAW_TOPK_ROW_INDEX_ATTR,
     ):
         value = getattr(logits_output, attr, None)
         if _is_torch_tensor(value) and value.dim() > 0 and int(value.shape[0]) > rows:
@@ -2654,31 +2613,12 @@ def _slice_sglang_debug_rows(value, row_slice):
 def _sglang_raw_target_logprobs_tensor(logits_output, row_slice=None):
     raw_topk_ids = getattr(logits_output, _VERL_DRAFTER_LH_CHECK_RAW_TOPK_IDS_ATTR, None)
     raw_topk_logprobs = getattr(logits_output, _VERL_DRAFTER_LH_CHECK_RAW_TOPK_LOGPROBS_ATTR, None)
-    if _is_torch_tensor(raw_topk_ids) and _is_torch_tensor(raw_topk_logprobs):
-        if raw_topk_ids.dim() != 2 or raw_topk_logprobs.dim() != 2:
-            return None
-        raw_topk_ids = _slice_sglang_debug_rows(raw_topk_ids, row_slice)
-        raw_topk_logprobs = _slice_sglang_debug_rows(raw_topk_logprobs, row_slice)
-    else:
-        topk = getattr(logits_output, _VERL_DRAFTER_RAW_TOPK_REQUESTED_TOPK_ATTR, None)
-        next_token_logits = getattr(logits_output, "next_token_logits", None)
-        if topk is None or not _is_torch_tensor(next_token_logits) or next_token_logits.dim() != 2:
-            return None
-        try:
-            raw_topk = min(max(int(topk), 1), int(next_token_logits.shape[-1]))
-            row_index = getattr(logits_output, _VERL_DRAFTER_RAW_TOPK_ROW_INDEX_ATTR, None)
-            logits = next_token_logits.detach()
-            if _is_torch_tensor(row_index) and int(row_index.numel()) > 0:
-                logits = logits[row_index.to(device=logits.device, dtype=torch.long).reshape(-1)]
-            logits = _slice_sglang_debug_rows(logits, row_slice)
-            if not _is_torch_tensor(logits) or logits.dim() != 2 or int(logits.shape[0]) <= 0:
-                return None
-            raw_topk_logits, raw_topk_ids = torch.topk(logits, k=raw_topk, dim=-1)
-            log_norm = torch.logsumexp(logits.float(), dim=-1, keepdim=True)
-            raw_topk_logprobs = raw_topk_logits.float() - log_norm
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to compute deferred SGLang raw top-k logprobs: %s", exc)
-            return None
+    if not (_is_torch_tensor(raw_topk_ids) and _is_torch_tensor(raw_topk_logprobs)):
+        return None
+    if raw_topk_ids.dim() != 2 or raw_topk_logprobs.dim() != 2:
+        return None
+    raw_topk_ids = _slice_sglang_debug_rows(raw_topk_ids, row_slice)
+    raw_topk_logprobs = _slice_sglang_debug_rows(raw_topk_logprobs, row_slice)
     rows = min(int(raw_topk_ids.shape[0]), int(raw_topk_logprobs.shape[0]))
     topk = min(int(raw_topk_ids.shape[1]), int(raw_topk_logprobs.shape[1]))
     if rows <= 0 or topk <= 0:
@@ -2744,7 +2684,6 @@ def _slice_sglang_row_aligned_metadata(metadata: dict | None, start: int, end: i
 
 def _sglang_hidden_debug_metadata(logits_output, row_slice=None) -> dict:
     metadata = {}
-    _ensure_sglang_raw_top_logprobs_requested(logits_output)
     fingerprint = getattr(logits_output, "_verl_drafter_lh_check_lm_head_fingerprint", None)
     if isinstance(fingerprint, dict):
         metadata["lm_head_fingerprint"] = fingerprint
@@ -3790,7 +3729,7 @@ def _make_sglang_drafter_last_hidden_forward_patch(original_method):
             else:
                 output.hidden_states = dflash_hidden_states
                 setattr(output, "_verl_dflash_aux_hidden_states", True)
-        if _sglang_raw_top_logprobs_enabled() and _sglang_forward_batch_requests_raw_top_logprobs(logits_metadata):
+        if _sglang_raw_top_logprobs_enabled():
             _attach_sglang_raw_top_logprobs(output, logits_metadata)
         if return_last_hidden and hidden_states is not None:
             if getattr(output, "hidden_states", None) is not None:
@@ -3835,7 +3774,6 @@ def _copy_sglang_drafter_last_hidden_output(src, dst, index) -> None:
         _VERL_DRAFTER_LH_CHECK_SGLANG_TOP_LOGPROBS_ATTR,
         _VERL_DRAFTER_LH_CHECK_RAW_TOPK_IDS_ATTR,
         _VERL_DRAFTER_LH_CHECK_RAW_TOPK_LOGPROBS_ATTR,
-        _VERL_DRAFTER_RAW_TOPK_ROW_INDEX_ATTR,
     ):
         value = getattr(src, attr_name, None)
         if _is_torch_tensor(value):
@@ -3846,11 +3784,9 @@ def _copy_sglang_drafter_last_hidden_output(src, dst, index) -> None:
     for attr_name in (
         "_verl_drafter_last_hidden_select_summary",
         "_verl_drafter_lh_check_lm_head_fingerprint",
-        "_verl_drafter_lh_check_logits_shapes",
         _VERL_DRAFTER_LH_CHECK_SUMMARY_ATTR,
         _VERL_DRAFTER_LAST_HIDDEN_FILTER_SUMMARY_ATTR,
         _VERL_DRAFTER_LAST_HIDDEN_MATERIALIZED_ATTR,
-        _VERL_DRAFTER_RAW_TOPK_REQUESTED_TOPK_ATTR,
     ):
         if hasattr(src, attr_name):
             setattr(dst, attr_name, getattr(src, attr_name))
@@ -3908,7 +3844,7 @@ def _make_sglang_drafter_last_hidden_graph_replay_patch(original_method):
         output = _sglang_graph_replay_output_buffer(self, original_method, forward_batch)
         if output is not None:
             _copy_sglang_drafter_last_hidden_output(output, result, slice(0, self.raw_num_token))
-        if _sglang_raw_top_logprobs_enabled() and _sglang_forward_batch_requests_raw_top_logprobs(forward_batch):
+        if _sglang_raw_top_logprobs_enabled():
             _attach_sglang_raw_top_logprobs(result, forward_batch)
         if output is not None:
             _attach_sglang_last_hidden_logprob_check_from_graph_runner(self, result, forward_batch)

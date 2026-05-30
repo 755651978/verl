@@ -745,9 +745,11 @@ class SGLangHttpServer:
             args["enable_draft_weights_cpu_backup"] = True
 
         # drafter
+        return_last_hidden_for_drafter = False
         if self.config.drafter.enable:
             if self.config.drafter.training.use_logits:
                 enable_sglang_original_logprob_return()
+            return_last_hidden_for_drafter = _drafter_uses_eagle_last_hidden(self.config.drafter)
             args["speculative_algorithm"] = self.config.drafter.speculative_algorithm
             cuda_graph_max_bs = getattr(self.config.drafter.rollout, "cuda_graph_max_bs", None)
             if cuda_graph_max_bs is not None:
@@ -761,15 +763,15 @@ class SGLangHttpServer:
 
             args["enable_weights_cpu_backup"] = True
             args["enable_draft_weights_cpu_backup"] = True
-        # Last-hidden capture is only needed for use_logits=False collection
-        # requests. Keep the process-wide switch off and use the per-request
-        # custom parameter set below when should_collect is true.
-        os.environ[_VERL_DRAFTER_RETURN_LAST_HIDDEN_ENV] = "0"
+        os.environ[_VERL_DRAFTER_RETURN_LAST_HIDDEN_ENV] = (
+            "1" if return_last_hidden_for_drafter else "0"
+        )
+        raw_top_logprobs_for_debug = _env_flag_enabled(_LAST_HIDDEN_LOGPROB_CHECK_ENV, default=False)
         raw_top_logprobs_enabled = (
             self.config.drafter.enable
             and self.config.drafter.enable_drafter_training
             and self.config.drafter.training.collect_hidden_states_from_sgl
-            and self.config.drafter.training.use_logits
+            and (self.config.drafter.training.use_logits or raw_top_logprobs_for_debug)
         )
         os.environ[_VERL_DRAFTER_RAW_TOP_LOGPROBS_ENV] = "1" if raw_top_logprobs_enabled else "0"
         if raw_top_logprobs_enabled and self.config.drafter.training.use_logits:
@@ -1226,10 +1228,7 @@ class SGLangHttpServer:
                         hidden_raw_target_logprobs = torch.cat(raw_target_logprob_chunks, dim=0).contiguous()
                         raw_target_rows = int(hidden_raw_target_logprobs.size(0))
                         raw_rows_match_hidden = raw_target_rows == hidden_raw_len
-                        # Raw next-token logits may be compact: hidden rows cover
-                        # positions p, while raw rows cover shifted targets p + 1.
-                        # Keep that metadata for debug even when use_logits=False.
-                        raw_rows_match_eagle_shift = raw_target_rows == max(hidden_raw_len - 1, 0)
+                        raw_rows_match_eagle_shift = collect_target_logprobs and raw_target_rows == max(hidden_raw_len - 1, 0)
                         if not (raw_rows_match_hidden or raw_rows_match_eagle_shift):
                             logger.warning(
                                 "Drop raw top-k debug metadata with mismatched rows: raw_rows=%s hidden_rows=%s",
@@ -1291,26 +1290,15 @@ class SGLangHttpServer:
                     )
                 hidden_kept_len = int(hidden_states.size(0))
                 if collect_target_logprobs and torch.is_tensor(hidden_raw_target_logprobs):
-                    # SGLang next_token_logits row p is computed from target
-                    # hidden row p and predicts token p + 1. EAGLE3 trains
-                    # draft row p with token p + 1 as input, so its teacher
-                    # distribution must come from target row p + 1.
-                    if int(hidden_raw_target_logprobs.size(0)) == int(hidden_kept_len):
-                        target_logprobs = hidden_raw_target_logprobs[1:].contiguous()
-                        target_logprobs_dropped_rows = 1
-                    else:
-                        target_logprobs = hidden_raw_target_logprobs
-                        target_logprobs_dropped_rows = 0
-                    if int(target_logprobs.size(0)) <= 0:
-                        target_logprobs = None
-                    if target_logprobs is not None:
-                        target_logprobs_position_start = int(hidden_position_start) + 1
-                        target_logprobs_position_end = target_logprobs_position_start + int(target_logprobs.size(0))
-                        output_top_len = int(target_logprobs.size(0))
-                    else:
-                        target_logprobs_position_start = None
-                        target_logprobs_position_end = None
-                        output_top_len = None
+                    # Prefer raw logprobs captured directly from SGLang
+                    # next_token_logits. These rows align with hidden row p and
+                    # supervise token position p + 1, matching the EAGLE shift
+                    # used later in collect_online_data().
+                    target_logprobs = hidden_raw_target_logprobs
+                    target_logprobs_position_start = int(hidden_position_start) + 1
+                    target_logprobs_position_end = target_logprobs_position_start + int(target_logprobs.size(0))
+                    target_logprobs_dropped_rows = 0
+                    output_top_len = int(target_logprobs.size(0))
                 elif collect_target_logprobs:
                     logger.warning(
                         "Missing SGLang raw next_token_logits metadata for drafter logits training; "
@@ -1327,7 +1315,6 @@ class SGLangHttpServer:
                         int(hidden_position_end),
                         max(len(prompt_ids) - 1, 0) + len(token_ids),
                     )
-                    shifted_dropped_rows = int(target_logprobs_dropped_rows)
                     (
                         target_logprobs,
                         target_logprobs_position_start,
@@ -1339,7 +1326,6 @@ class SGLangHttpServer:
                         desired_position_start=target_window_start,
                         desired_position_end=target_window_end,
                     )
-                    target_logprobs_dropped_rows += shifted_dropped_rows
                     if target_logprobs is not None:
                         output_top_len = int(target_logprobs.size(0))
                 drafter_sample = {

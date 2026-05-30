@@ -157,18 +157,14 @@ def _log_eagle3_raw_topk_check(
         return
     try:
         with torch.no_grad():
-            last_hidden_rows = int(last_h_states.size(0))
-            raw_rows_total = int(raw_target_logprobs.size(0))
-            hidden_shift = 1 if raw_rows_total == max(last_hidden_rows - 1, 0) else 0
-            rows = min(max(last_hidden_rows - hidden_shift, 0), raw_rows_total, 128)
+            rows = min(int(last_h_states.size(0)), int(raw_target_logprobs.size(0)), 128)
             if rows <= 0:
                 return
             target_device = next(target_model.parameters()).device
-            check_hidden = last_h_states[hidden_shift : hidden_shift + rows].to(device=target_device)
+            check_hidden = last_h_states[:rows].to(device=target_device)
             target_scores = target_model(check_hidden).float()
-            raw_slice = raw_target_logprobs[:rows]
-            raw_top1_ids = raw_slice[:, 0, 1].to(device=target_scores.device, dtype=torch.long)
-            raw_top1_logprobs = raw_slice[:, 0, 0].to(device=target_scores.device, dtype=torch.float32)
+            raw_top1_ids = raw_target_logprobs[:rows, 0, 1].to(device=target_scores.device, dtype=torch.long)
+            raw_top1_logprobs = raw_target_logprobs[:rows, 0, 0].to(device=target_scores.device, dtype=torch.float32)
             local_raw_top1_ids = raw_top1_ids
             mapped_vocab = False
             if target_token_to_local is not None and int(target_scores.size(-1)) < int(target_token_to_local.numel()):
@@ -197,15 +193,11 @@ def _log_eagle3_raw_topk_check(
             diff = (target_at_raw_top1 - raw_top1_logprobs[valid]).abs()
             top1_match = (target_top1_ids[valid] == local_raw_top1_ids[valid]).float().mean()
             logger.warning(
-                "[drafter raw topk check] source=%s item_idx=%s rows=%s hidden_shift=%s "
-                "last_hidden_rows=%s raw_rows=%s valid_rows=%s top1_match=%.6f "
+                "[drafter raw topk check] source=%s item_idx=%s rows=%s valid_rows=%s top1_match=%.6f "
                 "valid_ratio=%.6f logprob_abs_diff_mean=%.6g raw_topk=%s mapped_vocab=%s sglang_attach=%s",
                 item.get("hidden_target_logprobs_source"),
                 item_idx,
                 rows,
-                hidden_shift,
-                last_hidden_rows,
-                raw_rows_total,
                 int(valid.detach().sum().cpu().item()),
                 float(top1_match.detach().cpu().item()),
                 float(valid.detach().float().mean().cpu().item()),
