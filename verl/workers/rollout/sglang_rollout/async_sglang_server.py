@@ -1344,6 +1344,11 @@ class SGLangHttpServer:
                     "hidden_last_hidden_logprob_check": hidden_last_hidden_logprob_check,
                     "hidden_target_logprobs_source": hidden_target_logprobs_source,
                     "hidden_raw_topk_logprob_check": hidden_raw_topk_logprob_check,
+                    "hidden_raw_target_logprobs": (
+                        hidden_raw_target_logprobs.unsqueeze(0).cpu()
+                        if torch.is_tensor(hidden_raw_target_logprobs)
+                        else None
+                    ),
                     "hidden_last_hidden_filter": hidden_last_hidden_filter,
                     "hidden_last_hidden_select": hidden_last_hidden_select,
                     "target_logprobs": target_logprobs.unsqueeze(0).cpu() if target_logprobs is not None else None,
