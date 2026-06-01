@@ -69,7 +69,6 @@ _SGLANG_EAGLE_VERIFY_HIDDEN_STATES_PATCHED = False
 _SGLANG_DFLASH_VERIFY_HIDDEN_STATES_PATCHED = False
 _SGLANG_DRAFTER_LAST_HIDDEN_OUTPUT_PATCHED = False
 _SGLANG_RAW_TOP_LOGPROBS_REQUEST_GATE_PATCHED = False
-_SGLANG_DYNAMIC_HIDDEN_CAPTURE_PATCHED = False
 _SGLANG_SCHEDULER_PROCESS_PATCHED = False
 _SGLANG_LAST_HIDDEN_LOGPROB_CHECK_LOG_COUNT = 0
 _SGLANG_LAST_HIDDEN_LOGPROB_CHECK_SKIP_LOG_COUNT = 0
@@ -4175,132 +4174,6 @@ def _make_sglang_drafter_last_hidden_graph_replay_patch(original_method):
     return patched_graph_replay
 
 
-def _make_sglang_dynamic_hidden_capture_init_patch(original_method):
-    @wraps(original_method)
-    def patched_init(self, model_runner, *args, **kwargs):
-        server_args = getattr(model_runner, "server_args", None)
-        had_enable_return_hidden_states = hasattr(
-            server_args,
-            "enable_return_hidden_states",
-        )
-        original_enable_return_hidden_states = (
-            getattr(server_args, "enable_return_hidden_states")
-            if had_enable_return_hidden_states
-            else None
-        )
-        if original_enable_return_hidden_states:
-            # SGLang uses this server-level capability flag to force graph
-            # hidden capture globally. VERL only needs graph hidden capture for
-            # batches whose requests actually ask for hidden states.
-            setattr(server_args, "enable_return_hidden_states", False)
-        try:
-            return original_method(self, model_runner, *args, **kwargs)
-        finally:
-            if had_enable_return_hidden_states:
-                setattr(
-                    server_args,
-                    "enable_return_hidden_states",
-                    original_enable_return_hidden_states,
-                )
-
-    patched_init._verl_patched_dynamic_hidden_capture = True
-    return patched_init
-
-
-def _make_sglang_dynamic_hidden_recapture_patch(original_method):
-    @wraps(original_method)
-    def patched_recapture_if_needed(self, forward_batch):
-        try:
-            forward_batch_info = importlib.import_module(
-                "sglang.srt.model_executor.forward_batch_info"
-            )
-            capture_hidden_mode_cls = getattr(forward_batch_info, "CaptureHiddenMode")
-            null_mode = getattr(capture_hidden_mode_cls, "NULL")
-            required_by_batch = getattr(forward_batch, "capture_hidden_mode")
-            spec_info = getattr(forward_batch, "spec_info", None)
-            required_by_spec = (
-                getattr(spec_info, "capture_hidden_mode", None)
-                or null_mode
-            )
-            required_capture_hidden_mode = max(required_by_batch, required_by_spec)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(
-                "Fall back to original SGLang graph hidden recapture logic: %s",
-                exc,
-            )
-            return original_method(self, forward_batch)
-
-        if getattr(self, "capture_hidden_mode", None) != required_capture_hidden_mode:
-            self.capture_hidden_mode = required_capture_hidden_mode
-            self.capture()
-        return None
-
-    patched_recapture_if_needed._verl_patched_dynamic_hidden_capture = True
-    return patched_recapture_if_needed
-
-
-def patch_sglang_dynamic_hidden_capture() -> None:
-    """Avoid global FULL hidden capture when SGLang merely supports hidden-state return."""
-    global _SGLANG_DYNAMIC_HIDDEN_CAPTURE_PATCHED
-    if _SGLANG_DYNAMIC_HIDDEN_CAPTURE_PATCHED:
-        return
-
-    targets = (
-        ("sglang.srt.model_executor.cuda_graph_runner", "CudaGraphRunner"),
-        ("sglang.srt.model_executor.cpu_graph_runner", "CPUGraphRunner"),
-        (
-            "sglang.srt.model_executor.piecewise_cuda_graph_runner",
-            "PiecewiseCudaGraphRunner",
-        ),
-    )
-    patched = []
-    for module_name, class_name in targets:
-        try:
-            module = importlib.import_module(module_name)
-            runner_cls = getattr(module, class_name)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(
-                "Skip SGLang dynamic hidden capture patch for %s.%s: %s",
-                module_name,
-                class_name,
-                exc,
-            )
-            continue
-
-        original_init = getattr(runner_cls, "__init__", None)
-        if original_init is not None and not getattr(
-            original_init,
-            "_verl_patched_dynamic_hidden_capture",
-            False,
-        ):
-            setattr(
-                runner_cls,
-                "__init__",
-                _make_sglang_dynamic_hidden_capture_init_patch(original_init),
-            )
-            patched.append(f"{class_name}.__init__")
-
-        original_recapture = getattr(runner_cls, "recapture_if_needed", None)
-        if original_recapture is not None and not getattr(
-            original_recapture,
-            "_verl_patched_dynamic_hidden_capture",
-            False,
-        ):
-            setattr(
-                runner_cls,
-                "recapture_if_needed",
-                _make_sglang_dynamic_hidden_recapture_patch(original_recapture),
-            )
-            patched.append(f"{class_name}.recapture_if_needed")
-
-    if patched:
-        _SGLANG_DYNAMIC_HIDDEN_CAPTURE_PATCHED = True
-        logger.warning(
-            "SGLang dynamic hidden capture patch active for %s",
-            ", ".join(patched),
-        )
-
-
 def _make_sglang_forward_batch_init_new_raw_top_logprobs_patch(original_method):
     @wraps(original_method)
     def patched_init_new(cls, *args, **kwargs):
@@ -4477,7 +4350,6 @@ def patch_sglang_dflash_verify_hidden_states() -> None:
 def patch_sglang_hidden_states_tensor_output() -> None:
     """Return SGLang hidden-state chunks as CPU tensors instead of Python lists."""
     global _SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED
-    patch_sglang_dynamic_hidden_capture()
     patch_sglang_eagle_verify_hidden_states_full()
     patch_sglang_dflash_verify_hidden_states()
     patch_sglang_drafter_last_hidden_output()
