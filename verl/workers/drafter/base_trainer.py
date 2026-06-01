@@ -15,7 +15,6 @@ from contextlib import contextmanager, nullcontext
 
 import torch
 import torch.distributed as dist
-import torch.distributed.checkpoint as dcp
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import CPUOffload, MixedPrecision, ShardingStrategy
 from torch.nn import SmoothL1Loss
@@ -759,33 +758,99 @@ class DrafterBaseTrainer:
             if isinstance(tensor, torch.Tensor)
         }
 
+    def _get_pretrained_export_model(self):
+        model = self.model.module if hasattr(self.model, "module") else self.model
+        if getattr(self.backend, "model_type", None) == "dflash" and hasattr(model, "draft_model"):
+            return model.draft_model, ("draft_model.", "module.draft_model.", "_orig_mod.draft_model.")
+        return model, ()
+
+    def _get_pretrained_export_state_dict(self) -> dict[str, torch.Tensor]:
+        full_state_dict = self._get_full_export_state_dict()
+        if not full_state_dict:
+            return {}
+
+        _, strip_prefixes = self._get_pretrained_export_model()
+        if not strip_prefixes:
+            return full_state_dict
+
+        stripped_state_dict = {}
+        for name, tensor in full_state_dict.items():
+            stripped_name = None
+            for prefix in strip_prefixes:
+                if name.startswith(prefix):
+                    stripped_name = name[len(prefix) :]
+                    break
+            if stripped_name is not None:
+                stripped_state_dict[stripped_name] = tensor
+
+        return stripped_state_dict or full_state_dict
+
     def _is_checkpoint_leader(self) -> bool:
         return self.rollout_dp_rank == 0 and self._get_sp_local_rank() == 0
 
-    def _should_save_full_drafter_checkpoint(self, is_final: bool) -> bool:
-        training_cfg = self.config.rollout.drafter.training
-        return bool(is_final and training_cfg.get("save_full_drafter_checkpoint", False))
+    def _infer_pretrained_save_kwargs(self) -> dict[str, Any]:
+        # Save as HuggingFace-compatible PyTorch weights so SGLang and the
+        # drafter trainer can load the checkpoint directory directly.
+        save_kwargs: dict[str, Any] = {"safe_serialization": False}
+        spec_model_path = self.config.rollout.drafter.model_path
+        if not spec_model_path or not os.path.isdir(spec_model_path):
+            return save_kwargs
 
-    def _copy_drafter_config_files(self, output_dir: str) -> None:
+        shard_files = []
+        for index_path in sorted(glob.glob(os.path.join(spec_model_path, "*.index.json"))):
+            try:
+                with open(index_path, "r", encoding="utf-8") as f:
+                    index_json = json.load(f)
+            except (OSError, json.JSONDecodeError) as exc:
+                logger.warning("Failed to inspect drafter weight index %s: %s", index_path, exc)
+                continue
+            shard_files.extend(index_json.get("weight_map", {}).values())
+
+        if shard_files:
+            unique_shards = sorted(set(shard_files))
+            shard_sizes = []
+            for shard in unique_shards:
+                shard_path = os.path.join(spec_model_path, shard)
+                if os.path.exists(shard_path):
+                    shard_sizes.append(os.path.getsize(shard_path))
+            if len(unique_shards) > 1 and shard_sizes:
+                save_kwargs["max_shard_size"] = max(shard_sizes)
+        return save_kwargs
+
+    def _copy_drafter_auxiliary_files(self, output_dir: str) -> None:
         spec_model_path = self.config.rollout.drafter.model_path
         if not spec_model_path or not os.path.isdir(spec_model_path):
             return
-        for filename in ("config.json", "generation_config.json"):
+        for filename in ("generation_config.json",):
             src = os.path.join(spec_model_path, filename)
             dst = os.path.join(output_dir, filename)
-            if os.path.exists(src):
+            if os.path.exists(src) and not os.path.exists(dst):
                 try:
                     shutil.copy2(src, dst)
                 except OSError as exc:
                     logger.warning("Failed to copy drafter %s to full checkpoint: %s", filename, exc)
 
-    def _save_full_export_checkpoint_async(self, checkpoint_path: str, step: int, is_final: bool = False):
-        if not self._should_save_full_drafter_checkpoint(is_final):
-            return None
+    def _clear_existing_pretrained_weight_files(self, output_dir: str) -> None:
+        for pattern in (
+            "model.safetensors",
+            "model-*.safetensors",
+            "model.safetensors.index.json",
+            "pytorch_model.bin",
+            "pytorch_model-*.bin",
+            "pytorch_model.bin.index.json",
+            "model.pt",
+        ):
+            for path in glob.glob(os.path.join(output_dir, pattern)):
+                try:
+                    os.remove(path)
+                except OSError as exc:
+                    logger.warning("Failed to remove stale drafter checkpoint file %s: %s", path, exc)
+
+    def _save_pretrained_checkpoint_async(self, checkpoint_path: str, step: int):
         if self._pending_full_checkpoint_future is not None:
             if not self._pending_full_checkpoint_future.done():
                 logger.warning(
-                    "[Rank %s] Previous full drafter checkpoint save is still running; skip step=%s",
+                    "[Rank %s] Previous drafter checkpoint save is still running; skip step=%s",
                     self.rank,
                     step,
                 )
@@ -796,71 +861,85 @@ class DrafterBaseTrainer:
                 logger.warning("Previous full drafter checkpoint save failed: %s", exc)
             self._pending_full_checkpoint_future = None
 
-        model_state_dict = self._get_full_export_state_dict()
+        export_model, _ = self._get_pretrained_export_model()
+        model_state_dict = self._get_pretrained_export_state_dict()
         if not self._is_checkpoint_leader() or not model_state_dict:
             return None
+        if not hasattr(export_model, "save_pretrained"):
+            raise TypeError(f"Drafter export model does not support save_pretrained: {type(export_model)}")
 
-        export_dir = os.path.join(checkpoint_path, "full_drafter")
-        output_path = os.path.join(export_dir, "pytorch_model.bin")
-        metadata_path = os.path.join(export_dir, "metadata.json")
+        save_kwargs = self._infer_pretrained_save_kwargs()
+        metadata_path = os.path.join(checkpoint_path, "metadata.json")
 
         def _write_full_checkpoint():
-            os.makedirs(export_dir, exist_ok=True)
-            torch.save(model_state_dict, output_path)
+            os.makedirs(checkpoint_path, exist_ok=True)
+            self._clear_existing_pretrained_weight_files(checkpoint_path)
+            export_model.save_pretrained(checkpoint_path, state_dict=model_state_dict, **save_kwargs)
             with open(metadata_path, "w", encoding="utf-8") as f:
-                json.dump({"step": step, "format": "full_drafter_export"}, f, indent=2)
-            self._copy_drafter_config_files(export_dir)
+                json.dump(
+                    {
+                        "step": step,
+                        "format": "pretrained_drafter_checkpoint",
+                        "serialization": "pytorch",
+                    },
+                    f,
+                    indent=2,
+                )
+            self._copy_drafter_auxiliary_files(checkpoint_path)
 
         if self._full_checkpoint_executor is None:
             self._full_checkpoint_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="drafter-full-ckpt")
         future = self._full_checkpoint_executor.submit(_write_full_checkpoint)
         self._pending_full_checkpoint_future = future
-        logger.info("[Rank %s] Scheduled full drafter checkpoint export to %s", self.rank, export_dir)
+        logger.info("[Rank %s] Scheduled drafter checkpoint export to %s", self.rank, checkpoint_path)
         return future
 
     
     def _save_checkpoint_async(self, step: int, is_final: bool = False):
-        """Asynchronously save checkpoint using DCP's async_save.
+        """Asynchronously save a directly loadable drafter checkpoint.
 
         Args:
             step: Current training step
             is_final: Whether this is the final checkpoint during cleanup
 
         Returns:
-            Future object from dcp.async_save that can be awaited or checked for completion
+            Future object for the background save, or None on non-leader ranks
         """
         if not self.checkpoint_dir:
             return None
 
         checkpoint_path = os.path.join(self.checkpoint_dir, f"draft_step_{step}")
-        os.makedirs(checkpoint_path, exist_ok=True)
+        return self._save_pretrained_checkpoint_async(checkpoint_path, step)
 
-        # Get trainable state dict (excluding frozen layers)
-        model_state_dict = self._get_trainable_state_dict()
+    def save_checkpoint(self, step: int) -> dict[str, Any]:
+        if not self.checkpoint_dir:
+            return {"saved": False, "reason": "missing_checkpoint_dir"}
+
+        if self.model is None:
+            self._build_draft_model()
+
+        first_param = next(self.model.parameters(), None)
+        was_on_device = first_param is not None and first_param.device.type == device_name
         is_fsdp_wrapped = isinstance(self.model, FSDP) or self.training_device_mesh is not None
-        is_checkpoint_leader = self.rollout_dp_rank == 0 and self._get_sp_local_rank() == 0
-        optimizer_state_dict = self.optimizer.state_dict() if self.optimizer and is_checkpoint_leader else {}
+        if is_fsdp_wrapped and not was_on_device:
+            load_fsdp_model_to_gpu(self.model)
 
-        state_dict = {"model": model_state_dict, "optimizer": optimizer_state_dict, "step": step}
-        self._save_full_export_checkpoint_async(checkpoint_path, step, is_final=is_final)
+        future = None
+        try:
+            future = self._save_checkpoint_async(int(step))
+            if future is not None:
+                future.result()
+                self._pending_full_checkpoint_future = None
+        finally:
+            if is_fsdp_wrapped and not was_on_device:
+                offload_fsdp_model_to_cpu(self.model)
 
-        if is_fsdp_wrapped:
-            if is_checkpoint_leader and model_state_dict:
-                torch.save(state_dict, os.path.join(checkpoint_path, "model.pt"))
-            return None
-
-        # Standalone mode: no distributed mesh, save locally.
-        if self.training_device_mesh is None or not dist.is_initialized():
-            torch.save(state_dict, os.path.join(checkpoint_path, "model.pt"))
-            return None
-
-        # Use DCP async_save - returns a future that can be checked later
-        future = dcp.async_save(
-            state_dict=state_dict,
-            checkpoint_id=checkpoint_path,
-            process_group=self.training_device_mesh.get_group(),
-        )
-        return future
+        checkpoint_path = os.path.join(self.checkpoint_dir, f"draft_step_{int(step)}")
+        return {
+            "saved": future is not None,
+            "path": checkpoint_path,
+            "reason": "saved" if future is not None else "not_checkpoint_leader",
+        }
 
     async def activate_training_model(self) -> bool:
         # 将模型和优化器状态从CPU加载到GPU，激活草稿模型进入训练状态

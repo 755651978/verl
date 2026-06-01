@@ -103,7 +103,9 @@ class DrafterTrainingConfig(BaseConfig):
     draft_update_pause_generation: bool = True
     draft_update_flush_before: bool = True
     draft_update_flush_after: bool = True
-    save_full_drafter_checkpoint: bool = False
+    # Deprecated compatibility knob. Drafter checkpoints are now always saved
+    # as full pretrained model directories without optimizer state.
+    save_full_drafter_checkpoint: bool = True
     sample_last_n_steps: int = 20
     train_batches_per_cycle: int = 4
     lr: float = 1e-6

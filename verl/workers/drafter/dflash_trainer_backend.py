@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from safetensors import safe_open
 from transformers import AutoConfig
 
+from .checkpoint import log_drafter_checkpoint_step
 from .model.dflash import DFlashConfig, DFlashDraftModel, build_target_layer_ids
 from .model.dflash.flex_attention import compile_friendly_create_block_mask
 from .model.target.target_head import TargetHead
@@ -581,6 +582,7 @@ class DFlashTrainerBackend:
         if config_path and os.path.exists(config_path):
             drafter_config = DFlashConfig.from_dflash_pretrained(spec_model_path)
             if spec_model_path and os.path.exists(spec_model_path):
+                log_drafter_checkpoint_step(logger, spec_model_path, action="Loading DFlash drafter weights")
                 normalized_state = self._normalize_draft_state_dict(self._load_draft_state_dict(spec_model_path))
         else:
             drafter_config = self._build_fallback_config(target_hf_config)

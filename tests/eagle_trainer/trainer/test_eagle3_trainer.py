@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import shutil
 import tempfile
@@ -12,7 +13,10 @@ from omegaconf import OmegaConf
 from transformers import AutoConfig, LlamaConfig, LlamaForCausalLM
 
 from verl.workers.drafter.base_trainer import DrafterBaseTrainer
+from verl.workers.drafter.checkpoint import get_drafter_checkpoint_step, resolve_drafter_checkpoint_path
+from verl.workers.drafter.dflash_trainer_backend import DFlashTrainingModel
 from verl.workers.drafter.eagle3_trainer_backend import Eagle3TrainerBackend, _masked_soft_cross_entropy
+from verl.workers.drafter.model.dflash import DFlashConfig, DFlashDraftModel
 from verl.workers.drafter.model.eagle import LlamaForCausalLMEagle3
 
 
@@ -235,6 +239,110 @@ def test_drafter_trainable_state_dict_skips_non_floating_buffers():
 
     assert set(trainable_state) == {"weight"}
     assert trainable_state["weight"].shape == (2, 2)
+
+
+def _build_checkpoint_export_trainer(model, checkpoint_dir: Path, model_path: Path, model_type: str):
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.model = model
+    trainer.training_device_mesh = None
+    trainer.rollout_dp_rank = 0
+    trainer.rank = 0
+    trainer.training_group_world_size = 1
+    trainer.backend = type("Backend", (), {"model_type": model_type})()
+    trainer.checkpoint_dir = str(checkpoint_dir)
+    trainer._pending_full_checkpoint_future = None
+    trainer._full_checkpoint_executor = None
+    trainer.config = OmegaConf.create(
+        {
+            "rollout": {
+                "drafter": {
+                    "model_path": str(model_path),
+                    "training": {},
+                }
+            }
+        }
+    )
+    return trainer
+
+
+def _wait_checkpoint_export(trainer: DrafterBaseTrainer, step: int):
+    future = trainer._save_checkpoint_async(step)
+    assert future is not None
+    future.result(timeout=30)
+    if trainer._full_checkpoint_executor is not None:
+        trainer._full_checkpoint_executor.shutdown(wait=True)
+        trainer._full_checkpoint_executor = None
+
+
+def test_drafter_checkpoint_saves_pretrained_full_weights(tmp_path):
+    source_dir = tmp_path / "source"
+    checkpoint_dir = tmp_path / "checkpoints"
+    config = _tiny_llama_config()
+    config.architectures = ["LlamaForCausalLMEagle3"]
+    config.draft_vocab_size = config.vocab_size
+    config.target_hidden_size = config.hidden_size
+    config.num_hidden_layers = 1
+    model = LlamaForCausalLMEagle3(config)
+    model.d2t[0] = 7
+    model.save_pretrained(source_dir, safe_serialization=True, max_shard_size="10KB")
+
+    trainer = _build_checkpoint_export_trainer(model, checkpoint_dir, source_dir, "eagle3")
+    _wait_checkpoint_export(trainer, step=7)
+
+    export_dir = checkpoint_dir / "draft_step_7"
+    assert (export_dir / "config.json").exists()
+    assert list(export_dir.glob("*.bin"))
+    assert not list(export_dir.glob("*.safetensors"))
+    assert not (export_dir / "model.pt").exists()
+    with open(export_dir / "metadata.json", encoding="utf-8") as f:
+        metadata = json.load(f)
+    assert metadata["format"] == "pretrained_drafter_checkpoint"
+    assert metadata["serialization"] == "pytorch"
+    assert metadata["step"] == 7
+    assert get_drafter_checkpoint_step(export_dir) == 7
+    assert resolve_drafter_checkpoint_path(source_dir, checkpoint_dir, 7) == str(export_dir)
+
+    loaded = LlamaForCausalLMEagle3.from_pretrained(export_dir)
+    assert loaded.d2t[0].item() == 7
+    assert torch.equal(loaded.state_dict()["fc.weight"], model.state_dict()["fc.weight"])
+
+
+def test_dflash_checkpoint_exports_inner_draft_model_keys(tmp_path):
+    source_dir = tmp_path / "source_dflash"
+    checkpoint_dir = tmp_path / "checkpoints"
+    config = DFlashConfig(
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        vocab_size=16,
+        max_position_embeddings=32,
+        num_target_layers=4,
+        num_context_layers=2,
+        target_hidden_size=8,
+        target_num_hidden_layers=4,
+        target_layer_ids=[1, 2],
+        mask_token_id=15,
+        architectures=["DFlashDraftModel"],
+    )
+    source_model = DFlashDraftModel(config)
+    source_model.save_pretrained(source_dir, safe_serialization=False)
+
+    draft_model = DFlashDraftModel(config)
+    with torch.no_grad():
+        draft_model.context_proj.weight.fill_(2.0)
+    training_model = DFlashTrainingModel(draft_model=draft_model, block_size=2, num_anchors=2)
+    trainer = _build_checkpoint_export_trainer(training_model, checkpoint_dir, source_dir, "dflash")
+
+    _wait_checkpoint_export(trainer, step=3)
+
+    export_dir = checkpoint_dir / "draft_step_3"
+    state_dict = torch.load(export_dir / "pytorch_model.bin", map_location="cpu", weights_only=True)
+    assert "context_proj.weight" in state_dict
+    assert "draft_model.context_proj.weight" not in state_dict
+    loaded = DFlashDraftModel.from_pretrained(export_dir)
+    assert torch.equal(loaded.context_proj.weight, draft_model.context_proj.weight)
 
 
 def test_drafter_prepare_training_batch_uses_current_step_collected_data_only():

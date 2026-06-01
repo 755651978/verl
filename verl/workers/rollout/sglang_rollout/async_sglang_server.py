@@ -46,6 +46,7 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_visible_devices_keyword
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.utils.profiler import DistProfiler, build_sglang_profiler_args
+from verl.workers.drafter.checkpoint import log_drafter_checkpoint_step
 from verl.workers.drafter.sglang_patch import (
     enable_sglang_original_logprob_return,
     install_sglang_verl_patches,
@@ -756,6 +757,11 @@ class SGLangHttpServer:
             if cuda_graph_max_bs is not None:
                 args["cuda_graph_max_bs"] = cuda_graph_max_bs
             args["speculative_draft_model_path"] = self.config.drafter.model_path
+            log_drafter_checkpoint_step(
+                logger,
+                self.config.drafter.model_path,
+                action="Starting SGLang with drafter weights",
+            )
             args["speculative_num_steps"] = self.config.drafter.rollout.spec_steps
             args["speculative_eagle_topk"] = self.config.drafter.rollout.spec_topk
             args["speculative_num_draft_tokens"] = self.config.drafter.rollout.spec_verify_tokens

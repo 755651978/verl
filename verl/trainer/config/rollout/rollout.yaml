@@ -481,7 +481,9 @@ drafter:
     draft_update_pause_generation: true
     draft_update_flush_before: true
     draft_update_flush_after: true
-    save_full_drafter_checkpoint: false
+    # Deprecated compatibility knob. Drafter checkpoints are always full
+    # pretrained model directories without optimizer state.
+    save_full_drafter_checkpoint: true
     sample_last_n_steps: 20
     train_batches_per_cycle: 4
     lr: 1e-6
@@ -512,5 +514,4 @@ drafter:
     current_max_samples: 2000
     data_buffer_max_size: 1024
     hidden_state_clip_value: 1.0e4
-
 

@@ -72,6 +72,7 @@ from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import DistillationConfig, EngineConfig
+from verl.workers.drafter.checkpoint import resolve_drafter_checkpoint_path
 from verl.workers.engine.fsdp.utils import build_rollout_parallel_layout
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
@@ -707,6 +708,72 @@ class RayPPOTrainer:
 
         return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
 
+    def _resolve_resume_global_step_folder_for_init(self) -> Optional[str]:
+        if self.config.trainer.resume_mode == "disable":
+            return None
+        if self.config.trainer.default_hdfs_dir is not None:
+            return None
+
+        if self.config.trainer.resume_mode == "resume_path":
+            resume_path = self.config.trainer.resume_from_path
+            if not isinstance(resume_path, str) or "global_step_" not in resume_path:
+                return None
+            if os.path.isabs(resume_path):
+                return resume_path
+            return os.path.join(os.getcwd(), resume_path)
+
+        checkpoint_folder = self.config.trainer.default_local_dir
+        if not os.path.isabs(checkpoint_folder):
+            checkpoint_folder = os.path.join(os.getcwd(), checkpoint_folder)
+        return find_latest_ckpt_path(checkpoint_folder)
+
+    def _resolve_resume_global_step_for_init(self) -> int:
+        global_step_folder = self._resolve_resume_global_step_folder_for_init()
+        if global_step_folder is None:
+            return 0
+        try:
+            return int(global_step_folder.split("global_step_")[-1])
+        except (TypeError, ValueError):
+            return 0
+
+    def _ensure_drafter_checkpoint_path(self) -> Optional[str]:
+        if not self.use_drafter:
+            return None
+
+        drafter_cfg = self.config.actor_rollout_ref.rollout.drafter
+        checkpoint_path = drafter_cfg.get("checkpoint_path", None)
+        if checkpoint_path in (None, "", "null", "None", "/path/to/drafter/checkpoint"):
+            checkpoint_path = os.path.join(self.config.trainer.default_local_dir, "drafter")
+            with open_dict(drafter_cfg):
+                drafter_cfg.checkpoint_path = checkpoint_path
+        return checkpoint_path
+
+    def _configure_drafter_checkpoint_for_worker_init(self) -> None:
+        if not self.use_drafter:
+            return
+
+        checkpoint_path = self._ensure_drafter_checkpoint_path()
+        global_step = self._resolve_resume_global_step_for_init()
+        drafter_cfg = self.config.actor_rollout_ref.rollout.drafter
+        original_model_path = drafter_cfg.model_path
+        resolved_model_path = resolve_drafter_checkpoint_path(
+            original_model_path,
+            checkpoint_path,
+            global_step,
+        )
+        if resolved_model_path != original_model_path:
+            with open_dict(drafter_cfg):
+                drafter_cfg.model_path = resolved_model_path
+            print(
+                "Resolved drafter model path for resume: "
+                f"global_step={global_step}, model_path={resolved_model_path}"
+            )
+        elif global_step > 0:
+            print(
+                "No drafter checkpoint found for resume; using configured drafter model path: "
+                f"global_step={global_step}, checkpoint_path={checkpoint_path}, model_path={original_model_path}"
+            )
+
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
 
@@ -717,6 +784,7 @@ class RayPPOTrainer:
         self.resource_pool_manager.create_resource_pool()
 
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
+        self._configure_drafter_checkpoint_for_worker_init()
 
         # create actor and rollout
         actor_role = Role.ActorRolloutRef if Role.ActorRolloutRef in self.role_worker_mapping else Role.ActorRollout
@@ -1257,6 +1325,10 @@ class RayPPOTrainer:
             self.critic_wg.save_checkpoint(
                 critic_local_path, critic_remote_path, self.global_steps, max_ckpt_to_keep=max_critic_ckpt_to_keep
             )
+
+        if self.use_drafter and self.drafter_wg is not None:
+            self._ensure_drafter_checkpoint_path()
+            self.drafter_wg.save_checkpoint(self.global_steps)
 
         # save dataloader
         local_mkdir_safe(local_global_step_folder)

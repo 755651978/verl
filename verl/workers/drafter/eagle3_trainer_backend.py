@@ -7,6 +7,7 @@ from torch.nn import functional as F
 from transformers import AutoConfig
 
 from .model.auto import AutoDraftModelConfig, AutoEagle3DraftModel
+from .checkpoint import log_drafter_checkpoint_step
 from .eagle_trainer_backend import EagleTrainerBackend
 from .model.target.target_head import TargetHead
 from verl.utils.fsdp_utils import get_device_id
@@ -622,6 +623,7 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
 
         # Initialize model
         if spec_model_path and os.path.exists(spec_model_path):
+            log_drafter_checkpoint_step(logger, spec_model_path, action="Loading EAGLE3 drafter weights")
             loaded = factory_cls.from_pretrained(spec_model_path, output_loading_info=True)
             if isinstance(loaded, tuple):
                 drafter_module, loading_info = loaded

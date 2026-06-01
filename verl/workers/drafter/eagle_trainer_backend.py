@@ -9,6 +9,7 @@ from torch.nn import SmoothL1Loss
 from torch.nn import functional as F
 
 from .model.auto import AutoDraftModelConfig, AutoEagleDraftModel
+from .checkpoint import log_drafter_checkpoint_step
 
 from verl.utils.torch_functional import (
     get_constant_schedule_with_warmup,
@@ -78,6 +79,7 @@ class EagleTrainerBackend:
 
         # Initialize model
         if spec_model_path and os.path.exists(spec_model_path):
+            log_drafter_checkpoint_step(logger, spec_model_path, action="Loading EAGLE drafter weights")
             drafter_module = factory_cls.from_pretrained(spec_model_path, ignore_mismatched_sizes = True)
 
         

@@ -1113,6 +1113,24 @@ class DrafterWorker(Worker):
         self.trainer.clear_pending_publish_state_dict()
         self.trainer.increment_rl_step(global_step)
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def save_checkpoint(self, global_step: int):
+        if not self.enable_drafter:
+            return {"saved": False, "reason": "disabled"}
+        if not self.in_drafter_train_group or self.trainer is None:
+            return {"saved": False, "reason": "not_in_training_group"}
+        if global_step is None:
+            return {"saved": False, "reason": "missing_global_step"}
+        result = self.trainer.save_checkpoint(int(global_step))
+        if self.is_drafter_group_leader:
+            logger.info(
+                "[drafter checkpoint] replica=%s global_step=%s result=%s",
+                self.replica_rank,
+                global_step,
+                result,
+            )
+        return result
+
     @register(dispatch_mode=make_nd_compute_dispatch_fn(mesh_name=DRAFTER_TARGET_SYNC_MESH))
     def sync_target_lm_head_weight(self, payload: Optional[dict], global_step: Optional[int] = None):
         if not self.enable_drafter:
