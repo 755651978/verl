@@ -2904,6 +2904,27 @@ def _sglang_raw_target_logprobs_tensor(logits_output, row_slice=None):
     return torch.stack((logprobs, token_ids), dim=-1).contiguous()
 
 
+def _sglang_debug_row_slice_for_hidden_chunk(logits_output, start: int, end: int, chunk_rows: int):
+    row_slice = slice(start, end)
+    raw_topk_logprobs = getattr(logits_output, _VERL_DRAFTER_LH_CHECK_RAW_TOPK_LOGPROBS_ATTR, None)
+    if not (_is_torch_tensor(raw_topk_logprobs) and raw_topk_logprobs.dim() > 0):
+        return row_slice
+    try:
+        raw_rows = int(raw_topk_logprobs.shape[0])
+        chunk_rows = int(chunk_rows)
+        start = int(start)
+        end = int(end)
+    except (TypeError, ValueError):
+        return row_slice
+    if raw_rows <= 0 or chunk_rows <= 0:
+        return row_slice
+    if 0 <= start <= end <= raw_rows:
+        return row_slice
+    if raw_rows == chunk_rows:
+        return slice(0, chunk_rows)
+    return row_slice
+
+
 def _raw_topk_metadata_summary(raw_target_logprobs) -> dict | None:
     if not _is_torch_tensor(raw_target_logprobs) or raw_target_logprobs.dim() != 3:
         return None
@@ -3211,13 +3232,19 @@ def _append_sglang_prefill_hidden_states(req, logits_output, hidden_state_offset
         chunk,
         _slice_sglang_drafter_last_hidden_output(logits_output, slice(hidden_state_offset, end)),
     )
+    debug_row_slice = _sglang_debug_row_slice_for_hidden_chunk(
+        logits_output,
+        hidden_state_offset,
+        end,
+        _sglang_hidden_chunk_rows(chunk),
+    )
     _append_sglang_hidden_state_chunk_with_budget(
         req,
         chunk,
         position_start=prefix_cache_rows,
         positions=torch.arange(prefix_cache_rows, prefix_cache_rows + _sglang_hidden_chunk_rows(chunk), dtype=torch.long),
         prefix_cache_rows=prefix_cache_rows,
-        extra_metadata=_sglang_hidden_debug_metadata(logits_output, row_slice=slice(hidden_state_offset, end)),
+        extra_metadata=_sglang_hidden_debug_metadata(logits_output, row_slice=debug_row_slice),
         batch=batch,
     )
     return end
@@ -3289,9 +3316,16 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
             end = hidden_state_offset + rows
             total_hidden = int(hidden_states.shape[0])
             if hidden_states.dim() >= 2 and end <= total_hidden:
+                chunk = hidden_states[hidden_state_offset:end]
+                debug_row_slice = _sglang_debug_row_slice_for_hidden_chunk(
+                    logits_output,
+                    hidden_state_offset,
+                    end,
+                    _sglang_hidden_chunk_rows(chunk),
+                )
                 _append_sglang_hidden_state_chunk_with_budget(
                     req,
-                    hidden_states[hidden_state_offset:end],
+                    chunk,
                     position_start=(
                         None
                         if not _is_torch_tensor(hidden_positions)
@@ -3302,7 +3336,7 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
                         if _is_torch_tensor(hidden_positions)
                         else None
                     ),
-                    extra_metadata=_sglang_hidden_debug_metadata(logits_output, row_slice=slice(hidden_state_offset, end)),
+                    extra_metadata=_sglang_hidden_debug_metadata(logits_output, row_slice=debug_row_slice),
                     batch=batch,
                 )
                 return end
@@ -3328,6 +3362,12 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
                 chunk,
                 _slice_sglang_drafter_last_hidden_output(logits_output, slice(hidden_state_offset, end)),
             )
+            debug_row_slice = _sglang_debug_row_slice_for_hidden_chunk(
+                logits_output,
+                hidden_state_offset,
+                end,
+                _sglang_hidden_chunk_rows(chunk),
+            )
             _append_sglang_hidden_state_chunk_with_budget(
                 req,
                 chunk,
@@ -3341,7 +3381,7 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
                     if _is_torch_tensor(hidden_positions)
                     else None
                 ),
-                extra_metadata=_sglang_hidden_debug_metadata(logits_output, row_slice=slice(hidden_state_offset, end)),
+                extra_metadata=_sglang_hidden_debug_metadata(logits_output, row_slice=debug_row_slice),
                 batch=batch,
             )
             return end
@@ -3364,6 +3404,12 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
             chunk,
             _slice_sglang_drafter_last_hidden_output(logits_output, req_index),
         )
+        debug_row_slice = _sglang_debug_row_slice_for_hidden_chunk(
+            logits_output,
+            req_index,
+            req_index + 1,
+            _sglang_hidden_chunk_rows(chunk),
+        )
         _append_sglang_hidden_state_chunk_with_budget(
             req,
             chunk,
@@ -3373,15 +3419,22 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
                 else int(hidden_positions[req_index].detach().cpu().item())
             ),
             positions=(hidden_positions[req_index] if _is_torch_tensor(hidden_positions) else None),
-            extra_metadata=_sglang_hidden_debug_metadata(logits_output, row_slice=req_index),
+            extra_metadata=_sglang_hidden_debug_metadata(logits_output, row_slice=debug_row_slice),
             batch=batch,
         )
     else:
+        chunk = hidden_states[req_index]
+        debug_row_slice = _sglang_debug_row_slice_for_hidden_chunk(
+            logits_output,
+            req_index,
+            req_index + 1,
+            _sglang_hidden_chunk_rows(chunk),
+        )
         _append_sglang_hidden_state_chunk_with_budget(
             req,
-            hidden_states[req_index],
+            chunk,
             position_start=None,
-            extra_metadata=_sglang_hidden_debug_metadata(logits_output, row_slice=req_index),
+            extra_metadata=_sglang_hidden_debug_metadata(logits_output, row_slice=debug_row_slice),
             batch=batch,
         )
     return hidden_state_offset
