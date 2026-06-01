@@ -1980,15 +1980,11 @@ class RayPPOTrainer:
                         # 2. It's the last training step.
                         # 3. The current step number is a multiple of the save frequency.
                         # 4. The ESI(Elastic Server Instance)/training plan is close to expiration.
-                        if self.config.trainer.save_freq > 0 and (
+                        should_save_checkpoint = self.config.trainer.save_freq > 0 and (
                             is_last_step
                             or self.global_steps % self.config.trainer.save_freq == 0
                             or esi_close_to_expiration
-                        ):
-                            if esi_close_to_expiration:
-                                print("Force saving checkpoint: ESI instance expiration approaching.")
-                            with marked_timer("save_checkpoint", timing_raw, color="green"):
-                                self._save_checkpoint()
+                        )
 
                         drafter_trained = False
                         if self.use_drafter and self.drafter_wg is not None:
@@ -2000,6 +1996,12 @@ class RayPPOTrainer:
                             metrics.update(drafter_metrics)
                             drafter_trained = bool(drafter_metrics["drafter/trained"])
                             del drafter_train_results
+
+                        if should_save_checkpoint:
+                            if esi_close_to_expiration:
+                                print("Force saving checkpoint: ESI instance expiration approaching.")
+                            with marked_timer("save_checkpoint", timing_raw, color="green"):
+                                self._save_checkpoint()
 
                         # update weights from trainer to rollout
                         with marked_timer("update_weights", timing_raw, color="red"):

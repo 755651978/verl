@@ -2488,25 +2488,6 @@ class DrafterBaseTrainer:
                 logger.warning(f"Pending full drafter checkpoint save failed: {e}")
             self._pending_full_checkpoint_future = None
 
-        # Save final checkpoint and wait for it to complete
-        if self.checkpoint_dir and self.model is not None and self.training_steps > 0:
-            final_ckpt_step = self.current_rl_step if self.current_rl_step > 0 else self.training_steps
-            final_future = self._save_checkpoint_async(final_ckpt_step, is_final=True)
-            if final_future is not None:
-                try:
-                    loop = asyncio.get_event_loop()
-                    await loop.run_in_executor(None, final_future.result)
-                    logger.info(f"[Rank {self.rank}] Final checkpoint save completed")
-                except Exception as e:  # noqa: BLE001
-                    logger.warning(f"Final checkpoint save failed: {e}")
-            if self._pending_full_checkpoint_future is not None:
-                try:
-                    await asyncio.wrap_future(self._pending_full_checkpoint_future)
-                    logger.info(f"[Rank {self.rank}] Final full drafter checkpoint save completed")
-                except Exception as e:  # noqa: BLE001
-                    logger.warning(f"Final full drafter checkpoint save failed: {e}")
-                self._pending_full_checkpoint_future = None
-
         if self.optimizer is not None:
             try:
                 self.optimizer.zero_grad(set_to_none=True)
