@@ -125,6 +125,9 @@ class DrafterTrainingConfig(BaseConfig):
     dflash_block_size: int = 16
     dflash_num_anchors: int = 512
     dflash_loss_decay_gamma: float = 7.0
+    dflash_front_position_weight: float = 1.0
+    dflash_front_position_count: int = 0
+    dflash_hard_sample_ratio: float = 0.0
     dflash_hidden_size: Optional[int] = None
     dflash_num_target_layers: int = 5
     dflash_num_hidden_layers: int = 1
@@ -180,6 +183,12 @@ class DrafterTrainingConfig(BaseConfig):
             raise ValueError("`dflash_loss_mode` must be one of 'full_vocab', 'restricted_ce', or 'sampled_ce'.")
         if self.dflash_sampled_ce_negatives < 0:
             raise ValueError("`dflash_sampled_ce_negatives` must be non-negative.")
+        if self.dflash_front_position_weight <= 0:
+            raise ValueError("`dflash_front_position_weight` must be positive.")
+        if self.dflash_front_position_count < 0:
+            raise ValueError("`dflash_front_position_count` must be non-negative.")
+        if self.dflash_hard_sample_ratio < 0 or self.dflash_hard_sample_ratio > 1:
+            raise ValueError("`dflash_hard_sample_ratio` must be in [0, 1].")
 
 
 @dataclass

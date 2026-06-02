@@ -74,6 +74,8 @@ class DFlashTrainingModel(nn.Module):
         block_size: int = 16,
         num_anchors: int = 512,
         loss_decay_gamma: float = 7.0,
+        front_position_weight: float = 1.0,
+        front_position_count: int = 0,
         loss_mode: str = "full_vocab",
         sampled_ce_negatives: int = 0,
     ):
@@ -83,6 +85,8 @@ class DFlashTrainingModel(nn.Module):
         self.block_size = block_size
         self.num_anchors = num_anchors
         self.loss_decay_gamma = loss_decay_gamma
+        self.front_position_weight = float(front_position_weight)
+        self.front_position_count = max(int(front_position_count), 0)
         self.loss_mode = str(loss_mode or "full_vocab")
         self.sampled_ce_negatives = max(int(sampled_ce_negatives), 0)
         self._tensor_template_cache: dict[tuple, torch.Tensor] = {}
@@ -227,6 +231,15 @@ class DFlashTrainingModel(nn.Module):
         if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
             decay_weights = self._cached_decay_weights(device)
             weight_mask = weight_mask * decay_weights
+        if self.front_position_count > 0 and self.front_position_weight != 1.0:
+            front_count = min(self.front_position_count, self.block_size)
+            front_mask = (pos_in_block > 0) & (pos_in_block <= front_count)
+            front_weights = torch.where(
+                front_mask,
+                torch.full((), self.front_position_weight, dtype=weight_mask.dtype, device=device),
+                torch.ones((), dtype=weight_mask.dtype, device=device),
+            )
+            weight_mask = weight_mask * front_weights
 
         flat_targets = target_ids.view(-1)
         flat_weights = weight_mask.view(-1)
@@ -606,6 +619,8 @@ class DFlashTrainerBackend:
             block_size=int(training_cfg.get("dflash_block_size", 16)),
             num_anchors=int(training_cfg.get("dflash_num_anchors", 512)),
             loss_decay_gamma=float(training_cfg.get("dflash_loss_decay_gamma", 7.0)),
+            front_position_weight=float(training_cfg.get("dflash_front_position_weight", 1.0)),
+            front_position_count=int(training_cfg.get("dflash_front_position_count", 0)),
             loss_mode=str(training_cfg.get("dflash_loss_mode", "full_vocab")),
             sampled_ce_negatives=int(training_cfg.get("dflash_sampled_ce_negatives", 0)),
         ), drafter_config

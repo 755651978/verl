@@ -503,6 +503,9 @@ drafter:
     dflash_block_size: 16
     dflash_num_anchors: 512
     dflash_loss_decay_gamma: 7.0
+    dflash_front_position_weight: 1.0
+    dflash_front_position_count: 0
+    dflash_hard_sample_ratio: 0.0
     dflash_hidden_size: null
     dflash_num_target_layers: 5
     dflash_num_hidden_layers: 1

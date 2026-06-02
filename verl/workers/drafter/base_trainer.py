@@ -201,6 +201,26 @@ def _batch_item_int(value: Any, index: int = 0) -> int | None:
         return None
 
 
+def _batch_item_float(value: Any, index: int = 0) -> float | None:
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        if value.numel() == 0:
+            return None
+        flat = value.detach().view(-1).float().cpu()
+        index = min(max(int(index), 0), flat.numel() - 1)
+        return float(flat[index].item())
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return None
+        index = min(max(int(index), 0), len(value) - 1)
+        value = value[index]
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _tensor_sum_int(tensor: torch.Tensor) -> int:
     return int(tensor.detach().float().sum().cpu().item())
 
@@ -1457,6 +1477,16 @@ class DrafterBaseTrainer:
                 if kept_hidden_positions is not None
                 else torch.arange(feature_start + 1, feature_start + 1 + hidden_feature_length, dtype=torch.long)
             )
+            accept_len = _batch_item_float(batch.get("accept_lens"), i)
+            if accept_len is None:
+                num_correct = _batch_item_float(batch.get("num_correct_drafts_per_req_cpu"), i)
+                if num_correct is not None:
+                    accept_len = max(num_correct + 1.0, 1.0)
+            accept_rate = None
+            if accept_len is not None:
+                verify_tokens = int(self.config.rollout.drafter.rollout.get("spec_verify_tokens", 0) or 0)
+                if verify_tokens > 0:
+                    accept_rate = accept_len / float(verify_tokens)
 
             data_item = {
                 "input_ids": cpu_input_ids[i, feature_start:feature_end],
@@ -1496,6 +1526,8 @@ class DrafterBaseTrainer:
                 ),
                 "_verl_prompt_len": prompt_len if cpu_prompts is not None else None,
                 "_verl_response_len": response_len if cpu_responses is not None else None,
+                "_verl_accept_len": accept_len,
+                "_verl_accept_rate": accept_rate,
                 "_verl_input_seq_length": input_seq_length,
                 "hidden_lm_head_fingerprint": batch.get("hidden_lm_head_fingerprint"),
                 "hidden_last_hidden_logprob_check": batch.get("hidden_last_hidden_logprob_check"),
@@ -1704,6 +1736,90 @@ class DrafterBaseTrainer:
         self._alignment_debug_counts[stage] = sample_index + 1
         return sample_index
 
+    @staticmethod
+    def _item_float(item: dict[str, Any], keys: tuple[str, ...]) -> Optional[float]:
+        for key in keys:
+            value = item.get(key)
+            if torch.is_tensor(value):
+                if value.numel() != 1:
+                    continue
+                value = value.detach().float().cpu().item()
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def _dflash_hard_sample_score(self, item: dict[str, Any]) -> Optional[float]:
+        """Return a larger-is-harder score for DFlash sample selection."""
+        explicit_score = self._item_float(
+            item,
+            (
+                "_verl_dflash_hard_score",
+                "dflash_hard_score",
+                "_verl_sample_loss",
+                "sample_loss",
+            ),
+        )
+        if explicit_score is not None:
+            return explicit_score
+
+        accept_len = self._item_float(
+            item,
+            (
+                "_verl_accept_len",
+                "accept_len",
+                "accepted_len",
+                "num_correct_drafts",
+                "num_correct_drafts_per_req",
+            ),
+        )
+        if accept_len is not None:
+            return -accept_len
+
+        accept_rate = self._item_float(item, ("_verl_accept_rate", "accept_rate"))
+        if accept_rate is not None:
+            return -accept_rate
+
+        return None
+
+    def _sample_training_items(
+        self,
+        available_data: list[dict[str, Any]],
+        batch_size: int,
+        rng: random.Random,
+    ) -> list[dict[str, Any]]:
+        if len(available_data) <= batch_size:
+            return list(available_data)
+
+        hard_ratio = float(self.config.rollout.drafter.training.get("dflash_hard_sample_ratio", 0.0) or 0.0)
+        if self.backend.model_type != "dflash" or hard_ratio <= 0:
+            return rng.sample(available_data, batch_size)
+
+        hard_count = min(batch_size, max(0, round(batch_size * hard_ratio)))
+        scored: list[tuple[float, float, dict[str, Any]]] = []
+        for item in available_data:
+            score = self._dflash_hard_sample_score(item)
+            if score is not None:
+                scored.append((score, rng.random(), item))
+
+        selected: list[dict[str, Any]] = []
+        if hard_count > 0 and scored:
+            scored.sort(key=lambda entry: (entry[0], entry[1]), reverse=True)
+            hard_pool_size = min(len(scored), max(hard_count, hard_count * 4))
+            hard_pool = [entry[2] for entry in scored[:hard_pool_size]]
+            selected.extend(rng.sample(hard_pool, min(hard_count, len(hard_pool))))
+
+        selected_ids = {id(item) for item in selected}
+        remaining = [item for item in available_data if id(item) not in selected_ids]
+        random_count = batch_size - len(selected)
+        if random_count > 0:
+            selected.extend(rng.sample(remaining, min(random_count, len(remaining))))
+
+        return selected
+
     def _prepare_training_batch(
         self, buffer_steps: int = 2
     ) -> Optional[dict[str, torch.Tensor]]:
@@ -1743,7 +1859,11 @@ class DrafterBaseTrainer:
             else:
                 # Randomly sample from available data to ensure diversity
                 rng = random.Random((int(self.current_rl_step) << 16) + int(self.training_steps))
-                items = rng.sample(available_data, min(len(available_data), effective_batch_size))
+                items = self._sample_training_items(
+                    available_data,
+                    min(len(available_data), effective_batch_size),
+                    rng,
+                )
         else:
             # Fall back to current step data only. collected_data can contain
             # older rollout steps when drafter training is triggered sparsely.
@@ -1757,7 +1877,7 @@ class DrafterBaseTrainer:
                     return None
             else:
                 rng = random.Random((current_step << 16) + int(self.training_steps))
-                items = rng.sample(current_step_data, effective_batch_size)
+                items = self._sample_training_items(current_step_data, effective_batch_size, rng)
 
         # Filter out items without the tensors required by the selected loss path.
         items = [item for item in items if "hidden_states" in item]
