@@ -1433,45 +1433,7 @@ class DrafterBaseTrainer:
             )
             hidden_raw_target_logprobs_item = None
             if cpu_hidden_raw_target_logprobs is not None:
-                raw_target_logprobs_item = cpu_hidden_raw_target_logprobs[i]
-                raw_rows = int(raw_target_logprobs_item.size(0))
-                raw_position_start = _batch_item_int(batch.get("hidden_raw_target_logprobs_position_start"), i)
-                raw_position_end = _batch_item_int(batch.get("hidden_raw_target_logprobs_position_end"), i)
-                if raw_position_start is None:
-                    raw_position_start = hidden_position_start
-                if raw_position_end is None:
-                    raw_position_end = raw_position_start + raw_rows
-                raw_position_end = min(
-                    max(raw_position_end, raw_position_start),
-                    raw_position_start + raw_rows,
-                )
-                if raw_target_logprobs_item.dim() == 3 and hidden_feature_length > 0:
-                    raw_target_logprobs_item = raw_target_logprobs_item[
-                        : max(raw_position_end - raw_position_start, 0)
-                    ]
-                    row_positions = (
-                        kept_hidden_positions.long()
-                        if kept_hidden_positions is not None
-                        else torch.arange(feature_start, feature_start + hidden_feature_length, dtype=torch.long)
-                    )
-                    hidden_raw_target_logprobs_item = torch.zeros(
-                        hidden_feature_length,
-                        raw_target_logprobs_item.size(1),
-                        raw_target_logprobs_item.size(2),
-                        dtype=raw_target_logprobs_item.dtype,
-                    )
-                    hidden_raw_target_logprobs_item[..., 0] = float("-inf")
-                    if int(hidden_raw_target_logprobs_item.size(-1)) > 1:
-                        hidden_raw_target_logprobs_item[..., 1] = -1
-                    valid_raw_rows = (row_positions >= raw_position_start) & (row_positions < raw_position_end)
-                    if bool(valid_raw_rows.any()):
-                        local_rows = torch.nonzero(valid_raw_rows, as_tuple=False).flatten()
-                        raw_indices = (row_positions[local_rows] - raw_position_start).long()
-                        in_bounds = raw_indices < int(raw_target_logprobs_item.size(0))
-                        if bool(in_bounds.any()):
-                            hidden_raw_target_logprobs_item[local_rows[in_bounds]] = raw_target_logprobs_item[
-                                raw_indices[in_bounds]
-                            ]
+                hidden_raw_target_logprobs_item = cpu_hidden_raw_target_logprobs[i, hidden_start:hidden_end, ...]
             item_position_ids = (
                 kept_hidden_positions + 1
                 if kept_hidden_positions is not None
@@ -1514,16 +1476,6 @@ class DrafterBaseTrainer:
                 ),
                 "_verl_target_tensor_position_start": target_logprobs_position_start,
                 "_verl_target_tensor_position_end": target_logprobs_position_end,
-                "_verl_hidden_raw_target_position_start": (
-                    _batch_item_int(batch.get("hidden_raw_target_logprobs_position_start"), i)
-                    if cpu_hidden_raw_target_logprobs is not None
-                    else None
-                ),
-                "_verl_hidden_raw_target_position_end": (
-                    _batch_item_int(batch.get("hidden_raw_target_logprobs_position_end"), i)
-                    if cpu_hidden_raw_target_logprobs is not None
-                    else None
-                ),
                 "_verl_prompt_len": prompt_len if cpu_prompts is not None else None,
                 "_verl_response_len": response_len if cpu_responses is not None else None,
                 "_verl_accept_len": accept_len,

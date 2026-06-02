@@ -1162,8 +1162,6 @@ class SGLangHttpServer:
             hidden_target_logprobs_source = None
             hidden_raw_topk_logprob_check = None
             hidden_raw_target_logprobs = None
-            hidden_raw_target_logprobs_position_start = None
-            hidden_raw_target_logprobs_position_end = None
             hidden_last_hidden_filter = None
             hidden_last_hidden_select = None
             hidden_positions = None
@@ -1244,10 +1242,7 @@ class SGLangHttpServer:
                         hidden_raw_target_logprobs = torch.cat(raw_target_logprob_chunks, dim=0).contiguous()
                         raw_target_rows = int(hidden_raw_target_logprobs.size(0))
                         raw_rows_match_hidden = raw_target_rows == hidden_raw_len
-                        raw_rows_match_eagle_shift = (
-                            _drafter_uses_eagle_last_hidden(self.config.drafter)
-                            and raw_target_rows == max(hidden_raw_len - 1, 0)
-                        )
+                        raw_rows_match_eagle_shift = collect_target_logprobs and raw_target_rows == max(hidden_raw_len - 1, 0)
                         if not (raw_rows_match_hidden or raw_rows_match_eagle_shift):
                             logger.warning(
                                 "Drop raw top-k debug metadata with mismatched rows: raw_rows=%s hidden_rows=%s",
@@ -1259,19 +1254,11 @@ class SGLangHttpServer:
                                 hidden_target_logprobs_source = None
                             hidden_raw_topk_logprob_check = None
                         elif hidden_raw_target_logprobs.dim() == 3 and int(hidden_raw_target_logprobs.size(0)) > 0:
-                            raw_position_offset = 0 if raw_rows_match_hidden else 1
-                            hidden_raw_target_logprobs_position_start = int(hidden_position_start) + raw_position_offset
-                            hidden_raw_target_logprobs_position_end = (
-                                hidden_raw_target_logprobs_position_start + raw_target_rows
-                            )
                             hidden_raw_topk_logprob_check = {
                                 "target_logprobs_source": "raw_hidden_metadata",
                                 "shape": tuple(hidden_raw_target_logprobs.shape),
                                 "rows": raw_target_rows,
                                 "topk": int(hidden_raw_target_logprobs.size(1)),
-                                "position_start": hidden_raw_target_logprobs_position_start,
-                                "position_end": hidden_raw_target_logprobs_position_end,
-                                "position_offset": raw_position_offset,
                                 "top1_ids_head": [
                                     int(x)
                                     for x in hidden_raw_target_logprobs[
@@ -1375,8 +1362,6 @@ class SGLangHttpServer:
                         if torch.is_tensor(hidden_raw_target_logprobs)
                         else None
                     ),
-                    "hidden_raw_target_logprobs_position_start": hidden_raw_target_logprobs_position_start,
-                    "hidden_raw_target_logprobs_position_end": hidden_raw_target_logprobs_position_end,
                     "hidden_last_hidden_filter": hidden_last_hidden_filter,
                     "hidden_last_hidden_select": hidden_last_hidden_select,
                     "target_logprobs": target_logprobs.unsqueeze(0).cpu() if target_logprobs is not None else None,
