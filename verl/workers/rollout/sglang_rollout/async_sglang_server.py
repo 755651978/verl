@@ -1055,10 +1055,15 @@ class SGLangHttpServer:
                 elif _drafter_uses_eagle_last_hidden(self.config.drafter):
                     custom_params[_VERL_DRAFTER_RETURN_LAST_HIDDEN_PARAM] = True
             sampling_params["custom_params"] = custom_params
-        sampling_debug = _sampling_params_debug(sampling_params, request, return_logprob)
+        log_generate_debug = bool(
+            self.config.drafter.enable and (alignment_debug_enabled() or logger.isEnabledFor(logging.DEBUG))
+        )
+        sampling_debug = (
+            _sampling_params_debug(sampling_params, request, return_logprob) if log_generate_debug else None
+        )
 
-        if self.config.drafter.enable:
-            logger.warning(
+        if log_generate_debug:
+            logger.debug(
                 "[sglang generate] request_id=%s server_global_steps=%s request_global_steps=%s "
                 "should_collect=%s return_hidden_states=%s drafter_training=%s sampling_debug=%s",
                 request_id,
