@@ -46,6 +46,7 @@ _ALIGNMENT_DEBUG_EVERY_N_STEPS_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_EVERY_N_STEPS
 _ALIGNMENT_DEBUG_MAX_SAMPLES_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_MAX_SAMPLES_PER_STEP"
 _ALIGNMENT_DEBUG_TOKEN_WINDOW_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_TOKEN_WINDOW"
 _ALIGNMENT_DEBUG_RANKS_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_RANKS"
+_LAST_HIDDEN_LOGPROB_CHECK_ENV = "VERL_DRAFTER_LAST_HIDDEN_LOGPROB_CHECK"
 
 
 def _env_flag_enabled(name: str, default: bool = False) -> bool:
@@ -73,6 +74,10 @@ def _env_int(name: str, default: int, minimum: int) -> int:
 
 def alignment_debug_enabled() -> bool:
     return _env_flag_enabled(_ALIGNMENT_DEBUG_ENV, default=False)
+
+
+def last_hidden_logprob_check_enabled() -> bool:
+    return _env_flag_enabled(_LAST_HIDDEN_LOGPROB_CHECK_ENV, default=False)
 
 
 def alignment_debug_every_n_steps() -> int:
@@ -1179,6 +1184,24 @@ class DrafterBaseTrainer:
             None if row0_norm is None else round(float(row0_norm.detach().cpu().item()), 6),
             None if row_last_norm is None else round(float(row_last_norm.detach().cpu().item()), 6),
         )
+        if last_hidden_logprob_check_enabled() and int(target_weight.size(0)) > 0:
+            probe_indices = sorted(
+                {
+                    0,
+                    max(int(target_weight.size(0)) // 2 - 1, 0),
+                    min(int(target_weight.size(0)) // 2, int(target_weight.size(0)) - 1),
+                    int(target_weight.size(0)) - 1,
+                }
+            )
+            probe_norms = {}
+            for row_idx in probe_indices:
+                row_norm = target_weight[row_idx].detach().float().norm()
+                probe_norms[f"row_{row_idx}_norm"] = round(float(row_norm.detach().cpu().item()), 6)
+            logger.warning(
+                "[drafter target lm_head sync debug] global_step=%s probe_norms=%s",
+                self._target_lm_head_weight_step,
+                probe_norms,
+            )
         return True
 
     def _resize_target_lm_head_to_weight(self, lm_head, source_weight: torch.Tensor):
@@ -1433,7 +1456,45 @@ class DrafterBaseTrainer:
             )
             hidden_raw_target_logprobs_item = None
             if cpu_hidden_raw_target_logprobs is not None:
-                hidden_raw_target_logprobs_item = cpu_hidden_raw_target_logprobs[i, hidden_start:hidden_end, ...]
+                raw_target_logprobs_item = cpu_hidden_raw_target_logprobs[i]
+                raw_rows = int(raw_target_logprobs_item.size(0))
+                raw_position_start = _batch_item_int(batch.get("hidden_raw_target_logprobs_position_start"), i)
+                raw_position_end = _batch_item_int(batch.get("hidden_raw_target_logprobs_position_end"), i)
+                if raw_position_start is None:
+                    raw_position_start = hidden_position_start
+                if raw_position_end is None:
+                    raw_position_end = raw_position_start + raw_rows
+                raw_position_end = min(
+                    max(raw_position_end, raw_position_start),
+                    raw_position_start + raw_rows,
+                )
+                if raw_target_logprobs_item.dim() == 3 and hidden_feature_length > 0:
+                    raw_target_logprobs_item = raw_target_logprobs_item[
+                        : max(raw_position_end - raw_position_start, 0)
+                    ]
+                    row_positions = (
+                        kept_hidden_positions.long()
+                        if kept_hidden_positions is not None
+                        else torch.arange(feature_start, feature_start + hidden_feature_length, dtype=torch.long)
+                    )
+                    hidden_raw_target_logprobs_item = torch.zeros(
+                        hidden_feature_length,
+                        raw_target_logprobs_item.size(1),
+                        raw_target_logprobs_item.size(2),
+                        dtype=raw_target_logprobs_item.dtype,
+                    )
+                    hidden_raw_target_logprobs_item[..., 0] = float("-inf")
+                    if int(hidden_raw_target_logprobs_item.size(-1)) > 1:
+                        hidden_raw_target_logprobs_item[..., 1] = -1
+                    valid_raw_rows = (row_positions >= raw_position_start) & (row_positions < raw_position_end)
+                    if bool(valid_raw_rows.any()):
+                        local_rows = torch.nonzero(valid_raw_rows, as_tuple=False).flatten()
+                        raw_indices = (row_positions[local_rows] - raw_position_start).long()
+                        in_bounds = raw_indices < int(raw_target_logprobs_item.size(0))
+                        if bool(in_bounds.any()):
+                            hidden_raw_target_logprobs_item[local_rows[in_bounds]] = raw_target_logprobs_item[
+                                raw_indices[in_bounds]
+                            ]
             item_position_ids = (
                 kept_hidden_positions + 1
                 if kept_hidden_positions is not None
@@ -1476,6 +1537,16 @@ class DrafterBaseTrainer:
                 ),
                 "_verl_target_tensor_position_start": target_logprobs_position_start,
                 "_verl_target_tensor_position_end": target_logprobs_position_end,
+                "_verl_hidden_raw_target_position_start": (
+                    _batch_item_int(batch.get("hidden_raw_target_logprobs_position_start"), i)
+                    if cpu_hidden_raw_target_logprobs is not None
+                    else None
+                ),
+                "_verl_hidden_raw_target_position_end": (
+                    _batch_item_int(batch.get("hidden_raw_target_logprobs_position_end"), i)
+                    if cpu_hidden_raw_target_logprobs is not None
+                    else None
+                ),
                 "_verl_prompt_len": prompt_len if cpu_prompts is not None else None,
                 "_verl_response_len": response_len if cpu_responses is not None else None,
                 "_verl_accept_len": accept_len,
@@ -1539,6 +1610,10 @@ class DrafterBaseTrainer:
                             "hidden_target_logprobs_source": data_item.get("hidden_target_logprobs_source"),
                             "hidden_raw_topk_logprob_check": data_item.get("hidden_raw_topk_logprob_check"),
                             "hidden_raw_target_shape": _tensor_shape(data_item.get("hidden_raw_target_logprobs")),
+                            "hidden_raw_target_position_start": data_item.get(
+                                "_verl_hidden_raw_target_position_start"
+                            ),
+                            "hidden_raw_target_position_end": data_item.get("_verl_hidden_raw_target_position_end"),
                             "hidden_last_hidden_filter": data_item.get("hidden_last_hidden_filter"),
                             "hidden_last_hidden_select": data_item.get("hidden_last_hidden_select"),
                             "item_global_step": data_item.get("global_step"),
@@ -2045,6 +2120,12 @@ class DrafterBaseTrainer:
                             "hidden_target_logprobs_source": source_item.get("hidden_target_logprobs_source"),
                             "hidden_raw_topk_logprob_check": source_item.get("hidden_raw_topk_logprob_check"),
                             "hidden_raw_target_shape": _tensor_shape(source_item.get("hidden_raw_target_logprobs")),
+                            "hidden_raw_target_position_start": source_item.get(
+                                "_verl_hidden_raw_target_position_start"
+                            ),
+                            "hidden_raw_target_position_end": source_item.get(
+                                "_verl_hidden_raw_target_position_end"
+                            ),
                             "hidden_last_hidden_filter": source_item.get("hidden_last_hidden_filter"),
                             "hidden_last_hidden_select": source_item.get("hidden_last_hidden_select"),
                             "target_lm_head_weight_step": getattr(self, "_target_lm_head_weight_step", None),

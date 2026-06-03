@@ -1646,6 +1646,7 @@ def _attach_sglang_lm_head_fingerprint(logits_output, lm_head) -> None:
                 "device": str(weight.device),
                 "block_sum": float(block.sum().detach().cpu().item()),
                 "row0_norm": None if row0_norm is None else float(row0_norm.detach().cpu().item()),
+                "row_last_index": int(weight.shape[0]) - 1,
                 "row_last_norm": None if row_last_norm is None else float(row_last_norm.detach().cpu().item()),
             },
         )
