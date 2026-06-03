@@ -1469,14 +1469,6 @@ class DrafterBaseTrainer:
                     raw_position_start + raw_rows,
                 )
                 if raw_target_logprobs_item.dim() == 3 and hidden_feature_length > 0:
-                    raw_target_logprobs_item = raw_target_logprobs_item[
-                        : max(raw_position_end - raw_position_start, 0)
-                    ]
-                    row_positions = (
-                        kept_hidden_positions.long()
-                        if kept_hidden_positions is not None
-                        else torch.arange(feature_start, feature_start + hidden_feature_length, dtype=torch.long)
-                    )
                     hidden_raw_target_logprobs_item = torch.zeros(
                         hidden_feature_length,
                         raw_target_logprobs_item.size(1),
@@ -1486,15 +1478,18 @@ class DrafterBaseTrainer:
                     hidden_raw_target_logprobs_item[..., 0] = float("-inf")
                     if int(hidden_raw_target_logprobs_item.size(-1)) > 1:
                         hidden_raw_target_logprobs_item[..., 1] = -1
-                    valid_raw_rows = (row_positions >= raw_position_start) & (row_positions < raw_position_end)
-                    if bool(valid_raw_rows.any()):
-                        local_rows = torch.nonzero(valid_raw_rows, as_tuple=False).flatten()
-                        raw_indices = (row_positions[local_rows] - raw_position_start).long()
-                        in_bounds = raw_indices < int(raw_target_logprobs_item.size(0))
-                        if bool(in_bounds.any()):
-                            hidden_raw_target_logprobs_item[local_rows[in_bounds]] = raw_target_logprobs_item[
-                                raw_indices[in_bounds]
-                            ]
+                    # SGLang attaches raw top-k rows after applying the same
+                    # accepted-row/window filtering as hidden_states, so the
+                    # tensor is row-aligned with hidden_states. Do not remap it
+                    # as a dense absolute-position tensor; accepted positions
+                    # can be non-contiguous.
+                    raw_slice_start = min(max(int(hidden_start), 0), raw_rows)
+                    raw_slice_end = min(max(int(hidden_end), raw_slice_start), raw_rows)
+                    copy_rows = min(raw_slice_end - raw_slice_start, hidden_feature_length)
+                    if copy_rows > 0:
+                        hidden_raw_target_logprobs_item[:copy_rows] = raw_target_logprobs_item[
+                            raw_slice_start : raw_slice_start + copy_rows
+                        ]
             item_position_ids = (
                 kept_hidden_positions + 1
                 if kept_hidden_positions is not None
