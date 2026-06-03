@@ -158,55 +158,126 @@ def _log_eagle3_raw_topk_check(
         return
     try:
         with torch.no_grad():
-            rows = min(int(last_h_states.size(0)), int(raw_target_logprobs.size(0)), 128)
-            if rows <= 0:
-                return
+            max_rows = 128
             target_device = next(target_model.parameters()).device
-            check_hidden = last_h_states[:rows].to(device=target_device)
-            target_scores = target_model(check_hidden).float()
-            raw_top1_ids = raw_target_logprobs[:rows, 0, 1].to(device=target_scores.device, dtype=torch.long)
-            raw_top1_logprobs = raw_target_logprobs[:rows, 0, 0].to(device=target_scores.device, dtype=torch.float32)
-            local_raw_top1_ids = raw_top1_ids
-            mapped_vocab = False
-            if target_token_to_local is not None and int(target_scores.size(-1)) < int(target_token_to_local.numel()):
-                target_token_to_local = target_token_to_local.to(device=target_scores.device, dtype=torch.long)
-                in_vocab = (raw_top1_ids >= 0) & (raw_top1_ids < int(target_token_to_local.numel()))
-                local_raw_top1_ids = torch.full_like(raw_top1_ids, -1)
-                local_raw_top1_ids[in_vocab] = target_token_to_local[raw_top1_ids[in_vocab]]
-                mapped_vocab = True
-            valid = (local_raw_top1_ids >= 0) & (local_raw_top1_ids < int(target_scores.size(-1)))
-            if not bool(valid.any()):
+            target_token_to_local_device = (
+                target_token_to_local.to(device=target_device, dtype=torch.long)
+                if target_token_to_local is not None
+                else None
+            )
+
+            def _evaluate_shift(hidden_start: int, raw_start: int) -> dict | None:
+                rows = min(
+                    int(last_h_states.size(0)) - hidden_start,
+                    int(raw_target_logprobs.size(0)) - raw_start,
+                    max_rows,
+                )
+                if rows <= 0:
+                    return None
+
+                check_hidden = last_h_states[hidden_start : hidden_start + rows].to(device=target_device)
+                target_scores = target_model(check_hidden).float()
+                raw_slice = raw_target_logprobs[raw_start : raw_start + rows]
+                raw_top1_ids = raw_slice[:, 0, 1].to(device=target_scores.device, dtype=torch.long)
+                raw_top1_logprobs = raw_slice[:, 0, 0].to(device=target_scores.device, dtype=torch.float32)
+
+                local_raw_top1_ids = raw_top1_ids
+                mapped_vocab = False
+                if target_token_to_local_device is not None and int(target_scores.size(-1)) < int(
+                    target_token_to_local_device.numel()
+                ):
+                    in_vocab = (raw_top1_ids >= 0) & (raw_top1_ids < int(target_token_to_local_device.numel()))
+                    local_raw_top1_ids = torch.full_like(raw_top1_ids, -1)
+                    local_raw_top1_ids[in_vocab] = target_token_to_local_device[raw_top1_ids[in_vocab]]
+                    mapped_vocab = True
+
+                valid = (
+                    (local_raw_top1_ids >= 0)
+                    & (local_raw_top1_ids < int(target_scores.size(-1)))
+                    & torch.isfinite(raw_top1_logprobs)
+                )
+                result = {
+                    "hidden_start": hidden_start,
+                    "raw_start": raw_start,
+                    "rows": rows,
+                    "valid_rows": int(valid.detach().sum().cpu().item()),
+                    "valid_ratio": float(valid.detach().float().mean().cpu().item()),
+                    "target_vocab": int(target_scores.size(-1)),
+                    "mapped_vocab": mapped_vocab,
+                }
+                if not bool(valid.any()):
+                    return result
+
+                target_logprobs = F.log_softmax(target_scores, dim=-1)
+                target_top1_ids = target_logprobs.argmax(dim=-1)
+                row_ids = torch.arange(rows, device=target_scores.device)
+                target_at_raw_top1 = target_logprobs[row_ids[valid], local_raw_top1_ids[valid]]
+                diff = (target_at_raw_top1 - raw_top1_logprobs[valid]).abs()
+                top1_match = (target_top1_ids[valid] == local_raw_top1_ids[valid]).float().mean()
+                result.update(
+                    {
+                        "top1_match": float(top1_match.detach().cpu().item()),
+                        "logprob_abs_diff_mean": float(diff.mean().detach().cpu().item()),
+                    }
+                )
+                return result
+
+            baseline = _evaluate_shift(0, 0)
+            if baseline is None:
+                return
+            if baseline["valid_rows"] <= 0:
                 logger.warning(
                     "[drafter raw topk check] no valid raw ids item_idx=%s rows=%s target_vocab=%s "
                     "raw_shape=%s mapped_vocab=%s",
                     item_idx,
-                    rows,
-                    int(target_scores.size(-1)),
+                    baseline["rows"],
+                    baseline["target_vocab"],
                     tuple(raw_target_logprobs.shape),
-                    mapped_vocab,
+                    baseline["mapped_vocab"],
                 )
                 _RAW_TOPK_DEBUG_LOG_COUNT += 1
                 return
-            target_logprobs = F.log_softmax(target_scores, dim=-1)
-            target_top1_ids = target_logprobs.argmax(dim=-1)
-            row_ids = torch.arange(rows, device=target_scores.device)
-            target_at_raw_top1 = target_logprobs[row_ids[valid], local_raw_top1_ids[valid]]
-            diff = (target_at_raw_top1 - raw_top1_logprobs[valid]).abs()
-            top1_match = (target_top1_ids[valid] == local_raw_top1_ids[valid]).float().mean()
             logger.warning(
                 "[drafter raw topk check] source=%s item_idx=%s rows=%s valid_rows=%s top1_match=%.6f "
                 "valid_ratio=%.6f logprob_abs_diff_mean=%.6g raw_topk=%s mapped_vocab=%s sglang_attach=%s",
                 item.get("hidden_target_logprobs_source"),
                 item_idx,
-                rows,
-                int(valid.detach().sum().cpu().item()),
-                float(top1_match.detach().cpu().item()),
-                float(valid.detach().float().mean().cpu().item()),
-                float(diff.mean().detach().cpu().item()),
+                baseline["rows"],
+                baseline["valid_rows"],
+                baseline.get("top1_match", 0.0),
+                baseline["valid_ratio"],
+                baseline.get("logprob_abs_diff_mean", float("nan")),
                 int(raw_target_logprobs.size(1)),
-                mapped_vocab,
+                baseline["mapped_vocab"],
                 item.get("hidden_raw_topk_logprob_check"),
             )
+            shift_results = []
+            for shift in (-2, -1, 0, 1, 2):
+                # shift means raw_index = hidden_index + shift.
+                hidden_start = max(0, -shift)
+                raw_start = max(0, shift)
+                result = _evaluate_shift(hidden_start, raw_start)
+                if result is None:
+                    continue
+                result["shift"] = shift
+                shift_results.append(result)
+            if shift_results:
+                best = max(
+                    shift_results,
+                    key=lambda x: (
+                        x.get("top1_match", -1.0),
+                        -x.get("logprob_abs_diff_mean", float("inf")),
+                        x.get("valid_rows", 0),
+                    ),
+                )
+                logger.warning(
+                    "[drafter raw topk shift check] item_idx=%s shift_means='raw_index=hidden_index+shift' "
+                    "shifts=%s best=%s sglang_attach=%s",
+                    item_idx,
+                    shift_results,
+                    best,
+                    item.get("hidden_raw_topk_logprob_check"),
+                )
             _RAW_TOPK_DEBUG_LOG_COUNT += 1
     except Exception as exc:  # noqa: BLE001
         logger.warning("[drafter raw topk check] failed: %s", exc)
