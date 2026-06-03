@@ -1259,8 +1259,12 @@ class SGLangHttpServer:
                                 hidden_target_logprobs_source = None
                             hidden_raw_topk_logprob_check = None
                         elif hidden_raw_target_logprobs.dim() == 3 and int(hidden_raw_target_logprobs.size(0)) > 0:
-                            raw_position_offset = 0 if raw_rows_match_hidden else 1
-                            hidden_raw_target_logprobs_position_start = int(hidden_position_start) + raw_position_offset
+                            # Raw SGLang next-token logits are row-aligned with
+                            # hidden row p; that row predicts token p + 1. If
+                            # SGLang returns one fewer raw row, it is the tail
+                            # target row that is missing, not a leading offset.
+                            raw_position_offset = 0
+                            hidden_raw_target_logprobs_position_start = int(hidden_position_start)
                             hidden_raw_target_logprobs_position_end = (
                                 hidden_raw_target_logprobs_position_start + raw_target_rows
                             )
@@ -1272,6 +1276,7 @@ class SGLangHttpServer:
                                 "position_start": hidden_raw_target_logprobs_position_start,
                                 "position_end": hidden_raw_target_logprobs_position_end,
                                 "position_offset": raw_position_offset,
+                                "missing_tail_rows": max(int(hidden_raw_len) - raw_target_rows, 0),
                                 "top1_ids_head": [
                                     int(x)
                                     for x in hidden_raw_target_logprobs[
