@@ -1779,16 +1779,13 @@ def _attach_sglang_raw_top_logprobs(
     try:
         with torch.no_grad():
             source_rows = int(next_token_logits.shape[0])
-            raw_positions = None
-            track_raw_positions = _sglang_last_hidden_logprob_check_enabled()
-            if track_raw_positions:
-                if positions is None:
-                    positions = getattr(logits_metadata, "positions", None)
-                raw_positions = _normalize_sglang_raw_topk_positions(
-                    positions,
-                    source_rows,
-                    device=next_token_logits.device,
-                )
+            if positions is None:
+                positions = getattr(logits_metadata, "positions", None)
+            raw_positions = _normalize_sglang_raw_topk_positions(
+                positions,
+                source_rows,
+                device=next_token_logits.device,
+            )
             if _is_torch_tensor(source_row_indices):
                 source_row_indices = source_row_indices.to(
                     device=next_token_logits.device,
@@ -1799,7 +1796,7 @@ def _attach_sglang_raw_top_logprobs(
                 next_token_logits = next_token_logits[source_row_indices]
                 if _is_torch_tensor(raw_positions):
                     raw_positions = raw_positions[source_row_indices]
-                elif track_raw_positions:
+                else:
                     raw_positions = _normalize_sglang_raw_topk_positions(
                         positions,
                         int(source_row_indices.numel()),
@@ -1825,36 +1822,21 @@ def _attach_sglang_raw_top_logprobs(
             if computed_subset:
                 row_indices = row_indices.to(device=next_token_logits.device, dtype=torch.long)
                 compute_logits = compute_logits[row_indices]
+                if _is_torch_tensor(raw_positions):
+                    raw_positions = raw_positions[row_indices]
 
             sglang_logprobs = torch.nn.functional.log_softmax(compute_logits, dim=-1)
             computed_logprobs, computed_ids = torch.topk(sglang_logprobs, k=raw_topk, dim=-1)
-            if computed_subset:
-                raw_topk_logprobs = torch.full(
-                    (rows, raw_topk),
-                    float("-inf"),
-                    dtype=computed_logprobs.dtype,
-                    device=computed_logprobs.device,
-                )
-                raw_topk_ids = torch.full(
-                    (rows, raw_topk),
-                    -1,
-                    dtype=computed_ids.dtype,
-                    device=computed_ids.device,
-                )
-                raw_topk_logprobs[row_indices] = computed_logprobs
-                raw_topk_ids[row_indices] = computed_ids
-            else:
-                raw_topk_logprobs = computed_logprobs
-                raw_topk_ids = computed_ids
+            raw_topk_logprobs = computed_logprobs
+            raw_topk_ids = computed_ids
             setattr(logits_output, _VERL_DRAFTER_LH_CHECK_RAW_TOPK_IDS_ATTR, raw_topk_ids.detach())
             setattr(logits_output, _VERL_DRAFTER_LH_CHECK_RAW_TOPK_LOGPROBS_ATTR, raw_topk_logprobs.detach())
-            if track_raw_positions:
-                _set_sglang_raw_topk_positions(
-                    logits_output,
-                    raw_positions,
-                    rows,
-                    device=raw_topk_logprobs.device,
-                )
+            _set_sglang_raw_topk_positions(
+                logits_output,
+                raw_positions,
+                int(raw_topk_logprobs.shape[0]),
+                device=raw_topk_logprobs.device,
+            )
             logits_shapes = getattr(logits_output, "_verl_drafter_lh_check_logits_shapes", None)
             if not isinstance(logits_shapes, dict):
                 logits_shapes = {}
@@ -1864,7 +1846,9 @@ def _attach_sglang_raw_top_logprobs(
                     "raw_topk": raw_topk,
                     "raw_topk_source": "next_token_logits",
                     "raw_topk_computed_rows": int(compute_logits.shape[0]),
+                    "raw_topk_stored_rows": int(raw_topk_logprobs.shape[0]),
                     "raw_topk_windowed": bool(computed_subset),
+                    "raw_topk_compact": bool(computed_subset),
                 }
             )
             setattr(logits_output, "_verl_drafter_lh_check_logits_shapes", logits_shapes)
@@ -2995,11 +2979,32 @@ def _sglang_raw_target_logprobs_positions_tensor(logits_output, row_slice=None):
     return raw_positions.detach().to("cpu", dtype=torch.long).reshape(-1).contiguous()
 
 
-def _sglang_debug_row_slice_for_hidden_chunk(logits_output, start: int, end: int, chunk_rows: int):
+def _sglang_debug_row_slice_for_hidden_chunk(logits_output, start: int, end: int, chunk_rows: int, *, positions=None):
     row_slice = slice(start, end)
     raw_topk_logprobs = getattr(logits_output, _VERL_DRAFTER_LH_CHECK_RAW_TOPK_LOGPROBS_ATTR, None)
     if not (_is_torch_tensor(raw_topk_logprobs) and raw_topk_logprobs.dim() > 0):
         return row_slice
+    raw_positions = getattr(logits_output, _VERL_DRAFTER_LH_CHECK_RAW_TOPK_POSITIONS_ATTR, None)
+    if _is_torch_tensor(raw_positions) and positions is not None:
+        try:
+            raw_positions = raw_positions.detach().to(dtype=torch.long).reshape(-1)
+            chunk_positions = (
+                positions.detach().to(device=raw_positions.device, dtype=torch.long).reshape(-1)
+                if _is_torch_tensor(positions)
+                else torch.tensor(list(positions), device=raw_positions.device, dtype=torch.long).reshape(-1)
+            )
+            if int(raw_positions.numel()) == int(raw_topk_logprobs.shape[0]) and int(chunk_positions.numel()) > 0:
+                wanted = set(int(x) for x in chunk_positions.detach().cpu().tolist())
+                selected = [
+                    index
+                    for index, position in enumerate(raw_positions.detach().cpu().tolist())
+                    if int(position) in wanted
+                ]
+                if selected:
+                    return torch.tensor(selected, device=raw_topk_logprobs.device, dtype=torch.long)
+                return slice(0, 0)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to build SGLang raw top-k position selector: %s", exc)
     try:
         raw_rows = int(raw_topk_logprobs.shape[0])
         chunk_rows = int(chunk_rows)
@@ -3047,7 +3052,14 @@ def _raw_topk_metadata_summary(raw_target_logprobs, raw_positions=None) -> dict 
     return summary
 
 
-def _slice_sglang_row_aligned_metadata(metadata: dict | None, start: int, end: int, keep_mask=None) -> dict | None:
+def _slice_sglang_row_aligned_metadata(
+    metadata: dict | None,
+    start: int,
+    end: int,
+    keep_mask=None,
+    *,
+    positions=None,
+) -> dict | None:
     if not isinstance(metadata, dict):
         return metadata
     result = dict(metadata)
@@ -3060,13 +3072,50 @@ def _slice_sglang_row_aligned_metadata(metadata: dict | None, start: int, end: i
                 raw_positions = raw_positions.detach().to("cpu", dtype=torch.long).reshape(-1)
                 if int(raw_positions.numel()) != raw_rows:
                     raw_positions = None
+            raw_indices = None
+            if _is_torch_tensor(raw_positions) and positions is not None:
+                try:
+                    hidden_positions = (
+                        positions.detach().to("cpu", dtype=torch.long).reshape(-1)
+                        if _is_torch_tensor(positions)
+                        else torch.tensor(list(positions), dtype=torch.long).reshape(-1)
+                    )
+                    pos_start = min(max(int(start), 0), int(hidden_positions.numel()))
+                    pos_end = min(max(int(end), pos_start), int(hidden_positions.numel()))
+                    wanted_positions = hidden_positions[pos_start:pos_end]
+                    if _is_torch_tensor(keep_mask):
+                        mask = keep_mask.detach().to("cpu", dtype=torch.bool).reshape(-1)
+                        if int(mask.numel()) == int(wanted_positions.numel()):
+                            wanted_positions = wanted_positions[mask]
+                    raw_index_by_position = {
+                        int(position): raw_index
+                        for raw_index, position in enumerate(raw_positions.tolist())
+                        if int(position) >= 0
+                    }
+                    selected = [
+                        raw_index_by_position[int(position)]
+                        for position in wanted_positions.tolist()
+                        if int(position) in raw_index_by_position
+                    ]
+                    if selected:
+                        raw_indices = torch.tensor(selected, dtype=torch.long)
+                    else:
+                        raw_indices = torch.empty((0,), dtype=torch.long)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Failed to slice raw top-k metadata by positions: %s", exc)
+                    raw_indices = None
             slice_start = min(max(int(start), 0), raw_rows)
             slice_end = min(max(int(end), slice_start), raw_rows)
-            if slice_end > slice_start:
+            if _is_torch_tensor(raw_indices):
+                if int(raw_indices.numel()) > 0:
+                    sliced = raw_target_logprobs[raw_indices]
+                    sliced_positions = raw_positions[raw_indices] if _is_torch_tensor(raw_positions) else None
+                else:
+                    sliced = raw_target_logprobs[:0]
+                    sliced_positions = raw_positions[:0] if _is_torch_tensor(raw_positions) else None
+            elif slice_end > slice_start:
                 sliced = raw_target_logprobs[slice_start:slice_end]
-                sliced_positions = (
-                    raw_positions[slice_start:slice_end] if _is_torch_tensor(raw_positions) else None
-                )
+                sliced_positions = raw_positions[slice_start:slice_end] if _is_torch_tensor(raw_positions) else None
                 if _is_torch_tensor(keep_mask):
                     mask = keep_mask.detach().to(device=sliced.device, dtype=torch.bool).reshape(-1)
                     if int(mask.numel()) != max(int(end) - int(start), 0):
@@ -3078,6 +3127,10 @@ def _slice_sglang_row_aligned_metadata(metadata: dict | None, start: int, end: i
                         sliced = sliced[mask]
                         if _is_torch_tensor(sliced_positions):
                             sliced_positions = sliced_positions[mask.detach().to("cpu")]
+            else:
+                sliced = None
+                sliced_positions = None
+            if _is_torch_tensor(sliced) and int(sliced.shape[0]) > 0:
                 result[_VERL_RAW_TARGET_LOGPROBS_METADATA_KEY] = sliced
                 if _is_torch_tensor(sliced_positions):
                     result[_VERL_RAW_TARGET_LOGPROBS_POSITIONS_METADATA_KEY] = sliced_positions
@@ -3113,18 +3166,16 @@ def _sglang_hidden_debug_metadata(logits_output, row_slice=None, raw_positions=N
         raw_target_logprobs = raw_target_logprobs.detach().to("cpu")
         metadata[_VERL_TARGET_LOGPROBS_SOURCE_METADATA_KEY] = _VERL_TARGET_LOGPROBS_SOURCE_RAW_HIDDEN_METADATA
         metadata[_VERL_RAW_TARGET_LOGPROBS_METADATA_KEY] = raw_target_logprobs
-        normalized_raw_positions = None
-        if _sglang_last_hidden_logprob_check_enabled():
-            normalized_raw_positions = _sglang_raw_target_logprobs_positions_tensor(logits_output, row_slice=row_slice)
-            if not (
-                _is_torch_tensor(normalized_raw_positions)
-                and int(normalized_raw_positions.numel()) == int(raw_target_logprobs.shape[0])
-            ):
-                normalized_raw_positions = _normalize_sglang_raw_topk_positions(
-                    raw_positions,
-                    int(raw_target_logprobs.shape[0]),
-                    device="cpu",
-                )
+        normalized_raw_positions = _sglang_raw_target_logprobs_positions_tensor(logits_output, row_slice=row_slice)
+        if not (
+            _is_torch_tensor(normalized_raw_positions)
+            and int(normalized_raw_positions.numel()) == int(raw_target_logprobs.shape[0])
+        ):
+            normalized_raw_positions = _normalize_sglang_raw_topk_positions(
+                raw_positions,
+                int(raw_target_logprobs.shape[0]),
+                device="cpu",
+            )
         if _is_torch_tensor(normalized_raw_positions):
             metadata[_VERL_RAW_TARGET_LOGPROBS_POSITIONS_METADATA_KEY] = normalized_raw_positions
         raw_summary = _raw_topk_metadata_summary(raw_target_logprobs, normalized_raw_positions)
@@ -3152,12 +3203,14 @@ def _sglang_hidden_debug_metadata_for_req(
 ) -> dict | None:
     if not getattr(req, "return_hidden_states", False):
         return None
-    debug_row_slice = _sglang_debug_row_slice_for_hidden_chunk(logits_output, start, end, chunk_rows)
-    raw_positions = (
-        positions
-        if _sglang_last_hidden_logprob_check_enabled() and positions is not None and int(chunk_rows) > 0
-        else None
+    debug_row_slice = _sglang_debug_row_slice_for_hidden_chunk(
+        logits_output,
+        start,
+        end,
+        chunk_rows,
+        positions=positions,
     )
+    raw_positions = positions if positions is not None and int(chunk_rows) > 0 else None
     return _sglang_hidden_debug_metadata(logits_output, row_slice=debug_row_slice, raw_positions=raw_positions)
 
 
@@ -3251,7 +3304,12 @@ def _append_sglang_hidden_state_chunk_with_budget(
             local_end = int(keep_idx[-1].item()) + 1
             clipped_chunk = _slice_sglang_hidden_chunk(chunk, local_start, local_end)
             clipped_positions = positions[local_start:local_end]
-            clipped_metadata = _slice_sglang_row_aligned_metadata(extra_metadata, local_start, local_end)
+            clipped_metadata = _slice_sglang_row_aligned_metadata(
+                extra_metadata,
+                local_start,
+                local_end,
+                positions=positions,
+            )
             if not bool(keep_mask[local_start:local_end].all()):
                 local_keep_mask = keep_mask[local_start:local_end]
                 clipped_chunk = clipped_chunk[local_keep_mask]
@@ -3261,6 +3319,7 @@ def _append_sglang_hidden_state_chunk_with_budget(
                     local_start,
                     local_end,
                     keep_mask=local_keep_mask,
+                    positions=positions,
                 )
             metadata = {
                 "position_start": int(clipped_positions[0].item()),
@@ -3288,7 +3347,12 @@ def _append_sglang_hidden_state_chunk_with_budget(
         local_start = clipped_start - position_start
         local_end = clipped_end - position_start
         clipped_chunk = _slice_sglang_hidden_chunk(chunk, local_start, local_end)
-        clipped_metadata = _slice_sglang_row_aligned_metadata(extra_metadata, local_start, local_end)
+        clipped_metadata = _slice_sglang_row_aligned_metadata(
+            extra_metadata,
+            local_start,
+            local_end,
+            positions=positions,
+        )
         _append_sglang_hidden_chunk_payload(
             req,
             clipped_chunk,
@@ -3341,6 +3405,7 @@ def _append_sglang_hidden_state_chunk_with_budget(
         extra_metadata,
         0,
         _sglang_hidden_chunk_rows(chunk),
+        positions=positions,
     )
     if positions is not None and int(positions.numel()) > 0:
         metadata = {
