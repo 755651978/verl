@@ -84,6 +84,8 @@ _VERL_DRAFTER_HIDDEN_WINDOW_PARAM = "_verl_drafter_hidden_state_window"
 _VERL_HIDDEN_STATE_FRONT_TOKENS_PARAM = "_verl_hidden_state_front_tokens_per_sample"
 _VERL_HIDDEN_STATE_MAX_ROWS_PARAM = "_verl_hidden_state_max_rows"
 _VERL_HIDDEN_STATE_PROMPT_LEN_PARAM = "_verl_prompt_len"
+_VERL_HIDDEN_STATE_WINDOW_START_PARAM = "_verl_hidden_state_window_start"
+_VERL_HIDDEN_STATE_WINDOW_END_PARAM = "_verl_hidden_state_window_end"
 _VERL_HIDDEN_STATE_METADATA_MARKER = "__verl_hidden_state_metadata__"
 _VERL_HIDDEN_STATES_STREAM_FINAL_ATTR = "_verl_hidden_states_stream_final"
 _VERL_DRAFTER_RETURN_LAST_HIDDEN_PARAM = "_verl_drafter_return_last_hidden"
@@ -2842,6 +2844,22 @@ def _sglang_hidden_window_config(req) -> dict[str, int] | None:
     if not _custom_flag_enabled(custom_params.get(_VERL_DRAFTER_HIDDEN_WINDOW_PARAM, False)):
         return None
 
+    prompt_len = _sglang_req_prompt_len(req)
+    prefix_cache_rows = _sglang_req_hidden_prefix_cache_rows(req)
+    explicit_window_start = _int_or_none(custom_params.get(_VERL_HIDDEN_STATE_WINDOW_START_PARAM))
+    explicit_window_end = _int_or_none(custom_params.get(_VERL_HIDDEN_STATE_WINDOW_END_PARAM))
+    if explicit_window_start is not None and explicit_window_end is not None:
+        window_start = max(int(explicit_window_start), 0)
+        window_end = max(int(explicit_window_end), window_start)
+        if window_end <= window_start:
+            return None
+        return {
+            "prompt_len": prompt_len,
+            "prefix_cache_rows": prefix_cache_rows,
+            "window_start": window_start,
+            "window_end": window_end,
+        }
+
     front_tokens = _positive_int_or_none(custom_params.get(_VERL_HIDDEN_STATE_FRONT_TOKENS_PARAM))
     if front_tokens is None:
         front_tokens = _positive_int_or_none(custom_params.get(_VERL_HIDDEN_STATE_MAX_ROWS_PARAM))
@@ -2850,8 +2868,6 @@ def _sglang_hidden_window_config(req) -> dict[str, int] | None:
     if front_tokens is None:
         return None
 
-    prompt_len = _sglang_req_prompt_len(req)
-    prefix_cache_rows = _sglang_req_hidden_prefix_cache_rows(req)
     window_start = max(prefix_cache_rows, max(prompt_len - 1, 0))
     return {
         "prompt_len": prompt_len,

@@ -74,6 +74,11 @@ _LAST_HIDDEN_LOGPROB_CHECK_ENV = "VERL_DRAFTER_LAST_HIDDEN_LOGPROB_CHECK"
 _VERL_DRAFTER_HIDDEN_WINDOW_PARAM = "_verl_drafter_hidden_state_window"
 _VERL_HIDDEN_STATE_FRONT_TOKENS_PARAM = "_verl_hidden_state_front_tokens_per_sample"
 _VERL_HIDDEN_STATE_PROMPT_LEN_PARAM = "_verl_prompt_len"
+_VERL_HIDDEN_STATE_WINDOW_MODE_PARAM = "_verl_hidden_state_window_mode"
+_VERL_HIDDEN_STATE_WINDOW_START_PARAM = "_verl_hidden_state_window_start"
+_VERL_HIDDEN_STATE_WINDOW_END_PARAM = "_verl_hidden_state_window_end"
+_VERL_HIDDEN_STATE_WINDOW_START_OFFSET_PARAM = "_verl_hidden_state_window_start_offset"
+_VERL_HIDDEN_STATE_WINDOW_MIN_ROWS_PARAM = "_verl_hidden_state_window_min_rows"
 _VERL_DRAFTER_RETURN_LAST_HIDDEN_ENV = "VERL_SGLANG_DRAFTER_RETURN_LAST_HIDDEN"
 _VERL_DRAFTER_RETURN_LAST_HIDDEN_PARAM = "_verl_drafter_return_last_hidden"
 _VERL_DFLASH_RETURN_AUX_HIDDEN_PARAM = "_verl_dflash_return_aux_hidden"
@@ -307,6 +312,122 @@ def _positive_int_or_none(value: Any) -> Optional[int]:
     except (TypeError, ValueError):
         return None
     return value if value > 0 else None
+
+
+def _nonnegative_int(value: Any, default: int = 0) -> int:
+    try:
+        return max(int(value), 0)
+    except (TypeError, ValueError):
+        return max(int(default), 0)
+
+
+def _hidden_state_window_mode(training_cfg) -> str:
+    mode = str(getattr(training_cfg, "hidden_state_window_mode", "random") or "random").strip().lower()
+    return mode if mode in {"front", "random"} else "front"
+
+
+def _deterministic_random_window_offset(
+    *,
+    request_id: str,
+    collection_global_steps: Optional[int],
+    replica_rank: int,
+    prompt_len: int,
+    max_new_tokens: int,
+    max_start_offset: int,
+    seed_by_step: bool,
+) -> int:
+    if max_start_offset <= 0:
+        return 0
+    step_key = collection_global_steps if seed_by_step else "request"
+    seed_material = (
+        f"{step_key}:{replica_rank}:{request_id}:{prompt_len}:{max_new_tokens}:{max_start_offset}"
+    ).encode()
+    seed = int.from_bytes(hashlib.sha256(seed_material).digest()[:8], "little", signed=False)
+    return seed % (max_start_offset + 1)
+
+
+def _build_drafter_hidden_window_plan(
+    *,
+    training_cfg,
+    request_id: str,
+    collection_global_steps: Optional[int],
+    replica_rank: int,
+    prompt_len: int,
+    max_new_tokens: int,
+    front_tokens: Optional[int],
+    tail_tokens: Optional[int],
+) -> dict[str, Any]:
+    mode = _hidden_state_window_mode(training_cfg)
+    if mode == "random":
+        window_size = _positive_int_or_none(
+            getattr(training_cfg, "hidden_state_window_tokens_per_sample", None)
+        )
+        if window_size is None:
+            window_size = front_tokens
+        if window_size is None:
+            window_size = tail_tokens
+        if window_size is None:
+            window_size = max(int(max_new_tokens), 0)
+
+        min_rows = _nonnegative_int(getattr(training_cfg, "hidden_state_window_min_rows", 64), default=64)
+        min_rows = max(min_rows, 1)
+        max_offset_limit = _positive_int_or_none(getattr(training_cfg, "hidden_state_random_max_offset", None))
+        if max_offset_limit is None:
+            max_offset_limit = max(int(max_new_tokens), 0)
+        max_offset_limit = min(max(max_offset_limit, 0), max(int(max_new_tokens), 0))
+
+        target_window_rows = min(int(window_size), max_offset_limit, max(int(max_new_tokens), 0))
+        if max_new_tokens <= 0 or target_window_rows < min_rows:
+            return {
+                "mode": mode,
+                "estimated_rows": 0,
+                "min_rows": min_rows,
+                "skip_reason": "random_window_unavailable",
+            }
+
+        max_start_offset = max(max_offset_limit - target_window_rows, 0)
+        random_offset = _deterministic_random_window_offset(
+            request_id=request_id,
+            collection_global_steps=collection_global_steps,
+            replica_rank=replica_rank,
+            prompt_len=prompt_len,
+            max_new_tokens=max_new_tokens,
+            max_start_offset=max_start_offset,
+            seed_by_step=bool(getattr(training_cfg, "hidden_state_random_seed_by_step", True)),
+        )
+        train_base = max(int(prompt_len) - 1, 0)
+        window_start = train_base + random_offset
+        window_end_offset = random_offset + target_window_rows
+        window_end = train_base + window_end_offset
+        estimated_rows = max(window_end - window_start, 0)
+        if estimated_rows <= 0:
+            return {
+                "mode": mode,
+                "estimated_rows": 0,
+                "min_rows": min_rows,
+                "skip_reason": "random_window_empty",
+            }
+        return {
+            "mode": mode,
+            "estimated_rows": estimated_rows,
+            "min_rows": min_rows,
+            "window_start": window_start,
+            "window_end": window_end,
+            "window_start_offset": random_offset,
+            "window_size": int(window_size),
+            "target_window_rows": target_window_rows,
+        }
+
+    return {
+        "mode": "front",
+        "estimated_rows": _expected_collected_hidden_rows(
+            prompt_len,
+            max_new_tokens,
+            front_tokens,
+            tail_tokens,
+        ),
+        "min_rows": 0,
+    }
 
 
 def _select_drafter_hidden_state_window(
@@ -1021,18 +1142,24 @@ class SGLangHttpServer:
                     if front_hidden_tokens is not None
                     else dflash_max_window
                 )
-        estimated_hidden_rows = _expected_collected_hidden_rows(
-            len(prompt_ids),
-            max_new_tokens,
-            front_hidden_tokens,
-            max_hidden_tokens,
+        hidden_window_plan = _build_drafter_hidden_window_plan(
+            training_cfg=training_cfg,
+            request_id=request_id,
+            collection_global_steps=collection_global_steps,
+            replica_rank=self.replica_rank,
+            prompt_len=len(prompt_ids),
+            max_new_tokens=max_new_tokens,
+            front_tokens=front_hidden_tokens,
+            tail_tokens=max_hidden_tokens,
         )
+        estimated_hidden_rows = int(hidden_window_plan.get("estimated_rows", 0) or 0)
         if (
             self.config.drafter.enable
             and self.config.drafter.enable_drafter_training
             and self.config.drafter.training.collect_hidden_states_from_sgl
             and collect_this_step
             and not skip_drafter_collection
+            and estimated_hidden_rows > 0
             and self._reserve_drafter_collection_budget(request_id, collection_global_steps, estimated_hidden_rows)
         ):
             should_collect = True
@@ -1045,7 +1172,15 @@ class SGLangHttpServer:
                     _VERL_HIDDEN_STATE_PROMPT_LEN_PARAM: len(prompt_ids),
                 }
             )
-            if front_hidden_tokens is not None:
+            if hidden_window_plan.get("mode") == "random":
+                custom_params[_VERL_HIDDEN_STATE_WINDOW_MODE_PARAM] = "random"
+                custom_params[_VERL_HIDDEN_STATE_WINDOW_START_PARAM] = int(hidden_window_plan["window_start"])
+                custom_params[_VERL_HIDDEN_STATE_WINDOW_END_PARAM] = int(hidden_window_plan["window_end"])
+                custom_params[_VERL_HIDDEN_STATE_WINDOW_START_OFFSET_PARAM] = int(
+                    hidden_window_plan["window_start_offset"]
+                )
+                custom_params[_VERL_HIDDEN_STATE_WINDOW_MIN_ROWS_PARAM] = int(hidden_window_plan["min_rows"])
+            elif front_hidden_tokens is not None:
                 custom_params[_VERL_HIDDEN_STATE_FRONT_TOKENS_PARAM] = int(front_hidden_tokens)
             if _env_flag_enabled(_VERL_DRAFTER_RAW_TOP_LOGPROBS_ENV, default=False):
                 custom_params[_VERL_DRAFTER_RAW_TOP_LOGPROBS_PARAM] = True
@@ -1168,6 +1303,13 @@ class SGLangHttpServer:
             hidden_last_hidden_select = None
             hidden_positions = None
             hidden_crop_mode = "none"
+            hidden_window_mode = str(hidden_window_plan.get("mode", "front") or "front")
+            hidden_window_start = hidden_window_plan.get("window_start")
+            hidden_window_end = hidden_window_plan.get("window_end")
+            hidden_window_start_offset = hidden_window_plan.get("window_start_offset")
+            hidden_window_min_rows = int(hidden_window_plan.get("min_rows", 0) or 0)
+            hidden_window_target_rows = hidden_window_plan.get("target_window_rows")
+            hidden_window_drop_reason = None
             expected_hidden_rows = _expected_full_hidden_rows(len(prompt_ids), len(token_ids))
             hidden_complete = False
             if has_hidden_states:
@@ -1201,8 +1343,8 @@ class SGLangHttpServer:
                         hidden_position_start = int(hidden_positions[0].item())
                         hidden_position_end = int(hidden_positions[-1].item()) + 1
                     hidden_prefix_cache_rows = int(first_metadata.get("prefix_cache_rows", 0))
-                    hidden_window_start = first_metadata.get("window_start")
-                    hidden_window_end = first_metadata.get("window_end")
+                    hidden_window_start = first_metadata.get("window_start", hidden_window_start)
+                    hidden_window_end = first_metadata.get("window_end", hidden_window_end)
                     hidden_lm_head_fingerprint = next(
                         (
                             metadata.get("lm_head_fingerprint")
@@ -1360,37 +1502,49 @@ class SGLangHttpServer:
                     )
                     if target_logprobs is not None:
                         output_top_len = int(target_logprobs.size(0))
-                drafter_sample = {
-                    "input_ids": torch.cat([prompt_tensor, response_tensor], dim=0).unsqueeze(0),
-                    "prompts": prompt_tensor.unsqueeze(0),
-                    "responses": response_tensor.unsqueeze(0),
-                    "hidden_states": hidden_states.unsqueeze(0).cpu(),
-                    "hidden_positions": hidden_positions.unsqueeze(0).cpu() if hidden_positions is not None else None,
-                    "hidden_position_start": hidden_position_start,
-                    "hidden_position_end": hidden_position_end,
-                    "hidden_prefix_cache_rows": hidden_prefix_cache_rows,
-                    "hidden_window_start": hidden_window_start,
-                    "hidden_window_end": hidden_window_end,
-                    "hidden_lm_head_fingerprint": hidden_lm_head_fingerprint,
-                    "hidden_last_hidden_logprob_check": hidden_last_hidden_logprob_check,
-                    "hidden_target_logprobs_source": hidden_target_logprobs_source,
-                    "hidden_raw_topk_logprob_check": hidden_raw_topk_logprob_check,
-                    "hidden_raw_target_logprobs": (
-                        hidden_raw_target_logprobs.unsqueeze(0).cpu()
-                        if torch.is_tensor(hidden_raw_target_logprobs)
-                        else None
-                    ),
-                    "hidden_raw_target_logprobs_position_start": hidden_raw_target_logprobs_position_start,
-                    "hidden_raw_target_logprobs_position_end": hidden_raw_target_logprobs_position_end,
-                    "hidden_last_hidden_filter": hidden_last_hidden_filter,
-                    "hidden_last_hidden_select": hidden_last_hidden_select,
-                    "target_logprobs": target_logprobs.unsqueeze(0).cpu() if target_logprobs is not None else None,
-                    "target_logprobs_position_start": target_logprobs_position_start,
-                    "target_logprobs_position_end": target_logprobs_position_end,
-                    "global_step": collection_global_steps,
-                    "replica_rank": self.replica_rank,
-                }
+                if hidden_window_mode == "random" and hidden_kept_len < hidden_window_min_rows:
+                    hidden_window_drop_reason = "random_window_short"
+                    drafter_sample = None
+                else:
+                    drafter_sample = {
+                        "input_ids": torch.cat([prompt_tensor, response_tensor], dim=0).unsqueeze(0),
+                        "prompts": prompt_tensor.unsqueeze(0),
+                        "responses": response_tensor.unsqueeze(0),
+                        "hidden_states": hidden_states.unsqueeze(0).cpu(),
+                        "hidden_positions": (
+                            hidden_positions.unsqueeze(0).cpu() if hidden_positions is not None else None
+                        ),
+                        "hidden_position_start": hidden_position_start,
+                        "hidden_position_end": hidden_position_end,
+                        "hidden_prefix_cache_rows": hidden_prefix_cache_rows,
+                        "hidden_window_mode": hidden_window_mode,
+                        "hidden_window_start": hidden_window_start,
+                        "hidden_window_end": hidden_window_end,
+                        "hidden_window_start_offset": hidden_window_start_offset,
+                        "hidden_window_min_rows": hidden_window_min_rows,
+                        "hidden_window_target_rows": hidden_window_target_rows,
+                        "hidden_lm_head_fingerprint": hidden_lm_head_fingerprint,
+                        "hidden_last_hidden_logprob_check": hidden_last_hidden_logprob_check,
+                        "hidden_target_logprobs_source": hidden_target_logprobs_source,
+                        "hidden_raw_topk_logprob_check": hidden_raw_topk_logprob_check,
+                        "hidden_raw_target_logprobs": (
+                            hidden_raw_target_logprobs.unsqueeze(0).cpu()
+                            if torch.is_tensor(hidden_raw_target_logprobs)
+                            else None
+                        ),
+                        "hidden_raw_target_logprobs_position_start": hidden_raw_target_logprobs_position_start,
+                        "hidden_raw_target_logprobs_position_end": hidden_raw_target_logprobs_position_end,
+                        "hidden_last_hidden_filter": hidden_last_hidden_filter,
+                        "hidden_last_hidden_select": hidden_last_hidden_select,
+                        "target_logprobs": target_logprobs.unsqueeze(0).cpu() if target_logprobs is not None else None,
+                        "target_logprobs_position_start": target_logprobs_position_start,
+                        "target_logprobs_position_end": target_logprobs_position_end,
+                        "global_step": collection_global_steps,
+                        "replica_rank": self.replica_rank,
+                    }
             else:
+                if hidden_window_mode == "random":
+                    hidden_window_drop_reason = "random_window_not_reached"
                 logger.warning(
                     "[SGLangHttpServer] No valid hidden states returned for drafter sample collection: "
                     "meta_keys=%s hidden_raw_type=%s hidden_raw_len=%s algorithm=%s",
@@ -1414,6 +1568,7 @@ class SGLangHttpServer:
                     and target_logprobs is not None
                     and int(target_logprobs.size(0)) <= 0
                 )
+                or hidden_window_drop_reason is not None
                 or not hidden_complete
             )
             if should_log_alignment(
@@ -1439,8 +1594,13 @@ class SGLangHttpServer:
                         "hidden_prefix_cache_rows": hidden_prefix_cache_rows,
                         "hidden_position_start": hidden_position_start,
                         "hidden_position_end": hidden_position_end,
+                        "hidden_window_mode": hidden_window_mode,
                         "hidden_window_start": hidden_window_start,
                         "hidden_window_end": hidden_window_end,
+                        "hidden_window_start_offset": hidden_window_start_offset,
+                        "hidden_window_min_rows": hidden_window_min_rows,
+                        "hidden_window_target_rows": hidden_window_target_rows,
+                        "hidden_window_drop_reason": hidden_window_drop_reason,
                         "hidden_lm_head_fingerprint": hidden_lm_head_fingerprint,
                         "hidden_last_hidden_logprob_check": hidden_last_hidden_logprob_check,
                         "hidden_target_logprobs_source": hidden_target_logprobs_source,

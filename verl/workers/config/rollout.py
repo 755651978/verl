@@ -89,6 +89,11 @@ class DrafterTrainingConfig(BaseConfig):
     collection_sample_rate: float = 1.0
     max_collect_samples_per_step_per_replica: Optional[int] = 16
     max_collect_tokens_per_step_per_replica: Optional[int] = 8192
+    hidden_state_window_mode: str = "random"
+    hidden_state_window_tokens_per_sample: Optional[int] = None
+    hidden_state_window_min_rows: int = 64
+    hidden_state_random_max_offset: Optional[int] = None
+    hidden_state_random_seed_by_step: bool = True
     hidden_state_front_tokens_per_sample: Optional[int] = 2000
     hidden_state_max_tokens_per_sample: Optional[int] = None
     max_seq_len: int = 8192
@@ -157,6 +162,17 @@ class DrafterTrainingConfig(BaseConfig):
             raise ValueError("`hidden_state_max_tokens_per_sample` must be non-negative or null.")
         if self.hidden_state_front_tokens_per_sample is not None and self.hidden_state_front_tokens_per_sample < 0:
             raise ValueError("`hidden_state_front_tokens_per_sample` must be non-negative or null.")
+        if self.hidden_state_window_mode not in {"front", "random"}:
+            raise ValueError("`hidden_state_window_mode` must be either 'front' or 'random'.")
+        if (
+            self.hidden_state_window_tokens_per_sample is not None
+            and self.hidden_state_window_tokens_per_sample < 0
+        ):
+            raise ValueError("`hidden_state_window_tokens_per_sample` must be non-negative or null.")
+        if self.hidden_state_window_min_rows < 0:
+            raise ValueError("`hidden_state_window_min_rows` must be non-negative.")
+        if self.hidden_state_random_max_offset is not None and self.hidden_state_random_max_offset < 0:
+            raise ValueError("`hidden_state_random_max_offset` must be non-negative or null.")
         if (
             self.logits_coverage_mask_min_ratio is not None
             and (self.logits_coverage_mask_min_ratio < 0 or self.logits_coverage_mask_min_ratio > 1)
