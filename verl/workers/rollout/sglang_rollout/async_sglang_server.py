@@ -1404,9 +1404,12 @@ class SGLangHttpServer:
                         hidden_raw_target_logprobs = torch.cat(raw_target_logprob_chunks, dim=0).contiguous()
                         raw_target_rows = int(hidden_raw_target_logprobs.size(0))
                         raw_target_position_chunks = []
-                        has_raw_position_metadata = any(
-                            torch.is_tensor(metadata.get("raw_target_logprobs_positions"))
-                            for metadata in hidden_states_metadata
+                        has_raw_position_metadata = (
+                            _env_flag_enabled(_LAST_HIDDEN_LOGPROB_CHECK_ENV, default=False)
+                            and any(
+                                torch.is_tensor(metadata.get("raw_target_logprobs_positions"))
+                                for metadata in hidden_states_metadata
+                            )
                         )
                         if has_raw_position_metadata:
                             for metadata in hidden_states_metadata:
