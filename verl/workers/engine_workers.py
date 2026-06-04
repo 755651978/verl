@@ -1090,6 +1090,7 @@ class DrafterWorker(Worker):
                 "hidden_target_logprobs_source",
                 "hidden_raw_topk_logprob_check",
                 "hidden_raw_target_logprobs",
+                "hidden_raw_target_logprobs_positions",
                 "hidden_raw_target_logprobs_position_start",
                 "hidden_raw_target_logprobs_position_end",
                 "hidden_last_hidden_filter",

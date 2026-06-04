@@ -580,6 +580,23 @@ def _hidden_state_metadata_from_chunk(hidden_state_chunk: Any) -> dict[str, int]
                 metadata["raw_target_logprobs"] = raw_tensor.contiguous()
         except Exception:  # noqa: BLE001
             logger.warning("Failed to normalize raw top-k target logprobs metadata; ignoring raw debug top-k")
+    raw_target_logprobs_positions = hidden_state_chunk.get("raw_target_logprobs_positions")
+    if raw_target_logprobs_positions is not None and torch.is_tensor(metadata.get("raw_target_logprobs")):
+        try:
+            if torch.is_tensor(raw_target_logprobs_positions):
+                raw_positions = raw_target_logprobs_positions.detach().to(device="cpu", dtype=torch.long).reshape(-1)
+            else:
+                raw_positions = torch.tensor(list(raw_target_logprobs_positions), dtype=torch.long).reshape(-1)
+            if int(raw_positions.numel()) == int(metadata["raw_target_logprobs"].size(0)):
+                metadata["raw_target_logprobs_positions"] = raw_positions.contiguous()
+            else:
+                logger.warning(
+                    "Ignore raw top-k positions metadata with mismatched rows: positions=%s raw_rows=%s",
+                    int(raw_positions.numel()),
+                    int(metadata["raw_target_logprobs"].size(0)),
+                )
+        except Exception:  # noqa: BLE001
+            logger.warning("Failed to normalize raw top-k positions metadata; ignoring raw debug positions")
     last_hidden_filter = hidden_state_chunk.get("last_hidden_filter")
     if isinstance(last_hidden_filter, dict):
         metadata["last_hidden_filter"] = last_hidden_filter
@@ -1297,6 +1314,7 @@ class SGLangHttpServer:
             hidden_target_logprobs_source = None
             hidden_raw_topk_logprob_check = None
             hidden_raw_target_logprobs = None
+            hidden_raw_target_logprobs_positions = None
             hidden_raw_target_logprobs_position_start = None
             hidden_raw_target_logprobs_position_end = None
             hidden_last_hidden_filter = None
@@ -1385,31 +1403,107 @@ class SGLangHttpServer:
                     if raw_target_logprob_chunks:
                         hidden_raw_target_logprobs = torch.cat(raw_target_logprob_chunks, dim=0).contiguous()
                         raw_target_rows = int(hidden_raw_target_logprobs.size(0))
+                        raw_target_position_chunks = []
+                        has_raw_position_metadata = (
+                            _env_flag_enabled(_LAST_HIDDEN_LOGPROB_CHECK_ENV, default=False)
+                            and any(
+                                torch.is_tensor(metadata.get("raw_target_logprobs_positions"))
+                                for metadata in hidden_states_metadata
+                            )
+                        )
+                        if has_raw_position_metadata:
+                            for metadata in hidden_states_metadata:
+                                raw_chunk = metadata.get("raw_target_logprobs")
+                                if not torch.is_tensor(raw_chunk):
+                                    continue
+                                raw_position_chunk = metadata.get("raw_target_logprobs_positions")
+                                if torch.is_tensor(raw_position_chunk) and int(raw_position_chunk.numel()) == int(
+                                    raw_chunk.size(0)
+                                ):
+                                    raw_target_position_chunks.append(
+                                        raw_position_chunk.reshape(-1).to(dtype=torch.long)
+                                    )
+                                else:
+                                    raw_target_position_chunks.append(
+                                        torch.full((int(raw_chunk.size(0)),), -1, dtype=torch.long)
+                                    )
+                        if raw_target_position_chunks:
+                            hidden_raw_target_logprobs_positions = torch.cat(
+                                raw_target_position_chunks,
+                                dim=0,
+                            ).contiguous()
+                            if int(hidden_raw_target_logprobs_positions.numel()) != raw_target_rows:
+                                logger.warning(
+                                    "Drop raw top-k positions metadata with mismatched rows: positions=%s raw_rows=%s",
+                                    int(hidden_raw_target_logprobs_positions.numel()),
+                                    raw_target_rows,
+                                )
+                                hidden_raw_target_logprobs_positions = None
                         raw_rows_match_hidden = raw_target_rows == hidden_raw_len
                         raw_rows_match_eagle_shift = (
                             (collect_target_logprobs or _drafter_uses_eagle_last_hidden(self.config.drafter))
                             and raw_target_rows == max(hidden_raw_len - 1, 0)
                         )
-                        if not (raw_rows_match_hidden or raw_rows_match_eagle_shift):
+                        raw_rows_have_explicit_positions = (
+                            torch.is_tensor(hidden_raw_target_logprobs_positions)
+                            and int(hidden_raw_target_logprobs_positions.numel()) == raw_target_rows
+                            and bool((hidden_raw_target_logprobs_positions >= 0).any())
+                        )
+                        raw_rows_match_debug_positions = (
+                            not collect_target_logprobs
+                            and raw_rows_have_explicit_positions
+                            and raw_target_rows <= hidden_raw_len
+                        )
+                        if not (raw_rows_match_hidden or raw_rows_match_eagle_shift or raw_rows_match_debug_positions):
                             logger.warning(
                                 "Drop raw top-k debug metadata with mismatched rows: raw_rows=%s hidden_rows=%s",
                                 raw_target_rows,
                                 hidden_raw_len,
                             )
                             hidden_raw_target_logprobs = None
+                            hidden_raw_target_logprobs_positions = None
                             if hidden_target_logprobs_source == "raw_hidden_metadata":
                                 hidden_target_logprobs_source = None
                             hidden_raw_topk_logprob_check = None
                         elif hidden_raw_target_logprobs.dim() == 3 and int(hidden_raw_target_logprobs.size(0)) > 0:
-                            # Raw SGLang next-token logits are row-aligned with
-                            # hidden row p; that row predicts token p + 1. If
-                            # SGLang returns one fewer raw row, it is the tail
-                            # target row that is missing, not a leading offset.
-                            raw_position_offset = 0
-                            hidden_raw_target_logprobs_position_start = int(hidden_position_start)
-                            hidden_raw_target_logprobs_position_end = (
-                                hidden_raw_target_logprobs_position_start + raw_target_rows
-                            )
+                            raw_positions_contiguous = None
+                            raw_position_offset = None
+                            raw_positions_head = None
+                            raw_positions_tail = None
+                            raw_positions_valid = None
+                            if torch.is_tensor(hidden_raw_target_logprobs_positions):
+                                valid_raw_positions = hidden_raw_target_logprobs_positions[
+                                    hidden_raw_target_logprobs_positions >= 0
+                                ]
+                                raw_positions_valid = int(valid_raw_positions.numel())
+                                raw_positions_contiguous = bool(
+                                    int(valid_raw_positions.numel()) <= 1
+                                    or torch.equal(valid_raw_positions[1:], valid_raw_positions[:-1] + 1)
+                                )
+                                if not collect_target_logprobs and int(valid_raw_positions.numel()) > 0:
+                                    hidden_raw_target_logprobs_position_start = int(valid_raw_positions[0].item())
+                                    hidden_raw_target_logprobs_position_end = int(valid_raw_positions[-1].item()) + 1
+                                    raw_position_offset = (
+                                        hidden_raw_target_logprobs_position_start - int(hidden_position_start)
+                                    )
+                                raw_positions_head = [
+                                    int(x)
+                                    for x in hidden_raw_target_logprobs_positions[: min(raw_target_rows, 8)].tolist()
+                                ]
+                                raw_positions_tail = [
+                                    int(x)
+                                    for x in hidden_raw_target_logprobs_positions[-min(raw_target_rows, 8) :].tolist()
+                                ]
+                            if hidden_raw_target_logprobs_position_start is None:
+                                # Legacy fallback for raw metadata produced before
+                                # explicit row positions were attached, and for
+                                # use_logits targets whose compact-row semantics
+                                # must remain unchanged.
+                                raw_position_offset = 0
+                                hidden_raw_target_logprobs_position_start = int(hidden_position_start)
+                                hidden_raw_target_logprobs_position_end = (
+                                    hidden_raw_target_logprobs_position_start + raw_target_rows
+                                )
                             hidden_raw_topk_logprob_check = {
                                 "target_logprobs_source": "raw_hidden_metadata",
                                 "shape": tuple(hidden_raw_target_logprobs.shape),
@@ -1418,7 +1512,21 @@ class SGLangHttpServer:
                                 "position_start": hidden_raw_target_logprobs_position_start,
                                 "position_end": hidden_raw_target_logprobs_position_end,
                                 "position_offset": raw_position_offset,
-                                "missing_tail_rows": max(int(hidden_raw_len) - raw_target_rows, 0),
+                                "positions_len": (
+                                    int(hidden_raw_target_logprobs_positions.numel())
+                                    if torch.is_tensor(hidden_raw_target_logprobs_positions)
+                                    else None
+                                ),
+                                "positions_valid": raw_positions_valid,
+                                "positions_head": raw_positions_head,
+                                "positions_tail": raw_positions_tail,
+                                "positions_contiguous": raw_positions_contiguous,
+                                "missing_raw_rows": max(int(hidden_raw_len) - raw_target_rows, 0),
+                                "missing_tail_rows": (
+                                    max(int(hidden_raw_len) - raw_target_rows, 0)
+                                    if not torch.is_tensor(hidden_raw_target_logprobs_positions)
+                                    else None
+                                ),
                                 "top1_ids_head": [
                                     int(x)
                                     for x in hidden_raw_target_logprobs[
@@ -1532,6 +1640,11 @@ class SGLangHttpServer:
                             if torch.is_tensor(hidden_raw_target_logprobs)
                             else None
                         ),
+                        "hidden_raw_target_logprobs_positions": (
+                            hidden_raw_target_logprobs_positions.unsqueeze(0).cpu()
+                            if torch.is_tensor(hidden_raw_target_logprobs_positions)
+                            else None
+                        ),
                         "hidden_raw_target_logprobs_position_start": hidden_raw_target_logprobs_position_start,
                         "hidden_raw_target_logprobs_position_end": hidden_raw_target_logprobs_position_end,
                         "hidden_last_hidden_filter": hidden_last_hidden_filter,
@@ -1606,6 +1719,7 @@ class SGLangHttpServer:
                         "hidden_target_logprobs_source": hidden_target_logprobs_source,
                         "hidden_raw_topk_logprob_check": hidden_raw_topk_logprob_check,
                         "hidden_raw_target_shape": _tensor_shape(hidden_raw_target_logprobs),
+                        "hidden_raw_target_positions_shape": _tensor_shape(hidden_raw_target_logprobs_positions),
                         "hidden_raw_target_position_start": hidden_raw_target_logprobs_position_start,
                         "hidden_raw_target_position_end": hidden_raw_target_logprobs_position_end,
                         "hidden_last_hidden_filter": hidden_last_hidden_filter,

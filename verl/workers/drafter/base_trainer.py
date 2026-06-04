@@ -1275,6 +1275,11 @@ class DrafterBaseTrainer:
             source_tensors.append(hidden_raw_target_logprobs)
         else:
             hidden_raw_target_logprobs = None
+        hidden_raw_target_logprobs_positions = batch.get("hidden_raw_target_logprobs_positions")
+        if isinstance(hidden_raw_target_logprobs_positions, torch.Tensor):
+            source_tensors.append(hidden_raw_target_logprobs_positions)
+        else:
+            hidden_raw_target_logprobs_positions = None
         if target_logprobs is not None:
             source_tensors.append(target_logprobs)
         if "responses" in batch and batch["responses"] is not None:
@@ -1301,6 +1306,11 @@ class DrafterBaseTrainer:
                     if hidden_raw_target_logprobs is not None
                     else None
                 )
+                cpu_hidden_raw_target_logprobs_positions = (
+                    hidden_raw_target_logprobs_positions.to('cpu', non_blocking=True)
+                    if hidden_raw_target_logprobs_positions is not None
+                    else None
+                )
                 cpu_responses = batch.get("responses").to('cpu', non_blocking=True) if "responses" in batch else None
                 cpu_prompts = batch.get("prompts").to('cpu', non_blocking=True) if "prompts" in batch else None
 
@@ -1312,6 +1322,11 @@ class DrafterBaseTrainer:
             cpu_hidden_positions = hidden_positions.to('cpu') if hidden_positions is not None else None
             cpu_hidden_raw_target_logprobs = (
                 hidden_raw_target_logprobs.to('cpu') if hidden_raw_target_logprobs is not None else None
+            )
+            cpu_hidden_raw_target_logprobs_positions = (
+                hidden_raw_target_logprobs_positions.to('cpu')
+                if hidden_raw_target_logprobs_positions is not None
+                else None
             )
             cpu_responses = batch.get("responses").to('cpu') if "responses" in batch else None
             cpu_prompts = batch.get("prompts").to('cpu') if "prompts" in batch else None
@@ -1455,9 +1470,14 @@ class DrafterBaseTrainer:
                 hidden_positions_item[hidden_start:hidden_end] if hidden_positions_item is not None else None
             )
             hidden_raw_target_logprobs_item = None
+            raw_target_logprobs_positions_item = None
             if cpu_hidden_raw_target_logprobs is not None:
                 raw_target_logprobs_item = cpu_hidden_raw_target_logprobs[i]
                 raw_rows = int(raw_target_logprobs_item.size(0))
+                if cpu_hidden_raw_target_logprobs_positions is not None:
+                    candidate_raw_positions = cpu_hidden_raw_target_logprobs_positions[i].reshape(-1).long()
+                    if int(candidate_raw_positions.numel()) >= raw_rows:
+                        raw_target_logprobs_positions_item = candidate_raw_positions[:raw_rows]
                 raw_position_start = _batch_item_int(batch.get("hidden_raw_target_logprobs_position_start"), i)
                 raw_position_end = _batch_item_int(batch.get("hidden_raw_target_logprobs_position_end"), i)
                 if raw_position_start is None:
@@ -1478,18 +1498,38 @@ class DrafterBaseTrainer:
                     hidden_raw_target_logprobs_item[..., 0] = float("-inf")
                     if int(hidden_raw_target_logprobs_item.size(-1)) > 1:
                         hidden_raw_target_logprobs_item[..., 1] = -1
-                    # SGLang attaches raw top-k rows after applying the same
-                    # accepted-row/window filtering as hidden_states, so the
-                    # tensor is row-aligned with hidden_states. Do not remap it
-                    # as a dense absolute-position tensor; accepted positions
-                    # can be non-contiguous.
-                    raw_slice_start = min(max(int(hidden_start), 0), raw_rows)
-                    raw_slice_end = min(max(int(hidden_end), raw_slice_start), raw_rows)
-                    copy_rows = min(raw_slice_end - raw_slice_start, hidden_feature_length)
-                    if copy_rows > 0:
-                        hidden_raw_target_logprobs_item[:copy_rows] = raw_target_logprobs_item[
-                            raw_slice_start : raw_slice_start + copy_rows
-                        ]
+                    row_positions = (
+                        kept_hidden_positions.long()
+                        if kept_hidden_positions is not None
+                        else torch.arange(feature_start, feature_start + hidden_feature_length, dtype=torch.long)
+                    )
+                    if raw_target_logprobs_positions_item is not None:
+                        raw_index_by_position = {
+                            int(position): raw_index
+                            for raw_index, position in enumerate(raw_target_logprobs_positions_item.tolist())
+                            if int(position) >= 0
+                        }
+                        local_rows = []
+                        raw_indices = []
+                        for local_row, position in enumerate(row_positions.tolist()):
+                            raw_index = raw_index_by_position.get(int(position))
+                            if raw_index is not None:
+                                local_rows.append(local_row)
+                                raw_indices.append(raw_index)
+                        if local_rows:
+                            hidden_raw_target_logprobs_item[torch.tensor(local_rows, dtype=torch.long)] = (
+                                raw_target_logprobs_item[torch.tensor(raw_indices, dtype=torch.long)]
+                            )
+                    else:
+                        # Legacy metadata has no explicit positions. Keep the
+                        # compact row-order fallback for older rollout samples.
+                        raw_slice_start = min(max(int(hidden_start), 0), raw_rows)
+                        raw_slice_end = min(max(int(hidden_end), raw_slice_start), raw_rows)
+                        copy_rows = min(raw_slice_end - raw_slice_start, hidden_feature_length)
+                        if copy_rows > 0:
+                            hidden_raw_target_logprobs_item[:copy_rows] = raw_target_logprobs_item[
+                                raw_slice_start : raw_slice_start + copy_rows
+                            ]
             item_position_ids = (
                 kept_hidden_positions + 1
                 if kept_hidden_positions is not None
@@ -1552,6 +1592,7 @@ class DrafterBaseTrainer:
                 "hidden_target_logprobs_source": batch.get("hidden_target_logprobs_source"),
                 "hidden_raw_topk_logprob_check": batch.get("hidden_raw_topk_logprob_check"),
                 "hidden_raw_target_logprobs": hidden_raw_target_logprobs_item,
+                "hidden_raw_target_logprobs_positions": raw_target_logprobs_positions_item,
                 "hidden_last_hidden_filter": batch.get("hidden_last_hidden_filter"),
                 "hidden_last_hidden_select": batch.get("hidden_last_hidden_select"),
                 "global_step": _batch_item_int(batch.get("global_step"), i),
@@ -1605,6 +1646,9 @@ class DrafterBaseTrainer:
                             "hidden_target_logprobs_source": data_item.get("hidden_target_logprobs_source"),
                             "hidden_raw_topk_logprob_check": data_item.get("hidden_raw_topk_logprob_check"),
                             "hidden_raw_target_shape": _tensor_shape(data_item.get("hidden_raw_target_logprobs")),
+                            "hidden_raw_target_positions_shape": _tensor_shape(
+                                data_item.get("hidden_raw_target_logprobs_positions")
+                            ),
                             "hidden_raw_target_position_start": data_item.get(
                                 "_verl_hidden_raw_target_position_start"
                             ),
@@ -2115,6 +2159,9 @@ class DrafterBaseTrainer:
                             "hidden_target_logprobs_source": source_item.get("hidden_target_logprobs_source"),
                             "hidden_raw_topk_logprob_check": source_item.get("hidden_raw_topk_logprob_check"),
                             "hidden_raw_target_shape": _tensor_shape(source_item.get("hidden_raw_target_logprobs")),
+                            "hidden_raw_target_positions_shape": _tensor_shape(
+                                source_item.get("hidden_raw_target_logprobs_positions")
+                            ),
                             "hidden_raw_target_position_start": source_item.get(
                                 "_verl_hidden_raw_target_position_start"
                             ),
