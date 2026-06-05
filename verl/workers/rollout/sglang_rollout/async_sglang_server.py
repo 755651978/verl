@@ -1480,7 +1480,7 @@ class SGLangHttpServer:
                                     int(valid_raw_positions.numel()) <= 1
                                     or torch.equal(valid_raw_positions[1:], valid_raw_positions[:-1] + 1)
                                 )
-                                if not collect_target_logprobs and int(valid_raw_positions.numel()) > 0:
+                                if raw_positions_contiguous and int(valid_raw_positions.numel()) > 0:
                                     hidden_raw_target_logprobs_position_start = int(valid_raw_positions[0].item())
                                     hidden_raw_target_logprobs_position_end = int(valid_raw_positions[-1].item()) + 1
                                     raw_position_offset = (
@@ -1577,7 +1577,17 @@ class SGLangHttpServer:
                     # supervise token position p + 1, matching the EAGLE shift
                     # used later in collect_online_data().
                     target_logprobs = hidden_raw_target_logprobs
-                    target_logprobs_position_start = int(hidden_position_start) + 1
+                    if (
+                        torch.is_tensor(hidden_raw_target_logprobs_positions)
+                        and hidden_raw_target_logprobs_position_start is not None
+                        and hidden_raw_target_logprobs_position_end is not None
+                        and int(hidden_raw_target_logprobs_position_end)
+                        - int(hidden_raw_target_logprobs_position_start)
+                        == int(target_logprobs.size(0))
+                    ):
+                        target_logprobs_position_start = int(hidden_raw_target_logprobs_position_start) + 1
+                    else:
+                        target_logprobs_position_start = int(hidden_position_start) + 1
                     target_logprobs_position_end = target_logprobs_position_start + int(target_logprobs.size(0))
                     target_logprobs_dropped_rows = 0
                     output_top_len = int(target_logprobs.size(0))

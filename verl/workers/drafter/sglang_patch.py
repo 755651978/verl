@@ -1591,6 +1591,13 @@ def _sglang_logits_output_customized_info(logits_output, create: bool = False):
     return customized_info
 
 
+def _copy_sglang_logits_output_customized_info(logits_output):
+    customized_info = _sglang_logits_output_customized_info(logits_output)
+    if isinstance(customized_info, dict):
+        return dict(customized_info)
+    return customized_info
+
+
 def _get_sglang_drafter_last_hidden_states(logits_output):
     last_hidden_states = getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, None)
     if last_hidden_states is not None:
@@ -1797,7 +1804,9 @@ def _attach_sglang_raw_top_logprobs(
         with torch.no_grad():
             source_rows = int(next_token_logits.shape[0])
             raw_positions = None
-            track_raw_positions = _sglang_last_hidden_logprob_check_enabled()
+            # Raw top-k is a training target when use_logits=True, so row
+            # positions are normal metadata rather than debug-only data.
+            track_raw_positions = True
             if track_raw_positions:
                 if positions is None:
                     positions = getattr(logits_metadata, "positions", None)
@@ -3108,18 +3117,16 @@ def _sglang_hidden_debug_metadata(logits_output, row_slice=None, raw_positions=N
         raw_target_logprobs = raw_target_logprobs.detach().to("cpu")
         metadata[_VERL_TARGET_LOGPROBS_SOURCE_METADATA_KEY] = _VERL_TARGET_LOGPROBS_SOURCE_RAW_HIDDEN_METADATA
         metadata[_VERL_RAW_TARGET_LOGPROBS_METADATA_KEY] = raw_target_logprobs
-        normalized_raw_positions = None
-        if _sglang_last_hidden_logprob_check_enabled():
-            normalized_raw_positions = _sglang_raw_target_logprobs_positions_tensor(logits_output, row_slice=row_slice)
-            if not (
-                _is_torch_tensor(normalized_raw_positions)
-                and int(normalized_raw_positions.numel()) == int(raw_target_logprobs.shape[0])
-            ):
-                normalized_raw_positions = _normalize_sglang_raw_topk_positions(
-                    raw_positions,
-                    int(raw_target_logprobs.shape[0]),
-                    device="cpu",
-                )
+        normalized_raw_positions = _sglang_raw_target_logprobs_positions_tensor(logits_output, row_slice=row_slice)
+        if not (
+            _is_torch_tensor(normalized_raw_positions)
+            and int(normalized_raw_positions.numel()) == int(raw_target_logprobs.shape[0])
+        ):
+            normalized_raw_positions = _normalize_sglang_raw_topk_positions(
+                raw_positions,
+                int(raw_target_logprobs.shape[0]),
+                device="cpu",
+            )
         if _is_torch_tensor(normalized_raw_positions):
             metadata[_VERL_RAW_TARGET_LOGPROBS_POSITIONS_METADATA_KEY] = normalized_raw_positions
         raw_summary = _raw_topk_metadata_summary(raw_target_logprobs, normalized_raw_positions)
@@ -4308,6 +4315,34 @@ def _copy_sglang_drafter_last_hidden_output(src, dst, index) -> None:
             setattr(dst, attr_name, getattr(src, attr_name))
 
 
+def _sglang_drafter_graph_output_needs_metadata_copy(logits_output) -> bool:
+    if logits_output is None:
+        return False
+    if _get_sglang_drafter_last_hidden_states(logits_output) is not None:
+        return True
+    for attr_name in (
+        _VERL_DRAFTER_LH_CHECK_RECOMPUTED_TOP_IDS_ATTR,
+        _VERL_DRAFTER_LH_CHECK_RECOMPUTED_TOP_LOGPROBS_ATTR,
+        _VERL_DRAFTER_LH_CHECK_RECOMPUTED_AT_SGLANG_TOP_ATTR,
+        _VERL_DRAFTER_LH_CHECK_SGLANG_TOP_IDS_ATTR,
+        _VERL_DRAFTER_LH_CHECK_SGLANG_TOP_LOGPROBS_ATTR,
+        _VERL_DRAFTER_LH_CHECK_RAW_TOPK_IDS_ATTR,
+        _VERL_DRAFTER_LH_CHECK_RAW_TOPK_LOGPROBS_ATTR,
+        _VERL_DRAFTER_LH_CHECK_RAW_TOPK_POSITIONS_ATTR,
+    ):
+        if _is_torch_tensor(getattr(logits_output, attr_name, None)):
+            return True
+    for attr_name in (
+        "_verl_drafter_last_hidden_select_summary",
+        "_verl_drafter_lh_check_lm_head_fingerprint",
+        _VERL_DRAFTER_LH_CHECK_SUMMARY_ATTR,
+        _VERL_DRAFTER_LAST_HIDDEN_FILTER_SUMMARY_ATTR,
+    ):
+        if hasattr(logits_output, attr_name):
+            return True
+    return False
+
+
 def _clear_sglang_raw_top_logprobs(logits_output) -> None:
     if logits_output is None:
         return
@@ -4321,6 +4356,19 @@ def _clear_sglang_raw_top_logprobs(logits_output) -> None:
                 delattr(logits_output, attr_name)
         except Exception:  # noqa: BLE001
             setattr(logits_output, attr_name, None)
+
+
+def _ensure_sglang_raw_top_logprobs_for_replay(logits_output, forward_batch) -> None:
+    if logits_output is None:
+        return
+    if _sglang_forward_mode_is_target_verify(forward_batch):
+        _clear_sglang_raw_top_logprobs(logits_output)
+        return
+    if not _sglang_raw_top_logprobs_enabled(forward_batch):
+        return
+    if _is_torch_tensor(getattr(logits_output, _VERL_DRAFTER_LH_CHECK_RAW_TOPK_LOGPROBS_ATTR, None)):
+        return
+    _attach_sglang_raw_top_logprobs(logits_output, forward_batch)
 
 
 def _sglang_graph_replay_output_buffer(runner, original_method, forward_batch=None):
@@ -4373,14 +4421,11 @@ def _make_sglang_drafter_last_hidden_graph_replay_patch(original_method):
         result = original_method(self, *args, **kwargs)
         forward_batch = args[0] if args else kwargs.get("forward_batch")
         output = _sglang_graph_replay_output_buffer(self, original_method, forward_batch)
-        if output is not None:
+        if output is not None and _sglang_drafter_graph_output_needs_metadata_copy(output):
             raw_num_token = getattr(self, "raw_num_token", getattr(self, "raw_num_tokens", None))
             if raw_num_token is not None:
                 _copy_sglang_drafter_last_hidden_output(output, result, slice(0, raw_num_token))
-            if _sglang_forward_mode_is_target_verify(forward_batch):
-                _clear_sglang_raw_top_logprobs(result)
-        if _sglang_raw_top_logprobs_enabled(forward_batch):
-            _attach_sglang_raw_top_logprobs(result, forward_batch)
+        _ensure_sglang_raw_top_logprobs_for_replay(result, forward_batch)
         if output is not None:
             _attach_sglang_last_hidden_logprob_check_from_graph_runner(self, result, forward_batch)
         return result
@@ -4422,13 +4467,16 @@ def _make_sglang_drafter_last_hidden_inline_graph_replay_patch(original_method):
                             if output.hidden_states is not None
                             else None
                         ),
+                        customized_info=_copy_sglang_logits_output_customized_info(output),
                         mm_input_embeds=mm_input_embeds,
                     )
-                    _copy_sglang_drafter_last_hidden_output(
-                        output,
-                        _verl_replay_output,
-                        slice(0, self.raw_num_tokens),
-                    )
+                    if _sglang_drafter_graph_output_needs_metadata_copy(output):
+                        _copy_sglang_drafter_last_hidden_output(
+                            output,
+                            _verl_replay_output,
+                            slice(0, self.raw_num_tokens),
+                        )
+                    _ensure_sglang_raw_top_logprobs_for_replay(_verl_replay_output, forward_batch)
                     return _verl_replay_output
 """,
         ),
@@ -4456,11 +4504,13 @@ def _make_sglang_drafter_last_hidden_inline_graph_replay_patch(original_method):
                         ),
                         mm_input_embeds=mm_input_embeds,
                     )
-                    _copy_sglang_drafter_last_hidden_output(
-                        output,
-                        _verl_replay_output,
-                        slice(0, self.raw_num_tokens),
-                    )
+                    if _sglang_drafter_graph_output_needs_metadata_copy(output):
+                        _copy_sglang_drafter_last_hidden_output(
+                            output,
+                            _verl_replay_output,
+                            slice(0, self.raw_num_tokens),
+                        )
+                    _ensure_sglang_raw_top_logprobs_for_replay(_verl_replay_output, forward_batch)
                     return _verl_replay_output
 """,
         ),
@@ -4482,12 +4532,15 @@ def _make_sglang_drafter_last_hidden_inline_graph_replay_patch(original_method):
                     if output.hidden_states is not None
                     else None
                 ),
+                customized_info=_copy_sglang_logits_output_customized_info(output),
             )
-            _copy_sglang_drafter_last_hidden_output(
-                output,
-                _verl_replay_output,
-                slice(0, self.raw_num_tokens),
-            )
+            if _sglang_drafter_graph_output_needs_metadata_copy(output):
+                _copy_sglang_drafter_last_hidden_output(
+                    output,
+                    _verl_replay_output,
+                    slice(0, self.raw_num_tokens),
+                )
+            _ensure_sglang_raw_top_logprobs_for_replay(_verl_replay_output, forward_batch)
             return _verl_replay_output
 """,
         ),
@@ -4509,11 +4562,13 @@ def _make_sglang_drafter_last_hidden_inline_graph_replay_patch(original_method):
                     else None
                 ),
             )
-            _copy_sglang_drafter_last_hidden_output(
-                output,
-                _verl_replay_output,
-                slice(0, self.raw_num_tokens),
-            )
+            if _sglang_drafter_graph_output_needs_metadata_copy(output):
+                _copy_sglang_drafter_last_hidden_output(
+                    output,
+                    _verl_replay_output,
+                    slice(0, self.raw_num_tokens),
+                )
+            _ensure_sglang_raw_top_logprobs_for_replay(_verl_replay_output, forward_batch)
             return _verl_replay_output
 """,
         ),
@@ -4547,15 +4602,19 @@ def _make_sglang_drafter_last_hidden_inline_graph_replay_patch(original_method):
             f"{indent}        else None\n"
             f"{indent}    ),\n"
         )
+        if "customized_info=output.customized_info" in return_block:
+            replacement += f"{indent}    customized_info=_copy_sglang_logits_output_customized_info(output),\n"
         if "mm_input_embeds=mm_input_embeds" in return_block:
             replacement += f"{indent}    mm_input_embeds=mm_input_embeds,\n"
         replacement += (
             f"{indent})\n"
-            f"{indent}_copy_sglang_drafter_last_hidden_output(\n"
-            f"{indent}    output,\n"
-            f"{indent}    _verl_replay_output,\n"
-            f"{indent}    slice(0, self.raw_num_tokens),\n"
-            f"{indent})\n"
+            f"{indent}if _sglang_drafter_graph_output_needs_metadata_copy(output):\n"
+            f"{indent}    _copy_sglang_drafter_last_hidden_output(\n"
+            f"{indent}        output,\n"
+            f"{indent}        _verl_replay_output,\n"
+            f"{indent}        slice(0, self.raw_num_tokens),\n"
+            f"{indent}    )\n"
+            f"{indent}_ensure_sglang_raw_top_logprobs_for_replay(_verl_replay_output, forward_batch)\n"
             f"{indent}return _verl_replay_output\n"
         )
         patched_source = patched_source[:line_start] + replacement + patched_source[end_line_start:]
@@ -4565,6 +4624,9 @@ def _make_sglang_drafter_last_hidden_inline_graph_replay_patch(original_method):
 
     globals_dict = original_method.__globals__
     globals_dict["_copy_sglang_drafter_last_hidden_output"] = _copy_sglang_drafter_last_hidden_output
+    globals_dict["_copy_sglang_logits_output_customized_info"] = _copy_sglang_logits_output_customized_info
+    globals_dict["_sglang_drafter_graph_output_needs_metadata_copy"] = _sglang_drafter_graph_output_needs_metadata_copy
+    globals_dict["_ensure_sglang_raw_top_logprobs_for_replay"] = _ensure_sglang_raw_top_logprobs_for_replay
     namespace = {}
     exec(  # noqa: S102
         "from __future__ import annotations\n" + patched_source,
