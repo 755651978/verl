@@ -34,37 +34,6 @@ class _SyncedTargetHead(torch.nn.Module):
         return self.fc(hidden_states)
 
 
-def _scatter_topk_logprobs_with_tail(logprobs: torch.Tensor, indices: torch.Tensor, vocab_size: int) -> torch.Tensor:
-    dense_logprob_view = torch.full(
-        (logprobs.size(0), vocab_size),
-        float("-inf"),
-        dtype=logprobs.dtype,
-        device=logprobs.device,
-    )
-    if logprobs.numel() == 0:
-        return dense_logprob_view
-
-    valid = torch.isfinite(logprobs) & (indices >= 0) & (indices < vocab_size)
-    if not valid.any():
-        return dense_logprob_view
-
-    valid_count = valid.sum(dim=-1)
-    has_valid = valid_count > 0
-    topk_mass = torch.where(valid, logprobs.float().exp(), torch.zeros_like(logprobs, dtype=torch.float32)).sum(dim=-1)
-    remaining_mass = (1.0 - topk_mass).clamp(min=torch.finfo(torch.float32).tiny)
-    remaining_count = (vocab_size - valid_count).clamp(min=1).to(torch.float32)
-    tail_logprob = (remaining_mass.log() - remaining_count.log()).to(logprobs.dtype)
-    dense_logprob_view = torch.where(
-        has_valid.unsqueeze(-1),
-        tail_logprob.unsqueeze(-1).expand(-1, vocab_size),
-        dense_logprob_view,
-    )
-
-    row_indices = torch.arange(logprobs.size(0), device=logprobs.device).unsqueeze(1).expand_as(indices)
-    dense_logprob_view[row_indices[valid], indices[valid]] = logprobs[valid]
-    return dense_logprob_view
-
-
 def _env_flag_enabled(name: str, default: bool = False) -> bool:
     raw_value = os.getenv(name)
     if raw_value is None:
@@ -567,66 +536,6 @@ def _apply_coverage_mask_to_loss_mask(loss_mask: torch.Tensor, coverage_mask: to
     return masked_loss_mask
 
 
-def reconstruct_dense_logprob_view(target_topk_logprobs, topk, vocab_size):
-    if topk <= 0:
-        raise ValueError(f"topk must be positive when reconstructing dense logprob view, got {topk}")
-    if isinstance(target_topk_logprobs, torch.Tensor):
-        if target_topk_logprobs.dim() != 3 or target_topk_logprobs.size(-1) < 2:
-            raise ValueError(
-                "target_topk_logprobs must have shape [seq, topk, 2+] when reconstructing a dense logprob view, "
-                f"but got shape={tuple(target_topk_logprobs.shape)}"
-            )
-        if target_topk_logprobs.numel() == 0:
-            return torch.full(
-                (
-                    target_topk_logprobs.shape[0],
-                    vocab_size,
-                ),
-                float("-inf"),
-                dtype=target_topk_logprobs.dtype,
-                device=target_topk_logprobs.device,
-            )
-        logprobs = target_topk_logprobs[..., 0]
-        indices = target_topk_logprobs[..., 1].to(torch.long)
-        return _scatter_topk_logprobs_with_tail(logprobs, indices, vocab_size)
-
-    rows = []
-    for step_top_logprobs in target_topk_logprobs:
-        if isinstance(step_top_logprobs, dict):
-            entries = list(step_top_logprobs.values())
-        else:
-            entries = list(step_top_logprobs or [])
-
-        row = []
-        for entry in entries[:topk]:
-            if isinstance(entry, dict):
-                logprob = entry.get("logprob", entry.get("log_probs", entry.get("log_prob")))
-                token_id = entry.get("token_id", entry.get("idx", entry.get("id")))
-            elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
-                logprob, token_id = entry[0], entry[1]
-            else:
-                continue
-
-            try:
-                row.append([float(logprob), int(token_id)])
-            except (TypeError, ValueError):
-                continue
-
-        if not row:
-            row = [[float("-inf"), -1] for _ in range(topk)]
-        while len(row) < topk:
-            row.append([float("-inf"), -1])
-        rows.append(row)
-
-    if not rows:
-        return torch.empty((0, vocab_size), dtype=torch.float32)
-
-    rows_tensor = torch.tensor(rows, dtype=torch.float32)
-    logprobs = rows_tensor[..., 0]
-    indices = rows_tensor[..., 1].to(torch.long)
-    return _scatter_topk_logprobs_with_tail(logprobs, indices, vocab_size)
-
-
 class Eagle3TrainerBackend(EagleTrainerBackend):
 
     def __init__(
@@ -925,8 +834,7 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
         loss_mask = batch["loss_mask"]
         position_ids = batch["position_ids"]
         use_logits = self.config.rollout.drafter.training.use_logits
-        logits_loss_mode = self.config.rollout.drafter.training.get("logits_loss_mode", "dense_tail")
-        use_sparse_restricted_ce = use_logits and logits_loss_mode == "sparse_restricted"
+        use_sparse_restricted_ce = bool(use_logits)
         logits_sparse_min_intersection = int(
             self.config.rollout.drafter.training.get("logits_sparse_min_intersection", 1)
         )
@@ -1002,14 +910,7 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
                     require_top1=logits_coverage_mask_require_top1,
                 )
                 loss_mask = _apply_coverage_mask_to_loss_mask(loss_mask, coverage_mask)
-                if use_sparse_restricted_ce:
-                    target_topk_logprobs_for_loss = target_topk_logprobs
-                else:
-                    target_scores = reconstruct_dense_logprob_view(
-                        target_topk_logprobs.squeeze(0),
-                        topk=self.config.rollout.drafter.training.logits_topk,
-                        vocab_size=self.vocab_size,
-                    ).unsqueeze(0)
+                target_topk_logprobs_for_loss = target_topk_logprobs
             else:
                 if last_hidden_states is None:
                     raise ValueError("last_hidden_states is required when use_logits=False")
@@ -1039,14 +940,7 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
                     require_top1=logits_coverage_mask_require_top1,
                 )
                 loss_mask = _apply_coverage_mask_to_loss_mask(loss_mask, coverage_mask)
-                if use_sparse_restricted_ce:
-                    target_topk_logprobs_for_loss = target_topk_logprobs
-                else:
-                    target_scores = reconstruct_dense_logprob_view(
-                        target_topk_logprobs.squeeze(0),
-                        topk=self.config.rollout.drafter.training.logits_topk,
-                        vocab_size=self.vocab_size,
-                    ).unsqueeze(0)
+                target_topk_logprobs_for_loss = target_topk_logprobs
             else:
                 if last_hidden_states is None:
                     raise ValueError("last_hidden_states is required when use_logits=False")
@@ -1076,7 +970,7 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
         sparse_loss_mask_padded = None
         if use_sparse_restricted_ce:
             if target_topk_logprobs_for_loss is None:
-                raise ValueError("target_logprobs is required when logits_loss_mode='sparse_restricted'")
+                raise ValueError("target_logprobs is required when use_logits=True")
             if target_topk_logprobs_for_loss.device != target_device:
                 target_topk_logprobs_for_loss = target_topk_logprobs_for_loss.to(target_device)
             target_topk_logprobs_padded = _pad_topk_logprobs_for_future_shift(
@@ -1086,7 +980,7 @@ class Eagle3TrainerBackend(EagleTrainerBackend):
             sparse_loss_mask_padded = F.pad(loss_mask.float(), pad=(0, length), mode="constant", value=0.0)
         else:
             if target_scores is None:
-                raise ValueError("target_scores is required when logits_loss_mode='dense_tail'")
+                raise ValueError("target_scores is required when use_logits=False")
             if target_scores.device != target_device:
                 target_scores = target_scores.to(target_device)
             target_p_padded, target_position_mask_padded = self._compute_target_p_padded(

@@ -120,7 +120,6 @@ class DrafterTrainingConfig(BaseConfig):
     use_logits: bool = False
     target_lm_head_row_restricted_sync: bool = True
     logits_topk: int = 128
-    logits_loss_mode: str = "dense_tail"
     logits_sparse_min_intersection: int = 1
     logits_sparse_min_mass: Optional[float] = None
     logits_coverage_mask_min_ratio: Optional[float] = None
@@ -178,8 +177,6 @@ class DrafterTrainingConfig(BaseConfig):
             and (self.logits_coverage_mask_min_ratio < 0 or self.logits_coverage_mask_min_ratio > 1)
         ):
             raise ValueError("`logits_coverage_mask_min_ratio` must be in [0, 1] or null.")
-        if self.logits_loss_mode not in {"dense_tail", "sparse_restricted"}:
-            raise ValueError("`logits_loss_mode` must be either 'dense_tail' or 'sparse_restricted'.")
         if self.publish_interval_steps < 0:
             raise ValueError("`publish_interval_steps` must be non-negative.")
         if self.publish_dtype is not None and self.publish_dtype not in {"float32", "fp32", "float16", "fp16", "bfloat16", "bf16"}:
