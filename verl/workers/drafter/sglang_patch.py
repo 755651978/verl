@@ -2765,8 +2765,6 @@ def _filter_sglang_drafter_last_hidden_output(
         )
         filtered_last_hidden_states = filtered_last_hidden_states[:contiguous_rows]
         _set_sglang_drafter_last_hidden_states(logits_output, filtered_last_hidden_states)
-        if _is_torch_tensor(base_hidden_filtered):
-            setattr(logits_output, "hidden_states", base_hidden_filtered[:contiguous_rows])
         if _is_torch_tensor(filtered_positions):
             filtered_positions = filtered_positions[:contiguous_rows]
             setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_POSITIONS_ATTR, filtered_positions)
