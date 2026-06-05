@@ -467,7 +467,7 @@ drafter:
     collection_sample_rate: 1.0
     max_collect_samples_per_step_per_replica: 16
     max_collect_tokens_per_step_per_replica: 8192
-    hidden_state_window_mode: random
+    hidden_state_window_mode: front
     hidden_state_window_tokens_per_sample: null
     hidden_state_window_min_rows: 64
     hidden_state_random_max_offset: null
