@@ -1593,12 +1593,7 @@ def _sglang_logits_output_customized_info(logits_output, create: bool = False):
 
 def _get_sglang_drafter_last_hidden_states(logits_output):
     last_hidden_states = getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, None)
-    if last_hidden_states is not None:
-        return last_hidden_states
-    customized_info = _sglang_logits_output_customized_info(logits_output)
-    if customized_info is None:
-        return None
-    return customized_info.get(_VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR)
+    return last_hidden_states
 
 
 def _set_sglang_drafter_last_hidden_states(logits_output, last_hidden_states) -> None:
@@ -1608,9 +1603,13 @@ def _set_sglang_drafter_last_hidden_states(logits_output, last_hidden_states) ->
         setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, last_hidden_states)
     except Exception:  # noqa: BLE001
         pass
-    customized_info = _sglang_logits_output_customized_info(logits_output, create=True)
-    if customized_info is not None:
-        customized_info[_VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR] = last_hidden_states
+    # Do not store token-level drafter internals in SGLang's public
+    # customized_info. The scheduler treats customized_info values as
+    # request-level outputs and indexes them by request id, which is invalid for
+    # [token, hidden] tensors and can raise IndexError during decode finalization.
+    customized_info = _sglang_logits_output_customized_info(logits_output)
+    if isinstance(customized_info, dict):
+        customized_info.pop(_VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, None)
 
 
 def _slice_sglang_drafter_last_hidden_output(logits_output, index):
