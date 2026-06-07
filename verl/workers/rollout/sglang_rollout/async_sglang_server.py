@@ -529,6 +529,64 @@ def _crop_target_logprobs_to_position_window(
     return kept, clipped_start, clipped_start + int(kept.size(0)), row_count - int(kept.size(0))
 
 
+def _target_logprobs_invalid_rows_like(target_logprobs: torch.Tensor, rows: int) -> torch.Tensor:
+    shape = (int(rows),) + tuple(target_logprobs.shape[1:])
+    invalid = target_logprobs.new_empty(shape)
+    invalid.zero_()
+    if invalid.dim() >= 3 and int(invalid.size(-1)) >= 2:
+        invalid[..., 0] = float("-inf")
+        invalid[..., 1] = -1
+    return invalid
+
+
+def _select_target_logprobs_by_raw_positions(
+    target_logprobs: Optional[torch.Tensor],
+    raw_positions: Optional[torch.Tensor],
+    *,
+    desired_position_start: int,
+    desired_position_end: int,
+) -> tuple[Optional[torch.Tensor], Optional[int], Optional[int], int]:
+    """Rebuild a contiguous target window from explicit raw top-k row positions.
+
+    Raw SGLang next-token logits row at position p supervises token position
+    p + 1. Missing rows are filled with invalid top-k entries so the trainer
+    can keep sequence alignment and mask them out safely.
+    """
+    if target_logprobs is None or raw_positions is None:
+        return None, None, None, 0
+    row_count = int(target_logprobs.size(0))
+    desired_rows = max(int(desired_position_end) - int(desired_position_start), 0)
+    if row_count <= 0 or desired_rows <= 0:
+        return None, None, None, row_count
+    if not torch.is_tensor(raw_positions):
+        return None, None, None, row_count
+
+    raw_positions = raw_positions.reshape(-1).to(device=target_logprobs.device, dtype=torch.long)
+    if int(raw_positions.numel()) < row_count:
+        return None, None, None, row_count
+    raw_positions = raw_positions[:row_count]
+
+    target_positions = raw_positions + 1
+    keep_mask = (
+        (raw_positions >= 0)
+        & (target_positions >= int(desired_position_start))
+        & (target_positions < int(desired_position_end))
+    )
+    if not bool(keep_mask.any()):
+        return None, None, None, row_count
+
+    selected = _target_logprobs_invalid_rows_like(target_logprobs, desired_rows)
+    source_indices = torch.nonzero(keep_mask, as_tuple=False).reshape(-1)
+    dest_indices = (target_positions[source_indices] - int(desired_position_start)).to(dtype=torch.long)
+    selected[dest_indices] = target_logprobs[source_indices]
+    return (
+        selected.contiguous(),
+        int(desired_position_start),
+        int(desired_position_start) + desired_rows,
+        row_count - int(source_indices.numel()),
+    )
+
+
 def _hidden_state_metadata_from_chunk(hidden_state_chunk: Any) -> dict[str, int]:
     if not isinstance(hidden_state_chunk, dict):
         return {}
@@ -1404,12 +1462,9 @@ class SGLangHttpServer:
                         hidden_raw_target_logprobs = torch.cat(raw_target_logprob_chunks, dim=0).contiguous()
                         raw_target_rows = int(hidden_raw_target_logprobs.size(0))
                         raw_target_position_chunks = []
-                        has_raw_position_metadata = (
-                            _env_flag_enabled(_LAST_HIDDEN_LOGPROB_CHECK_ENV, default=False)
-                            and any(
-                                torch.is_tensor(metadata.get("raw_target_logprobs_positions"))
-                                for metadata in hidden_states_metadata
-                            )
+                        has_raw_position_metadata = any(
+                            torch.is_tensor(metadata.get("raw_target_logprobs_positions"))
+                            for metadata in hidden_states_metadata
                         )
                         if has_raw_position_metadata:
                             for metadata in hidden_states_metadata:
@@ -1449,14 +1504,10 @@ class SGLangHttpServer:
                             and int(hidden_raw_target_logprobs_positions.numel()) == raw_target_rows
                             and bool((hidden_raw_target_logprobs_positions >= 0).any())
                         )
-                        raw_rows_match_debug_positions = (
-                            not collect_target_logprobs
-                            and raw_rows_have_explicit_positions
-                            and raw_target_rows <= hidden_raw_len
-                        )
-                        if not (raw_rows_match_hidden or raw_rows_match_eagle_shift or raw_rows_match_debug_positions):
+                        raw_rows_match_explicit_positions = raw_rows_have_explicit_positions
+                        if not (raw_rows_match_hidden or raw_rows_match_eagle_shift or raw_rows_match_explicit_positions):
                             logger.warning(
-                                "Drop raw top-k debug metadata with mismatched rows: raw_rows=%s hidden_rows=%s",
+                                "Drop raw top-k metadata with mismatched rows: raw_rows=%s hidden_rows=%s",
                                 raw_target_rows,
                                 hidden_raw_len,
                             )
@@ -1494,11 +1545,10 @@ class SGLangHttpServer:
                                     int(x)
                                     for x in hidden_raw_target_logprobs_positions[-min(raw_target_rows, 8) :].tolist()
                                 ]
-                            if hidden_raw_target_logprobs_position_start is None:
+                            if hidden_raw_target_logprobs_position_start is None and not collect_target_logprobs:
                                 # Legacy fallback for raw metadata produced before
                                 # explicit row positions were attached, and for
-                                # use_logits targets whose compact-row semantics
-                                # must remain unchanged.
+                                # debug-only checks that do not train on these rows.
                                 raw_position_offset = 0
                                 hidden_raw_target_logprobs_position_start = int(hidden_position_start)
                                 hidden_raw_target_logprobs_position_end = (
@@ -1576,21 +1626,42 @@ class SGLangHttpServer:
                     # next_token_logits. These rows align with hidden row p and
                     # supervise token position p + 1, matching the EAGLE shift
                     # used later in collect_online_data().
-                    target_logprobs = hidden_raw_target_logprobs
-                    if (
-                        torch.is_tensor(hidden_raw_target_logprobs_positions)
-                        and hidden_raw_target_logprobs_position_start is not None
-                        and hidden_raw_target_logprobs_position_end is not None
-                        and int(hidden_raw_target_logprobs_position_end)
-                        - int(hidden_raw_target_logprobs_position_start)
-                        == int(target_logprobs.size(0))
-                    ):
-                        target_logprobs_position_start = int(hidden_raw_target_logprobs_position_start) + 1
+                    target_window_start = int(hidden_position_start) + 1
+                    target_window_end = min(
+                        int(hidden_position_end),
+                        max(len(prompt_ids) - 1, 0) + len(token_ids),
+                    )
+                    if torch.is_tensor(hidden_raw_target_logprobs_positions):
+                        (
+                            target_logprobs,
+                            target_logprobs_position_start,
+                            target_logprobs_position_end,
+                            target_logprobs_dropped_rows,
+                        ) = _select_target_logprobs_by_raw_positions(
+                            hidden_raw_target_logprobs,
+                            hidden_raw_target_logprobs_positions,
+                            desired_position_start=target_window_start,
+                            desired_position_end=target_window_end,
+                        )
+                        output_top_len = int(target_logprobs.size(0)) if target_logprobs is not None else None
+                        if target_logprobs is None:
+                            logger.warning(
+                                "No SGLang raw next_token_logits rows overlap drafter hidden target window; "
+                                "skip target_logprobs collection (target_window=[%s,%s), raw_rows=%s)",
+                                target_window_start,
+                                target_window_end,
+                                int(hidden_raw_target_logprobs.size(0)),
+                            )
                     else:
-                        target_logprobs_position_start = int(hidden_position_start) + 1
-                    target_logprobs_position_end = target_logprobs_position_start + int(target_logprobs.size(0))
-                    target_logprobs_dropped_rows = 0
-                    output_top_len = int(target_logprobs.size(0))
+                        logger.warning(
+                            "Missing SGLang raw next_token_logits positions metadata for drafter logits training; "
+                            "skip target_logprobs collection"
+                        )
+                        target_logprobs = None
+                        target_logprobs_position_start = None
+                        target_logprobs_position_end = None
+                        target_logprobs_dropped_rows = 0
+                        output_top_len = None
                 elif collect_target_logprobs:
                     logger.warning(
                         "Missing SGLang raw next_token_logits metadata for drafter logits training; "
@@ -1601,7 +1672,11 @@ class SGLangHttpServer:
                     target_logprobs_position_end = None
                     target_logprobs_dropped_rows = 0
                     output_top_len = None
-                if collect_target_logprobs and target_logprobs is not None:
+                if (
+                    collect_target_logprobs
+                    and target_logprobs is not None
+                    and not torch.is_tensor(hidden_raw_target_logprobs_positions)
+                ):
                     target_window_start = int(hidden_position_start) + 1
                     target_window_end = min(
                         int(hidden_position_end),
