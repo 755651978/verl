@@ -548,9 +548,11 @@ def _select_target_logprobs_by_raw_positions(
 ) -> tuple[Optional[torch.Tensor], Optional[int], Optional[int], int]:
     """Rebuild a contiguous target window from explicit raw top-k row positions.
 
-    Raw SGLang next-token logits row at position p supervises token position
-    p + 1. Missing rows are filled with invalid top-k entries so the trainer
-    can keep sequence alignment and mask them out safely.
+    Raw SGLang next-token logits row at position p is the target logits row
+    produced from main-model hidden position p. The caller passes the desired
+    EAGLE target window in the same logits-position coordinate space. Missing
+    rows are filled with invalid top-k entries so the trainer can keep sequence
+    alignment and mask them out safely.
     """
     if target_logprobs is None or raw_positions is None:
         return None, None, None, 0
@@ -566,18 +568,17 @@ def _select_target_logprobs_by_raw_positions(
         return None, None, None, row_count
     raw_positions = raw_positions[:row_count]
 
-    target_positions = raw_positions + 1
     keep_mask = (
         (raw_positions >= 0)
-        & (target_positions >= int(desired_position_start))
-        & (target_positions < int(desired_position_end))
+        & (raw_positions >= int(desired_position_start))
+        & (raw_positions < int(desired_position_end))
     )
     if not bool(keep_mask.any()):
         return None, None, None, row_count
 
     selected = _target_logprobs_invalid_rows_like(target_logprobs, desired_rows)
     source_indices = torch.nonzero(keep_mask, as_tuple=False).reshape(-1)
-    dest_indices = (target_positions[source_indices] - int(desired_position_start)).to(dtype=torch.long)
+    dest_indices = (raw_positions[source_indices] - int(desired_position_start)).to(dtype=torch.long)
     selected[dest_indices] = target_logprobs[source_indices]
     return (
         selected.contiguous(),
@@ -1623,9 +1624,10 @@ class SGLangHttpServer:
                 hidden_kept_len = int(hidden_states.size(0))
                 if collect_target_logprobs and torch.is_tensor(hidden_raw_target_logprobs):
                     # Prefer raw logprobs captured directly from SGLang
-                    # next_token_logits. These rows align with hidden row p and
-                    # supervise token position p + 1, matching the EAGLE shift
-                    # used later in collect_online_data().
+                    # next_token_logits. EAGLE uses hidden row p together with
+                    # token p + 1 to train against the main-model logits row at
+                    # p + 1, matching the shifted EAGLE path in
+                    # collect_online_data().
                     target_window_start = int(hidden_position_start) + 1
                     target_window_end = min(
                         int(hidden_position_end),
