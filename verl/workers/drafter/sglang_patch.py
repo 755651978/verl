@@ -69,6 +69,7 @@ _SGLANG_EAGLE_VERIFY_HIDDEN_STATES_PATCHED = False
 _SGLANG_DFLASH_VERIFY_HIDDEN_STATES_PATCHED = False
 _SGLANG_DRAFTER_LAST_HIDDEN_OUTPUT_PATCHED = False
 _SGLANG_RAW_TOP_LOGPROBS_REQUEST_GATE_PATCHED = False
+_SGLANG_QWEN3_ROPE_COMPAT_PATCHED = False
 _SGLANG_SCHEDULER_PROCESS_PATCHED = False
 _SGLANG_LAST_HIDDEN_LOGPROB_CHECK_LOG_COUNT = 0
 _SGLANG_LAST_HIDDEN_LOGPROB_CHECK_SKIP_LOG_COUNT = 0
@@ -79,6 +80,7 @@ _SGLANG_PATCH_NAMES = {
     "eagle_update_weights",
     "npu_eagle_target_sampling",
     "hidden_states_tensor_output",
+    "qwen3_rope_compat",
 }
 _VERL_DRAFTER_HIDDEN_WINDOW_PARAM = "_verl_drafter_hidden_state_window"
 _VERL_HIDDEN_STATE_FRONT_TOKENS_PARAM = "_verl_hidden_state_front_tokens_per_sample"
@@ -186,6 +188,91 @@ def _get_sglang_target_runner(worker):
         if runner is not None:
             return runner
     return None
+
+
+_SGLANG_QWEN3_ROPE_PARAMETERS_PATTERN = re.compile(
+    r'(?m)^(?P<indent>[ \t]+)rope_theta = config\.rope_parameters\["rope_theta"\]\s*\n'
+    r"(?P=indent)rope_scaling = config\.rope_parameters\s*$"
+)
+
+
+def _render_sglang_qwen3_rope_compat(match: re.Match) -> str:
+    indent = match.group("indent")
+    return (
+        f"{indent}if (\n"
+        f'{indent}    hasattr(config, "rope_parameters")\n'
+        f"{indent}    and config.rope_parameters\n"
+        f'{indent}    and "rope_theta" in config.rope_parameters\n'
+        f"{indent}):\n"
+        f'{indent}    rope_theta = config.rope_parameters["rope_theta"]\n'
+        f"{indent}    rope_scaling = config.rope_parameters\n"
+        f"{indent}else:\n"
+        f'{indent}    rope_theta = getattr(config, "rope_theta", 1000000)\n'
+        f'{indent}    rope_scaling = getattr(config, "rope_scaling", None)'
+    )
+
+
+def _patch_sglang_qwen3_decoder_layer_init_source(source: str) -> str | None:
+    patched_source, replacement_count = _SGLANG_QWEN3_ROPE_PARAMETERS_PATTERN.subn(
+        _render_sglang_qwen3_rope_compat,
+        source,
+        count=1,
+    )
+    if replacement_count <= 0 or patched_source == source:
+        return None
+    return patched_source
+
+
+def _make_sglang_qwen3_decoder_layer_init_patch(original_init):
+    try:
+        source = inspect.getsource(original_init)
+    except (OSError, TypeError):
+        return None
+
+    source = textwrap.dedent(source)
+    patched_source = _patch_sglang_qwen3_decoder_layer_init_source(source)
+    if patched_source is None:
+        return None
+
+    namespace = {}
+    exec(  # noqa: S102
+        "from __future__ import annotations\n" + patched_source,
+        original_init.__globals__,
+        namespace,
+    )
+    patched_init = namespace[original_init.__name__]
+    patched_init = wraps(original_init)(patched_init)
+    patched_init._verl_patched_qwen3_rope_compat = True
+    return patched_init
+
+
+def patch_sglang_qwen3_rope_compat() -> None:
+    """Patch SGLang 0.5.10 Qwen3 to accept transformers configs without rope_parameters."""
+    global _SGLANG_QWEN3_ROPE_COMPAT_PATCHED
+    if _SGLANG_QWEN3_ROPE_COMPAT_PATCHED:
+        return
+
+    try:
+        qwen3_module = importlib.import_module("sglang.srt.models.qwen3")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Skip SGLang Qwen3 rope compatibility patch: %s", exc)
+        return
+
+    qwen3_decoder_layer = getattr(qwen3_module, "Qwen3DecoderLayer", None)
+    original_init = getattr(qwen3_decoder_layer, "__init__", None)
+    if original_init is None:
+        return
+    if getattr(original_init, "_verl_patched_qwen3_rope_compat", False):
+        _SGLANG_QWEN3_ROPE_COMPAT_PATCHED = True
+        return
+
+    patched_init = _make_sglang_qwen3_decoder_layer_init_patch(original_init)
+    if patched_init is None:
+        return
+
+    qwen3_decoder_layer.__init__ = patched_init
+    _SGLANG_QWEN3_ROPE_COMPAT_PATCHED = True
+    logger.warning("SGLang Qwen3 rope-parameters compatibility patch active.")
 
 
 def _make_verl_eagle_update_weights_patch(original_update_weights):
@@ -4649,6 +4736,7 @@ def _apply_selected_sglang_patches() -> bool:
     selected_patches = _selected_sglang_patches()
 
     patchers = (
+        ("qwen3_rope_compat", patch_sglang_qwen3_rope_compat),
         ("eagle_update_weights", patch_sglang_eagle_update_weights_from_tensor),
         ("npu_eagle_target_sampling", patch_sglang_npu_eagle_target_sampling),
         ("hidden_states_tensor_output", patch_sglang_hidden_states_tensor_output),
@@ -4657,7 +4745,11 @@ def _apply_selected_sglang_patches() -> bool:
     applied_any = False
     skipped = []
     for patch_name, patcher in patchers:
-        if _sglang_patch_enabled(patch_name):
+        patch_enabled = _sglang_patch_enabled(patch_name)
+        if patch_name == "qwen3_rope_compat" and selected_patches:
+            patch_enabled = True
+
+        if patch_enabled:
             patcher()
             applied_any = True
         else:
