@@ -1438,23 +1438,33 @@ def _patch_sglang_npu_eagle_triton_bool_compat() -> None:
     try:
         spec_utils = importlib.import_module("sglang.srt.speculative.spec_utils")
         kernel = getattr(spec_utils, "assign_draft_cache_locs", None)
-        if kernel is None or getattr(kernel, "_verl_patched_triton_bool_compat", False):
+        if kernel is None:
+            logger.warning("Skip SGLang NPU EAGLE Triton bool compatibility patch: assign_draft_cache_locs missing.")
             return
-        source = textwrap.dedent(inspect.getsource(kernel.fn))
-        patched_source = source.replace(
-            "if page_size != 1 and topk != 1 and duplicate_cache_len > 0:",
-            "if (page_size != 1 and topk != 1) and duplicate_cache_len > 0:",
-            1,
+        if getattr(kernel, "_verl_patched_triton_bool_compat", False):
+            return
+        kernel_fn = getattr(kernel, "fn", kernel)
+        source = textwrap.dedent(inspect.getsource(kernel_fn))
+        patched_source, replacement_count = re.subn(
+            r"(?m)^([ \t]*)if\s+page_size\s*!=\s*1\s+and\s+topk\s*!=\s*1\s+and\s+duplicate_cache_len\s*>\s*0\s*:",
+            r"\1if (page_size != 1 and topk != 1) and duplicate_cache_len > 0:",
+            source,
+            count=1,
         )
-        if patched_source == source:
+        if replacement_count <= 0:
+            logger.warning(
+                "Skip SGLang NPU EAGLE Triton bool compatibility patch: "
+                "chained condition not found in %s.",
+                getattr(kernel_fn, "__code__", None).co_filename if getattr(kernel_fn, "__code__", None) else kernel_fn,
+            )
             return
         namespace = {}
         exec(  # noqa: S102
             "from __future__ import annotations\n" + patched_source,
-            kernel.fn.__globals__,
+            kernel_fn.__globals__,
             namespace,
         )
-        patched_kernel = namespace[kernel.fn.__name__]
+        patched_kernel = namespace[kernel_fn.__name__]
         patched_kernel._verl_patched_triton_bool_compat = True
         spec_utils.assign_draft_cache_locs = patched_kernel
         for module_name in (
@@ -1469,7 +1479,7 @@ def _patch_sglang_npu_eagle_triton_bool_compat() -> None:
                 module.assign_draft_cache_locs = patched_kernel
         logger.warning("SGLang NPU EAGLE Triton bool compatibility patch active.")
     except Exception as exc:  # noqa: BLE001
-        logger.debug("Skip SGLang NPU EAGLE Triton bool compatibility patch: %s", exc)
+        logger.warning("Skip SGLang NPU EAGLE Triton bool compatibility patch: %s", exc)
 
 
 def patch_sglang_npu_eagle_target_sampling() -> None:
@@ -4816,6 +4826,7 @@ def _apply_sglang_child_process_patches() -> None:
         enable_sglang_original_logprob_return()
 
     logger.warning("Applying verl SGLang patches in scheduler subprocess.")
+    _patch_sglang_npu_eagle_triton_bool_compat()
     _apply_selected_sglang_patches()
 
 
