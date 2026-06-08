@@ -18,6 +18,7 @@ import inspect
 import logging
 import os
 import re
+import sys
 import textwrap
 from functools import wraps
 from typing import Any, Callable
@@ -197,8 +198,6 @@ _SGLANG_QWEN3_ROPE_PARAMETERS_PATTERN = re.compile(
 _SGLANG_QWEN3_ZERO_ARG_SUPER_PATTERN = re.compile(
     r"(?m)^(?P<indent>[ \t]+)super\(\)\.__init__\(\)\s*$"
 )
-
-
 def _render_sglang_qwen3_rope_compat(match: re.Match) -> str:
     indent = match.group("indent")
     return (
@@ -1435,11 +1434,51 @@ def _tree_speculative_sampling_target_only_torch(
     )
 
 
+def _patch_sglang_npu_eagle_triton_bool_compat() -> None:
+    try:
+        spec_utils = importlib.import_module("sglang.srt.speculative.spec_utils")
+        kernel = getattr(spec_utils, "assign_draft_cache_locs", None)
+        if kernel is None or getattr(kernel, "_verl_patched_triton_bool_compat", False):
+            return
+        source = textwrap.dedent(inspect.getsource(kernel.fn))
+        patched_source = source.replace(
+            "if page_size != 1 and topk != 1 and duplicate_cache_len > 0:",
+            "if (page_size != 1 and topk != 1) and duplicate_cache_len > 0:",
+            1,
+        )
+        if patched_source == source:
+            return
+        namespace = {}
+        exec(  # noqa: S102
+            "from __future__ import annotations\n" + patched_source,
+            kernel.fn.__globals__,
+            namespace,
+        )
+        patched_kernel = namespace[kernel.fn.__name__]
+        patched_kernel._verl_patched_triton_bool_compat = True
+        spec_utils.assign_draft_cache_locs = patched_kernel
+        for module_name in (
+            "sglang.srt.speculative.eagle_worker",
+            "sglang.srt.speculative.eagle_worker_v2",
+            "sglang.srt.speculative.multi_layer_eagle_worker",
+            "sglang.srt.speculative.multi_layer_eagle_worker_v2",
+            "sglang.srt.speculative.frozen_kv_mtp_worker",
+        ):
+            module = sys.modules.get(module_name)
+            if module is not None and hasattr(module, "assign_draft_cache_locs"):
+                module.assign_draft_cache_locs = patched_kernel
+        logger.warning("SGLang NPU EAGLE Triton bool compatibility patch active.")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Skip SGLang NPU EAGLE Triton bool compatibility patch: %s", exc)
+
+
 def patch_sglang_npu_eagle_target_sampling() -> None:
     """Patch SGLang NPU EAGLE v1 verification to use target-only sampling."""
     global _SGLANG_NPU_EAGLE_SAMPLING_PATCHED
     if _SGLANG_NPU_EAGLE_SAMPLING_PATCHED or not _is_sglang_npu_backend():
         return
+
+    _patch_sglang_npu_eagle_triton_bool_compat()
 
     patched_targets = []
 
