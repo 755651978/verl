@@ -2330,6 +2330,25 @@ def _sglang_int_list(value) -> list[int] | None:
         return None
 
 
+def _sglang_accept_rows_from_verify_result(obj) -> list[int] | None:
+    """Return accepted verify rows per request, including the target/bonus token."""
+
+    accept_lens = _sglang_int_list(_sglang_nested_attr(obj, ("accept_lens",)))
+    if accept_lens is not None:
+        return [max(int(value), 1) for value in accept_lens]
+
+    for name in (
+        "num_correct_drafts_per_req_cpu",
+        "num_accepted_drafts_per_req_cpu",
+        "accept_length_per_req_cpu",
+    ):
+        draft_lens = _sglang_int_list(_sglang_nested_attr(obj, (name,)))
+        if draft_lens is not None:
+            return [max(int(value) + 1, 1) for value in draft_lens]
+
+    return None
+
+
 def _reconstruct_sglang_accepted_indices_from_lens(obj):
     draft_tokens = _sglang_nested_attr(obj, ("speculative_num_draft_tokens",))
     try:
@@ -2339,11 +2358,7 @@ def _reconstruct_sglang_accepted_indices_from_lens(obj):
     if draft_tokens <= 0:
         return None
 
-    accept_lens = _sglang_int_list(_sglang_nested_attr(obj, ("accept_lens",)))
-    if accept_lens is None:
-        num_correct = _sglang_int_list(_sglang_nested_attr(obj, ("num_correct_drafts_per_req_cpu",)))
-        if num_correct is not None:
-            accept_lens = [max(int(value) + 1, 1) for value in num_correct]
+    accept_lens = _sglang_accept_rows_from_verify_result(obj)
     if not accept_lens:
         return None
 
@@ -3409,10 +3424,12 @@ def _append_sglang_prefill_hidden_states(req, logits_output, hidden_state_offset
 
 
 def _sglang_decode_accept_rows_per_req(result) -> list[int] | None:
-    """Return per-request accepted row counts for SGLang 0.5.12 decode output.
+    """Return per-request accepted row counts for SGLang speculative decode output.
 
-    EAGLE/DFLASH spec-v1 reports num_correct_drafts_per_req_cpu without the
-    bonus token. Spec-v2 accept_lens already includes the bonus token.
+    Older EAGLE spec-v1 outputs use accept_length_per_req_cpu. Newer spec-v1
+    outputs use num_correct_drafts_per_req_cpu or num_accepted_drafts_per_req_cpu.
+    These draft counts do not include the target/bonus token. Spec-v2
+    accept_lens already includes it.
     """
 
     draft_tokens = _positive_int_or_none(getattr(result, "speculative_num_draft_tokens", None))
@@ -3422,18 +3439,8 @@ def _sglang_decode_accept_rows_per_req(result) -> list[int] | None:
             return rows
         return [min(row, draft_tokens) for row in rows]
 
-    num_correct_drafts = getattr(result, "num_correct_drafts_per_req_cpu", None)
-    if num_correct_drafts is not None:
-        return _clamp_to_verify_rows([max(int(x) + 1, 1) for x in num_correct_drafts])
-
-    accept_lens = getattr(result, "accept_lens", None)
-    if accept_lens is not None:
-        if _is_torch_tensor(accept_lens):
-            accept_lens = accept_lens.detach().cpu().tolist()
-        rows = [max(int(x), 1) for x in accept_lens]
-        return _clamp_to_verify_rows(rows)
-
-    return None
+    rows = _sglang_accept_rows_from_verify_result(result)
+    return None if rows is None else _clamp_to_verify_rows(rows)
 
 
 def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: int, hidden_state_offset: int, batch=None) -> int:
