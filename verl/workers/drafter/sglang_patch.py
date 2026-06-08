@@ -194,6 +194,9 @@ _SGLANG_QWEN3_ROPE_PARAMETERS_PATTERN = re.compile(
     r'(?m)^(?P<indent>[ \t]+)rope_theta = config\.rope_parameters\["rope_theta"\]\s*\n'
     r"(?P=indent)rope_scaling = config\.rope_parameters\s*$"
 )
+_SGLANG_QWEN3_ZERO_ARG_SUPER_PATTERN = re.compile(
+    r"(?m)^(?P<indent>[ \t]+)super\(\)\.__init__\(\)\s*$"
+)
 
 
 def _render_sglang_qwen3_rope_compat(match: re.Match) -> str:
@@ -220,6 +223,11 @@ def _patch_sglang_qwen3_decoder_layer_init_source(source: str) -> str | None:
     )
     if replacement_count <= 0 or patched_source == source:
         return None
+    patched_source = _SGLANG_QWEN3_ZERO_ARG_SUPER_PATTERN.sub(
+        r"\g<indent>super(Qwen3DecoderLayer, self).__init__()",
+        patched_source,
+        count=1,
+    )
     return patched_source
 
 
