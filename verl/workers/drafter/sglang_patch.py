@@ -1485,10 +1485,10 @@ def _patch_sglang_npu_eagle_triton_bool_compat() -> None:
 def patch_sglang_npu_eagle_target_sampling() -> None:
     """Patch SGLang NPU EAGLE v1 verification to use target-only sampling."""
     global _SGLANG_NPU_EAGLE_SAMPLING_PATCHED
-    if _SGLANG_NPU_EAGLE_SAMPLING_PATCHED or not _is_sglang_npu_backend():
-        return
 
     _patch_sglang_npu_eagle_triton_bool_compat()
+    if _SGLANG_NPU_EAGLE_SAMPLING_PATCHED or not _is_sglang_npu_backend():
+        return
 
     patched_targets = []
 
