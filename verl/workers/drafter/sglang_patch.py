@@ -4094,12 +4094,7 @@ def _wrap_sglang_eagle_forward_generation_last_hidden_materialize(method):
     return patched_forward_generation_last_hidden_materialize
 
 
-def _make_sglang_eagle_verify_full_hidden_patch(original_method):
-    try:
-        source = inspect.getsource(original_method)
-    except (OSError, TypeError):
-        return None
-
+def _patch_sglang_eagle_verify_full_hidden_source(source: str) -> str | None:
     source = textwrap.dedent(source)
     patched_source = source
 
@@ -4164,6 +4159,7 @@ def _make_sglang_eagle_verify_full_hidden_patch(original_method):
                 positions=getattr(spec_info, "positions", None),
                 batch=batch,
                 verify_result=res,
+                filter_base_hidden_states=not _sglang_needs_eagle_legacy_alignment_patch(),
             )
 """,
         ),
@@ -4181,6 +4177,7 @@ def _make_sglang_eagle_verify_full_hidden_patch(original_method):
                 positions=getattr(spec_info, "positions", None),
                 batch=batch,
                 verify_result=res,
+                filter_base_hidden_states=not _sglang_needs_eagle_legacy_alignment_patch(),
             )
 """,
         ),
@@ -4194,6 +4191,7 @@ def _make_sglang_eagle_verify_full_hidden_patch(original_method):
                 "            positions=getattr(spec_info, \"positions\", None),\n"
                 "            batch=batch,\n"
                 "            verify_result=res,\n"
+                "            filter_base_hidden_states=not _sglang_needs_eagle_legacy_alignment_patch(),\n"
                 "        )\n"
             ),
         ),
@@ -4207,6 +4205,7 @@ def _make_sglang_eagle_verify_full_hidden_patch(original_method):
                 "            positions=getattr(spec_info, \"positions\", None),\n"
                 "            batch=batch,\n"
                 "            verify_result=res,\n"
+                "            filter_base_hidden_states=not _sglang_needs_eagle_legacy_alignment_patch(),\n"
                 "        )\n"
             ),
         ),
@@ -4215,6 +4214,19 @@ def _make_sglang_eagle_verify_full_hidden_patch(original_method):
         if old_hidden_filter in patched_source:
             patched_source = patched_source.replace(old_hidden_filter, new_hidden_filter, 1)
             break
+
+    return patched_source
+
+
+def _make_sglang_eagle_verify_full_hidden_patch(original_method):
+    try:
+        source = inspect.getsource(original_method)
+    except (OSError, TypeError):
+        return None
+
+    patched_source = _patch_sglang_eagle_verify_full_hidden_source(source)
+    if patched_source is None:
+        return None
 
     globals_dict = original_method.__globals__
     globals_dict["logger"] = logger
@@ -4225,6 +4237,7 @@ def _make_sglang_eagle_verify_full_hidden_patch(original_method):
     globals_dict["_validate_sglang_eagle_verify_hidden_states"] = _validate_sglang_eagle_verify_hidden_states
     globals_dict["_validate_sglang_eagle_verify_last_hidden"] = _validate_sglang_eagle_verify_last_hidden
     globals_dict["_filter_sglang_drafter_last_hidden_output"] = _filter_sglang_drafter_last_hidden_output
+    globals_dict["_sglang_needs_eagle_legacy_alignment_patch"] = _sglang_needs_eagle_legacy_alignment_patch
     namespace = {}
     exec(  # noqa: S102
         "from __future__ import annotations\n" + patched_source,
