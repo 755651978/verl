@@ -72,6 +72,7 @@ _SGLANG_DRAFTER_LAST_HIDDEN_OUTPUT_PATCHED = False
 _SGLANG_RAW_TOP_LOGPROBS_REQUEST_GATE_PATCHED = False
 _SGLANG_QWEN3_ROPE_COMPAT_PATCHED = False
 _SGLANG_SCHEDULER_PROCESS_PATCHED = False
+_SGLANG_EAGLE_LEGACY_ALIGNMENT_PATCHED = False
 _SGLANG_LAST_HIDDEN_LOGPROB_CHECK_LOG_COUNT = 0
 _SGLANG_LAST_HIDDEN_LOGPROB_CHECK_SKIP_LOG_COUNT = 0
 _SGLANG_LAST_HIDDEN_FILTER_DEBUG_LOG_COUNT = 0
@@ -124,6 +125,126 @@ def enable_sglang_original_logprob_return() -> None:
         setattr(sampler_module, _SGLANG_RETURN_ORIGINAL_LOGPROB_ENV, True)
     except Exception as exc:  # noqa: BLE001
         logger.debug("Could not sync SGLang original-logprob sampler flag yet: %s", exc)
+
+
+def _sglang_version_tuple() -> tuple[int, int, int] | None:
+    raw_version = getattr(sglang, "__version__", None)
+    if raw_version is None:
+        return None
+    version_parts = re.findall(r"\d+", str(raw_version).split("+", 1)[0])
+    if not version_parts:
+        return None
+    values = [int(part) for part in version_parts[:3]]
+    values.extend([0] * (3 - len(values)))
+    return tuple(values[:3])
+
+
+def _sglang_version_in_range(
+    *,
+    min_inclusive: tuple[int, int, int] | None = None,
+    max_exclusive: tuple[int, int, int] | None = None,
+) -> bool:
+    version_tuple = _sglang_version_tuple()
+    if version_tuple is None:
+        return False
+    if min_inclusive is not None and version_tuple < min_inclusive:
+        return False
+    if max_exclusive is not None and version_tuple >= max_exclusive:
+        return False
+    return True
+
+
+def _sglang_needs_eagle_legacy_alignment_patch() -> bool:
+    return _sglang_version_in_range(min_inclusive=(0, 5, 10), max_exclusive=(0, 5, 12))
+
+
+def _patch_sglang_eagle_legacy_draft_forward_source(source: str) -> str | None:
+    """Match SGLang >=0.5.12 draft position timing on legacy 0.5.10/0.5.11."""
+
+    lines = textwrap.dedent(source).splitlines(keepends=True)
+    position_line = None
+    search_start = 0
+    for idx, line in enumerate(lines[:-1]):
+        if "forward_batch.out_cache_loc = out_cache_loc[i]" not in line:
+            continue
+        next_line = lines[idx + 1]
+        if "forward_batch.positions.add_(1)" not in next_line:
+            continue
+        position_line = lines.pop(idx + 1)
+        search_start = idx + 1
+        break
+    if position_line is None:
+        return None
+
+    for idx in range(search_start, len(lines)):
+        if lines[idx].strip() != "hidden_states = logits_output.hidden_states":
+            continue
+        lines.insert(idx + 1, position_line)
+        return "".join(lines)
+    return None
+
+
+def _make_sglang_eagle_legacy_draft_forward_alignment_patch(original_method):
+    try:
+        source = inspect.getsource(original_method)
+    except (OSError, TypeError):
+        return None
+    patched_source = _patch_sglang_eagle_legacy_draft_forward_source(source)
+    if patched_source is None:
+        return None
+
+    namespace = {}
+    exec(  # noqa: S102
+        "from __future__ import annotations\n" + patched_source,
+        original_method.__globals__,
+        namespace,
+    )
+    patched_method = namespace[original_method.__name__]
+    patched_method = wraps(original_method)(patched_method)
+    patched_method._verl_patched_eagle_legacy_alignment = True
+    return patched_method
+
+
+def patch_sglang_eagle_legacy_alignment_compat() -> None:
+    """Normalize legacy SGLang 0.5.10/0.5.11 EAGLE alignment to 0.5.12 semantics."""
+
+    global _SGLANG_EAGLE_LEGACY_ALIGNMENT_PATCHED
+    if _SGLANG_EAGLE_LEGACY_ALIGNMENT_PATCHED or not _sglang_needs_eagle_legacy_alignment_patch():
+        return
+
+    targets = (
+        ("sglang.srt.speculative.eagle_worker", "EAGLEWorker"),
+        ("sglang.srt.speculative.multi_layer_eagle_worker", "MultiLayerEagleWorker"),
+        ("sglang.srt.speculative.eagle_worker_v2", "EagleDraftWorker"),
+        ("sglang.srt.speculative.multi_layer_eagle_worker_v2", "MultiLayerEagleDraftWorker"),
+    )
+    patched_targets = []
+    for module_name, class_name in targets:
+        try:
+            module = importlib.import_module(module_name)
+            worker_cls = getattr(module, class_name)
+            original_method = getattr(worker_cls, "draft_forward", None)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Skip SGLang legacy EAGLE alignment patch for %s.%s: %s", module_name, class_name, exc)
+            continue
+        if original_method is None:
+            continue
+        if getattr(original_method, "_verl_patched_eagle_legacy_alignment", False):
+            patched_targets.append(f"{module_name}.{class_name}.draft_forward")
+            continue
+        patched_method = _make_sglang_eagle_legacy_draft_forward_alignment_patch(original_method)
+        if patched_method is None:
+            continue
+        setattr(worker_cls, "draft_forward", patched_method)
+        patched_targets.append(f"{module_name}.{class_name}.draft_forward")
+
+    if patched_targets:
+        _SGLANG_EAGLE_LEGACY_ALIGNMENT_PATCHED = True
+        logger.warning(
+            "SGLang legacy EAGLE alignment patch active for %s (version=%s).",
+            ", ".join(patched_targets),
+            getattr(sglang, "__version__", None),
+        )
 
 
 def configure_sglang_eagle_weight_update_patch(
@@ -2696,6 +2817,7 @@ def _filter_sglang_drafter_last_hidden_output(
     batch=None,
     verify_result=None,
     accepted_rows_per_req: list[int] | None = None,
+    filter_base_hidden_states: bool = True,
 ) -> None:
     global _SGLANG_LAST_HIDDEN_FILTER_DEBUG_LOG_COUNT
     try:
@@ -2716,6 +2838,8 @@ def _filter_sglang_drafter_last_hidden_output(
     base_hidden_states = getattr(logits_output, "hidden_states", None)
     base_hidden_filtered = None
     if (
+        filter_base_hidden_states
+        and
         _is_torch_tensor(base_hidden_states)
         and not bool(getattr(logits_output, "_verl_drafter_base_hidden_filtered_by_accept_indices", False))
     ):
@@ -3899,6 +4023,7 @@ def _wrap_sglang_eagle_verify_last_hidden_filter(method):
                     positions=positions,
                     batch=batch,
                     verify_result=verify_output,
+                    filter_base_hidden_states=not _sglang_needs_eagle_legacy_alignment_patch(),
                 )
             else:
                 _filter_sglang_drafter_last_hidden_from_verify_result(
@@ -3932,6 +4057,7 @@ def _wrap_sglang_eagle_verify_input_last_hidden_filter(method):
                     positions=positions,
                     batch=batch,
                     verify_result=result,
+                    filter_base_hidden_states=not _sglang_needs_eagle_legacy_alignment_patch(),
                 )
             else:
                 _filter_sglang_drafter_last_hidden_from_verify_result(
@@ -4737,6 +4863,7 @@ def patch_sglang_dflash_verify_hidden_states() -> None:
 def patch_sglang_hidden_states_tensor_output() -> None:
     """Return SGLang hidden-state chunks as CPU tensors instead of Python lists."""
     global _SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED
+    patch_sglang_eagle_legacy_alignment_compat()
     patch_sglang_eagle_verify_hidden_states_full()
     patch_sglang_dflash_verify_hidden_states()
     patch_sglang_drafter_last_hidden_output()
