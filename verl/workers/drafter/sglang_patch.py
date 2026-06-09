@@ -1832,7 +1832,12 @@ def _materialize_sglang_drafter_last_hidden_output(logits_output, stage: str) ->
         materialized_shape = tuple(last_hidden_states.shape)
     elif _is_torch_tensor(base_hidden_states):
         if tuple(base_hidden_states.shape[:-1]) != tuple(last_hidden_states.shape[:-1]):
-            logger.warning(
+            log_shape_mismatch = (
+                logger.warning
+                if bool(getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTERED_ATTR, False))
+                else logger.debug
+            )
+            log_shape_mismatch(
                 "Skip materializing SGLang drafter final hidden: stage=%s "
                 "base_shape=%s last_hidden_shape=%s",
                 stage,
@@ -2707,6 +2712,7 @@ def _mark_sglang_last_hidden_identity_filter(
             "positions_contiguous": positions_contiguous,
             "first_contiguous_rows": contiguous_rows,
             "first_break": first_break,
+            "positions_truncated": False,
             "positions_head": pos_head,
             "positions_tail": pos_tail,
         },
@@ -2905,6 +2911,7 @@ def _filter_sglang_drafter_last_hidden_output(
                 "positions_contiguous": positions_contiguous,
                 "first_contiguous_rows": contiguous_rows,
                 "first_break": first_break,
+                "positions_truncated": False,
                 "positions_head": pos_head,
                 "positions_tail": pos_tail,
             },
@@ -3044,22 +3051,13 @@ def _filter_sglang_drafter_last_hidden_output(
     _filter_sglang_last_hidden_logprob_check_tensors(logits_output, index_tensor)
     contiguous_rows, positions_contiguous, first_break = _sglang_first_contiguous_position_len(filtered_positions)
     if contiguous_rows is not None and contiguous_rows < int(filtered_last_hidden_states.shape[0]):
-        logger.warning(
-            "[sglang last_hidden filter check] positions are not contiguous; keep first segment rows=%s/%s "
+        logger.debug(
+            "[sglang last_hidden filter check] positions are not globally contiguous; keep all rows=%s "
             "first_break=%s positions_head=%s positions_tail=%s",
-            contiguous_rows,
             int(filtered_last_hidden_states.shape[0]),
             first_break,
             *_sglang_tensor_head_tail(filtered_positions),
         )
-        filtered_last_hidden_states = filtered_last_hidden_states[:contiguous_rows]
-        setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, filtered_last_hidden_states)
-        if _is_torch_tensor(base_hidden_filtered):
-            setattr(logits_output, "hidden_states", base_hidden_filtered[:contiguous_rows])
-        if _is_torch_tensor(filtered_positions):
-            filtered_positions = filtered_positions[:contiguous_rows]
-            setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_POSITIONS_ATTR, filtered_positions)
-        _truncate_sglang_last_hidden_logprob_check_tensors(logits_output, contiguous_rows)
     setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTERED_ATTR, True)
     filter_summary = getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTER_SUMMARY_ATTR, None)
     if isinstance(filter_summary, dict):
@@ -3072,6 +3070,7 @@ def _filter_sglang_drafter_last_hidden_output(
             "positions_contiguous": positions_contiguous,
             "first_contiguous_rows": contiguous_rows,
             "first_break": first_break,
+            "positions_truncated": False,
             "positions_head": pos_head,
             "positions_tail": pos_tail,
             "filtered_shape": tuple(filtered_last_hidden_states.shape),
@@ -3800,7 +3799,7 @@ def _append_sglang_decode_hidden_states(req, logits_output, result, req_index: i
         append_rows = min(rows, available_rows)
         end = hidden_state_offset + append_rows
         filter_summary = getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTER_SUMMARY_ATTR, None)
-        positions_truncated = isinstance(filter_summary, dict) and filter_summary.get("positions_contiguous") is False
+        positions_truncated = isinstance(filter_summary, dict) and bool(filter_summary.get("positions_truncated", False))
         if hidden_states.dim() >= 2 and append_rows > 0:
             if not getattr(req, "return_hidden_states", False):
                 return end
