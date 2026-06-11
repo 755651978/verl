@@ -21,7 +21,7 @@ import re
 import sys
 import textwrap
 from functools import wraps
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 import torch
 import sglang.srt.entrypoints.engine
@@ -117,6 +117,7 @@ _VERL_RAW_TARGET_LOGPROBS_POSITIONS_METADATA_KEY = "raw_target_logprobs_position
 _VERL_TARGET_LOGPROBS_SOURCE_METADATA_KEY = "target_logprobs_source"
 _VERL_RAW_TOPK_LOGPROB_CHECK_METADATA_KEY = "raw_topk_logprob_check"
 _VERL_TARGET_LOGPROBS_SOURCE_RAW_HIDDEN_METADATA = "raw_hidden_metadata"
+_SGLANG_PATCH_SELECTION_FROM_ENV = object()
 
 
 def enable_sglang_original_logprob_return() -> None:
@@ -157,6 +158,10 @@ def _sglang_version_in_range(
 
 
 def _sglang_needs_eagle_legacy_alignment_patch() -> bool:
+    return _sglang_version_in_range(min_inclusive=(0, 5, 10), max_exclusive=(0, 5, 12))
+
+
+def _sglang_needs_qwen3_rope_compat_patch() -> bool:
     return _sglang_version_in_range(min_inclusive=(0, 5, 10), max_exclusive=(0, 5, 12))
 
 
@@ -745,8 +750,7 @@ def _sglang_verl_patches_disabled() -> bool:
     return _env_flag_enabled(_DISABLE_SGLANG_PATCH_ENV, default=False)
 
 
-def _selected_sglang_patches() -> set[str] | None:
-    raw_value = os.getenv(_SGLANG_PATCHES_ENV)
+def _normalize_sglang_patch_selection(raw_value: str | None) -> set[str] | None:
     if raw_value is None or not raw_value.strip():
         return None
 
@@ -782,6 +786,29 @@ def _selected_sglang_patches() -> set[str] | None:
     return set(patch_names)
 
 
+def _selected_sglang_patches() -> set[str] | None:
+    return _normalize_sglang_patch_selection(os.getenv(_SGLANG_PATCHES_ENV))
+
+
+def _normalize_sglang_patch_names(patches: Iterable[str] | str | None) -> set[str] | None:
+    if patches is None:
+        return None
+    if isinstance(patches, str):
+        return _normalize_sglang_patch_selection(patches)
+
+    patch_names = ",".join(str(patch_name) for patch_name in patches)
+    if not patch_names.strip():
+        return set()
+    return _normalize_sglang_patch_selection(patch_names)
+
+
+def _set_sglang_patch_selection_env(patches: set[str] | None) -> None:
+    if patches is None:
+        os.environ.pop(_SGLANG_PATCHES_ENV, None)
+        return
+    os.environ[_SGLANG_PATCHES_ENV] = ",".join(sorted(patches)) if patches else "none"
+
+
 def _selected_sglang_base_compat_patches() -> set[str]:
     raw_value = os.getenv(_SGLANG_BASE_COMPAT_PATCHES_ENV)
     if raw_value is None or not raw_value.strip():
@@ -793,8 +820,9 @@ def _selected_sglang_base_compat_patches() -> set[str]:
     return {patch_name for patch_name in patch_names if patch_name == _SGLANG_QWEN3_ROPE_COMPAT_PATCH_NAME}
 
 
-def _sglang_patch_enabled(patch_name: str) -> bool:
-    selected = _selected_sglang_patches()
+def _sglang_patch_enabled(patch_name: str, selected: set[str] | None | object = _SGLANG_PATCH_SELECTION_FROM_ENV) -> bool:
+    if selected is _SGLANG_PATCH_SELECTION_FROM_ENV:
+        selected = _selected_sglang_patches()
     return selected is None or patch_name in selected
 
 
@@ -4420,15 +4448,20 @@ def _render_sglang_stream_hidden_states(match: re.Match) -> str:
 
 
 def _insert_sglang_decode_hidden_state_offset(source: str) -> str | None:
-    if re.search(r"(?m)^[ \t]+hidden_state_offset = 0\s*$", source):
+    if re.search(
+        r"(?ms)^def\s+process_batch_result_decode\s*\(.*?\)\s*(?:->\s*[^:]+)?\s*:\r?\n"
+        r"[ \t]+hidden_state_offset = 0\s*(?:#.*)?\r?\n",
+        source,
+    ):
         return source
 
-    patched_source, loop_count = _SGLANG_DECODE_REQUEST_LOOP_PATTERN.subn(
-        lambda match: f"{match.group('indent')}hidden_state_offset = 0\n\n{match.group(0)}",
+    patched_source, function_count = re.subn(
+        r"(?ms)^(?P<header>def\s+process_batch_result_decode\s*\(.*?\)\s*(?:->\s*[^:]+)?\s*:\r?\n)",
+        lambda match: f"{match.group('header')}    hidden_state_offset = 0\n",
         source,
         count=1,
     )
-    if loop_count <= 0:
+    if function_count <= 0:
         return None
     return patched_source
 
@@ -4941,8 +4974,14 @@ def patch_sglang_hidden_states_tensor_output() -> None:
         )
 
 
-def _apply_selected_sglang_patches() -> bool:
-    selected_patches = _selected_sglang_patches()
+def _apply_selected_sglang_patches(
+    patches: Iterable[str] | str | None | object = _SGLANG_PATCH_SELECTION_FROM_ENV,
+) -> bool:
+    selected_patches = (
+        _selected_sglang_patches()
+        if patches is _SGLANG_PATCH_SELECTION_FROM_ENV
+        else _normalize_sglang_patch_names(patches)
+    )
 
     patchers = (
         ("qwen3_rope_compat", patch_sglang_qwen3_rope_compat),
@@ -4954,9 +4993,7 @@ def _apply_selected_sglang_patches() -> bool:
     applied_any = False
     skipped = []
     for patch_name, patcher in patchers:
-        patch_enabled = _sglang_patch_enabled(patch_name)
-        if patch_name == "qwen3_rope_compat" and selected_patches:
-            patch_enabled = True
+        patch_enabled = _sglang_patch_enabled(patch_name, selected_patches)
 
         if patch_enabled:
             patcher()
@@ -4987,9 +5024,10 @@ def _apply_sglang_child_process_patches() -> None:
             patch_sglang_qwen3_rope_compat()
         return
 
-    logger.warning("Applying verl SGLang patches in scheduler subprocess.")
-    _patch_sglang_npu_eagle_triton_bool_compat()
-    _apply_selected_sglang_patches()
+    selected_patches = _selected_sglang_patches()
+    patch_summary = "all" if selected_patches is None else ", ".join(sorted(selected_patches)) or "none"
+    logger.warning("Applying verl SGLang patches in scheduler subprocess: %s", patch_summary)
+    _apply_selected_sglang_patches(selected_patches)
 
 
 def _run_scheduler_process_with_verl_patches(*args, **kwargs):
@@ -5060,14 +5098,31 @@ def install_sglang_verl_patches(
     set_envs_and_config: Callable | None = None,
     target_weight_loader: str | None = None,
     draft_weight_loader: str | None = None,
+    patches: Iterable[str] | str | None | object = _SGLANG_PATCH_SELECTION_FROM_ENV,
 ) -> None:
+    global _target_weight_loader, _draft_weight_loader
+
     if _sglang_verl_patches_disabled():
         logger.warning("Skip installing verl SGLang patches because %s=1.", _DISABLE_SGLANG_PATCH_ENV)
         return
 
-    if _sglang_patch_enabled("eagle_update_weights"):
+    selected_patches = (
+        _selected_sglang_patches()
+        if patches is _SGLANG_PATCH_SELECTION_FROM_ENV
+        else _normalize_sglang_patch_names(patches)
+    )
+    if patches is not _SGLANG_PATCH_SELECTION_FROM_ENV:
+        os.environ.pop(_SGLANG_BASE_COMPAT_PATCHES_ENV, None)
+        _set_sglang_patch_selection_env(selected_patches)
+        if not _sglang_patch_enabled("eagle_update_weights", selected_patches):
+            _target_weight_loader = None
+            _draft_weight_loader = None
+            os.environ.pop(_TARGET_WEIGHT_LOADER_ENV, None)
+            os.environ.pop(_DRAFT_WEIGHT_LOADER_ENV, None)
+
+    if _sglang_patch_enabled("eagle_update_weights", selected_patches):
         configure_sglang_eagle_weight_update_patch(target_weight_loader, draft_weight_loader)
-    applied_any = _apply_selected_sglang_patches()
+    applied_any = _apply_selected_sglang_patches(selected_patches)
     if applied_any:
         patch_sglang_scheduler_process_entrypoints()
 
@@ -5080,13 +5135,9 @@ def install_sglang_qwen3_rope_compat_patch(set_envs_and_config: Callable | None 
         logger.warning("Skip installing SGLang Qwen3 rope compat patch because %s=1.", _DISABLE_SGLANG_PATCH_ENV)
         return
 
-    selected_patches = _selected_sglang_patches()
-    if selected_patches == set():
-        logger.warning("Skip installing SGLang Qwen3 rope compat patch because %s=none.", _SGLANG_PATCHES_ENV)
-    else:
-        os.environ[_SGLANG_BASE_COMPAT_PATCHES_ENV] = _SGLANG_QWEN3_ROPE_COMPAT_PATCH_NAME
-        patch_sglang_qwen3_rope_compat()
-        patch_sglang_scheduler_process_entrypoints()
+    os.environ[_SGLANG_BASE_COMPAT_PATCHES_ENV] = _SGLANG_QWEN3_ROPE_COMPAT_PATCH_NAME
+    patch_sglang_qwen3_rope_compat()
+    patch_sglang_scheduler_process_entrypoints()
 
     if set_envs_and_config is not None:
         sglang.srt.entrypoints.engine._set_envs_and_config = set_envs_and_config

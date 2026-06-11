@@ -43,13 +43,12 @@ from sglang.srt.managers.tokenizer_manager import ServerStatus
 from sglang.srt.utils import MultiprocessingSerializer
 
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.device import get_visible_devices_keyword
+from verl.utils.device import get_device_name, get_visible_devices_keyword
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.utils.profiler import DistProfiler, build_sglang_profiler_args
 from verl.workers.drafter.checkpoint import log_drafter_checkpoint_step
 from verl.workers.drafter.sglang_patch import (
     enable_sglang_original_logprob_return,
-    install_sglang_qwen3_rope_compat_patch,
     install_sglang_verl_patches,
 )
 from verl.workers.config import HFModelConfig, RolloutConfig
@@ -86,6 +85,10 @@ _VERL_DFLASH_RETURN_AUX_HIDDEN_PARAM = "_verl_dflash_return_aux_hidden"
 _VERL_DRAFTER_RAW_TOP_LOGPROBS_PARAM = "_verl_drafter_raw_top_logprobs"
 _VERL_DRAFTER_RAW_TOP_LOGPROBS_ENV = "VERL_DRAFTER_RAW_TOP_LOGPROBS"
 _VERL_DRAFTER_RAW_TOP_LOGPROBS_TOPK_ENV = "VERL_DRAFTER_RAW_TOP_LOGPROBS_TOPK"
+_SGLANG_QWEN3_ROPE_COMPAT_PATCH = "qwen3_rope_compat"
+_SGLANG_EAGLE_UPDATE_WEIGHTS_PATCH = "eagle_update_weights"
+_SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCH = "hidden_states_tensor_output"
+_SGLANG_NPU_EAGLE_TARGET_SAMPLING_PATCH = "npu_eagle_target_sampling"
 
 
 def _drafter_uses_eagle_last_hidden(drafter_cfg) -> bool:
@@ -138,6 +141,26 @@ def _sglang_needs_qwen3_rope_compat_patch() -> bool:
     except Exception:  # noqa: BLE001
         return False
     return version.parse("0.5.10") <= current_version < version.parse("0.5.12")
+
+
+def _is_npu_runtime() -> bool:
+    return get_device_name() == "npu"
+
+
+def _default_sglang_verl_patches(drafter_cfg) -> set[str]:
+    patches: set[str] = set()
+    if _is_npu_runtime():
+        patches.add(_SGLANG_NPU_EAGLE_TARGET_SAMPLING_PATCH)
+    if _sglang_needs_qwen3_rope_compat_patch():
+        patches.add(_SGLANG_QWEN3_ROPE_COMPAT_PATCH)
+
+    if getattr(drafter_cfg, "enable", False):
+        patches.add(_SGLANG_EAGLE_UPDATE_WEIGHTS_PATCH)
+    if getattr(drafter_cfg, "enable", False) and getattr(drafter_cfg, "enable_drafter_training", False):
+        training_cfg = getattr(drafter_cfg, "training", None)
+        if training_cfg is not None and getattr(training_cfg, "collect_hidden_states_from_sgl", False):
+            patches.add(_SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCH)
+    return patches
 
 
 def _env_int(name: str, default: int, minimum: int) -> int:
@@ -994,14 +1017,15 @@ class SGLangHttpServer:
 
         # NOTE: We can't directly call SGLang's launch_server since it's not an async function.
         # https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/entrypoints/http_server.py
-        if self.config.drafter.enable:
-            install_sglang_verl_patches(
-                set_envs_and_config=_set_envs_and_config,
-                target_weight_loader=VERL_SGLANG_TARGET_WEIGHT_LOADER,
-                draft_weight_loader=VERL_SGLANG_DRAFT_WEIGHT_LOADER,
-            )
-        elif _sglang_needs_qwen3_rope_compat_patch():
-            install_sglang_qwen3_rope_compat_patch(set_envs_and_config=_set_envs_and_config)
+        default_sglang_patches = _default_sglang_verl_patches(self.config.drafter)
+        if default_sglang_patches:
+            logger.info("Installing verl SGLang patches: %s", ", ".join(sorted(default_sglang_patches)))
+        install_sglang_verl_patches(
+            set_envs_and_config=_set_envs_and_config,
+            target_weight_loader=VERL_SGLANG_TARGET_WEIGHT_LOADER,
+            draft_weight_loader=VERL_SGLANG_DRAFT_WEIGHT_LOADER,
+            patches=default_sglang_patches,
+        )
         sglang.srt.entrypoints.engine._set_envs_and_config = _set_envs_and_config
         os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
         server_args = ServerArgs(**args)
