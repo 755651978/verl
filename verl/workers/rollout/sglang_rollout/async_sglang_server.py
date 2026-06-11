@@ -49,6 +49,7 @@ from verl.utils.profiler import DistProfiler, build_sglang_profiler_args
 from verl.workers.drafter.checkpoint import log_drafter_checkpoint_step
 from verl.workers.drafter.sglang_patch import (
     enable_sglang_original_logprob_return,
+    install_sglang_qwen3_rope_compat_patch,
     install_sglang_verl_patches,
 )
 from verl.workers.config import HFModelConfig, RolloutConfig
@@ -129,6 +130,14 @@ def _env_flag_enabled(name: str, default: bool = False) -> bool:
     if normalized in {"0", "false", "no", "off", "n"}:
         return False
     return default
+
+
+def _sglang_needs_qwen3_rope_compat_patch() -> bool:
+    try:
+        current_version = version.parse(sglang.__version__)
+    except Exception:  # noqa: BLE001
+        return False
+    return version.parse("0.5.10") <= current_version < version.parse("0.5.12")
 
 
 def _env_int(name: str, default: int, minimum: int) -> int:
@@ -991,6 +1000,8 @@ class SGLangHttpServer:
                 target_weight_loader=VERL_SGLANG_TARGET_WEIGHT_LOADER,
                 draft_weight_loader=VERL_SGLANG_DRAFT_WEIGHT_LOADER,
             )
+        elif _sglang_needs_qwen3_rope_compat_patch():
+            install_sglang_qwen3_rope_compat_patch(set_envs_and_config=_set_envs_and_config)
         sglang.srt.entrypoints.engine._set_envs_and_config = _set_envs_and_config
         os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
         server_args = ServerArgs(**args)

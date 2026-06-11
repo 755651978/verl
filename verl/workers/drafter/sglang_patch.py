@@ -58,6 +58,7 @@ _DRAFTER_RAW_TOP_LOGPROBS_TOPK_ENV = "VERL_DRAFTER_RAW_TOP_LOGPROBS_TOPK"
 _SGLANG_RETURN_ORIGINAL_LOGPROB_ENV = "SGLANG_RETURN_ORIGINAL_LOGPROB"
 _DISABLE_SGLANG_PATCH_ENV = "VERL_DISABLE_SGLANG_PATCH"
 _SGLANG_PATCHES_ENV = "VERL_SGLANG_PATCHES"
+_SGLANG_BASE_COMPAT_PATCHES_ENV = "VERL_SGLANG_BASE_COMPAT_PATCHES"
 
 _target_weight_loader: str | None = os.environ.get(_TARGET_WEIGHT_LOADER_ENV)
 _draft_weight_loader: str | None = os.environ.get(_DRAFT_WEIGHT_LOADER_ENV)
@@ -78,11 +79,12 @@ _SGLANG_LAST_HIDDEN_LOGPROB_CHECK_SKIP_LOG_COUNT = 0
 _SGLANG_LAST_HIDDEN_FILTER_DEBUG_LOG_COUNT = 0
 _SCHEDULER_PROCESS_PATCH_ATTR = "_verl_patched_scheduler_process"
 _SGLANG_TOP_K_ALL = 1 << 30
+_SGLANG_QWEN3_ROPE_COMPAT_PATCH_NAME = "qwen3_rope_compat"
 _SGLANG_PATCH_NAMES = {
     "eagle_update_weights",
     "npu_eagle_target_sampling",
     "hidden_states_tensor_output",
-    "qwen3_rope_compat",
+    _SGLANG_QWEN3_ROPE_COMPAT_PATCH_NAME,
 }
 _VERL_DRAFTER_HIDDEN_WINDOW_PARAM = "_verl_drafter_hidden_state_window"
 _VERL_HIDDEN_STATE_FRONT_TOKENS_PARAM = "_verl_hidden_state_front_tokens_per_sample"
@@ -778,6 +780,17 @@ def _selected_sglang_patches() -> set[str] | None:
             return set()
 
     return set(patch_names)
+
+
+def _selected_sglang_base_compat_patches() -> set[str]:
+    raw_value = os.getenv(_SGLANG_BASE_COMPAT_PATCHES_ENV)
+    if raw_value is None or not raw_value.strip():
+        return set()
+
+    patch_names = {item.strip().lower() for item in re.split(r"[\s,]+", raw_value.strip()) if item.strip()}
+    if "all" in patch_names:
+        return {_SGLANG_QWEN3_ROPE_COMPAT_PATCH_NAME}
+    return {patch_name for patch_name in patch_names if patch_name == _SGLANG_QWEN3_ROPE_COMPAT_PATCH_NAME}
 
 
 def _sglang_patch_enabled(patch_name: str) -> bool:
@@ -4964,6 +4977,16 @@ def _apply_sglang_child_process_patches() -> None:
     if os.getenv(_SGLANG_RETURN_ORIGINAL_LOGPROB_ENV) == "1":
         enable_sglang_original_logprob_return()
 
+    base_compat_patches = _selected_sglang_base_compat_patches()
+    if base_compat_patches and _selected_sglang_patches() is None:
+        logger.warning(
+            "Applying verl SGLang base compatibility patches in scheduler subprocess: %s",
+            ", ".join(sorted(base_compat_patches)),
+        )
+        if _SGLANG_QWEN3_ROPE_COMPAT_PATCH_NAME in base_compat_patches:
+            patch_sglang_qwen3_rope_compat()
+        return
+
     logger.warning("Applying verl SGLang patches in scheduler subprocess.")
     _patch_sglang_npu_eagle_triton_bool_compat()
     _apply_selected_sglang_patches()
@@ -5046,6 +5069,23 @@ def install_sglang_verl_patches(
         configure_sglang_eagle_weight_update_patch(target_weight_loader, draft_weight_loader)
     applied_any = _apply_selected_sglang_patches()
     if applied_any:
+        patch_sglang_scheduler_process_entrypoints()
+
+    if set_envs_and_config is not None:
+        sglang.srt.entrypoints.engine._set_envs_and_config = set_envs_and_config
+
+
+def install_sglang_qwen3_rope_compat_patch(set_envs_and_config: Callable | None = None) -> None:
+    if _sglang_verl_patches_disabled():
+        logger.warning("Skip installing SGLang Qwen3 rope compat patch because %s=1.", _DISABLE_SGLANG_PATCH_ENV)
+        return
+
+    selected_patches = _selected_sglang_patches()
+    if selected_patches == set():
+        logger.warning("Skip installing SGLang Qwen3 rope compat patch because %s=none.", _SGLANG_PATCHES_ENV)
+    else:
+        os.environ[_SGLANG_BASE_COMPAT_PATCHES_ENV] = _SGLANG_QWEN3_ROPE_COMPAT_PATCH_NAME
+        patch_sglang_qwen3_rope_compat()
         patch_sglang_scheduler_process_entrypoints()
 
     if set_envs_and_config is not None:
