@@ -4978,7 +4978,7 @@ def _apply_sglang_child_process_patches() -> None:
         enable_sglang_original_logprob_return()
 
     base_compat_patches = _selected_sglang_base_compat_patches()
-    if base_compat_patches and _selected_sglang_patches() is None:
+    if base_compat_patches:
         logger.warning(
             "Applying verl SGLang base compatibility patches in scheduler subprocess: %s",
             ", ".join(sorted(base_compat_patches)),
