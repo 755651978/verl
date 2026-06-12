@@ -4149,6 +4149,72 @@ def _select_sglang_v2_accepted_positions(positions, accepted_indices):
         return None
 
 
+def _copy_sglang_rows_to_cpu(value, index):
+    if not (_is_torch_tensor(value) and _is_torch_tensor(index)):
+        return None
+    try:
+        index_tensor = index.detach().to(dtype=torch.long).reshape(-1)
+        if int(index_tensor.numel()) <= 0:
+            return value[:0].detach().to("cpu", copy=True).contiguous()
+        rows = int(value.shape[0]) if value.dim() > 0 else 0
+        max_index = int(index_tensor.max().detach().cpu().item())
+        if rows <= max_index:
+            return None
+        selected = value[index_tensor.to(device=value.device, dtype=torch.long)]
+        return selected.detach().to("cpu", copy=True).contiguous()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to copy SGLang accepted rows to CPU: %s", exc)
+        return None
+
+
+def _stabilize_sglang_v2_drafter_metadata(result, accepted_indices, accepted_positions) -> None:
+    logits_output = getattr(result, "logits_output", None)
+    if logits_output is None or not _is_torch_tensor(accepted_indices):
+        return
+
+    stabilized_any = False
+    last_hidden_states = getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, None)
+    if _is_torch_tensor(last_hidden_states):
+        filtered_last_hidden = _copy_sglang_rows_to_cpu(last_hidden_states, accepted_indices)
+        if filtered_last_hidden is not None:
+            setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, filtered_last_hidden)
+            stabilized_any = True
+            _set_sglang_last_hidden_filter_summary(
+                logits_output,
+                {
+                    "stage": "filtered_spec_v2_verify_metadata",
+                    "hidden_rows_before": _sglang_hidden_state_rows(last_hidden_states),
+                    "hidden_rows_after": int(filtered_last_hidden.shape[0]),
+                    "index_len": int(accepted_indices.numel()),
+                    "hidden_shape": tuple(last_hidden_states.shape),
+                    "filtered_shape": tuple(filtered_last_hidden.shape),
+                },
+            )
+
+    for attr_name in (
+        _VERL_DRAFTER_LH_CHECK_RECOMPUTED_TOP_IDS_ATTR,
+        _VERL_DRAFTER_LH_CHECK_RECOMPUTED_TOP_LOGPROBS_ATTR,
+        _VERL_DRAFTER_LH_CHECK_RECOMPUTED_AT_SGLANG_TOP_ATTR,
+        _VERL_DRAFTER_LH_CHECK_SGLANG_TOP_IDS_ATTR,
+        _VERL_DRAFTER_LH_CHECK_SGLANG_TOP_LOGPROBS_ATTR,
+        _VERL_DRAFTER_LH_CHECK_RAW_TOPK_IDS_ATTR,
+        _VERL_DRAFTER_LH_CHECK_RAW_TOPK_LOGPROBS_ATTR,
+        _VERL_DRAFTER_LH_CHECK_RAW_TOPK_POSITIONS_ATTR,
+    ):
+        value = getattr(logits_output, attr_name, None)
+        filtered_value = _copy_sglang_rows_to_cpu(value, accepted_indices)
+        if filtered_value is not None:
+            setattr(logits_output, attr_name, filtered_value)
+            stabilized_any = True
+
+    if stabilized_any and accepted_positions is not None:
+        setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_POSITIONS_ATTR, accepted_positions)
+        setattr(logits_output, _VERL_DRAFTER_LH_CHECK_RAW_TOPK_POSITIONS_ATTR, accepted_positions)
+
+    if stabilized_any:
+        setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTERED_ATTR, True)
+
+
 def _attach_sglang_v2_accepted_indices_to_result(result, accept_index, accept_lens, positions=None, batch=None):
     if batch is not None and not _sglang_batch_requests_hidden_states(batch):
         return result
@@ -4164,6 +4230,9 @@ def _attach_sglang_v2_accepted_indices_to_result(result, accept_index, accept_le
         accepted_positions = _select_sglang_v2_accepted_positions(verify_positions, accepted_indices)
         if accepted_positions is not None:
             setattr(result, "accepted_positions", accepted_positions)
+    else:
+        accepted_positions = None
+    _stabilize_sglang_v2_drafter_metadata(result, accepted_indices, accepted_positions)
     return result
 
 
