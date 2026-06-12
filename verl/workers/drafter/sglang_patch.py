@@ -4051,6 +4051,33 @@ def _compact_sglang_v2_accept_index(accept_index, accept_lens):
     if accept_index is None or accept_lens is None:
         return None
     try:
+        if _is_torch_tensor(accept_index) and _is_torch_tensor(accept_lens):
+            lens_tensor = accept_lens.detach().to(device=accept_index.device, dtype=torch.long).reshape(-1)
+            index_tensor = accept_index.detach().to(dtype=torch.long)
+            if int(lens_tensor.numel()) <= 0 or int(index_tensor.numel()) <= 0:
+                return None
+            if index_tensor.dim() == 1:
+                compact = index_tensor.reshape(-1)
+            elif index_tensor.dim() >= 2:
+                max_slots = int(index_tensor.shape[1])
+                req_count = min(int(index_tensor.shape[0]), int(lens_tensor.numel()))
+                if req_count <= 0:
+                    return None
+                index_tensor = index_tensor[:req_count]
+                lens_tensor = lens_tensor[:req_count].clamp(min=0, max=max_slots)
+                slots = torch.arange(max_slots, device=index_tensor.device, dtype=torch.long).unsqueeze(0)
+                compact = index_tensor[slots < lens_tensor.unsqueeze(1)]
+            else:
+                return None
+            compact = compact.to(dtype=torch.long).reshape(-1)
+            compact = compact[compact >= 0]
+            if int(compact.numel()) <= 0:
+                return None
+            return compact.contiguous()
+    except Exception:
+        pass
+
+    try:
         if _is_torch_tensor(accept_lens):
             lens_cpu = accept_lens.detach().to("cpu", dtype=torch.long).reshape(-1)
         else:
@@ -4087,16 +4114,16 @@ def _compact_sglang_v2_accept_index(accept_index, accept_lens):
         return None
 
 
-def _clone_sglang_v2_verify_positions(positions):
+def _snapshot_sglang_v2_verify_positions(positions):
     if positions is None:
         return None
     try:
         if _is_torch_tensor(positions):
-            return positions.detach().to("cpu", dtype=torch.long, copy=True).reshape(-1).contiguous()
+            return positions.detach().clone().to(dtype=torch.long).reshape(-1).contiguous()
         else:
             return torch.tensor(list(positions), dtype=torch.long).reshape(-1).contiguous()
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to clone SGLang spec-v2 verify positions: %s", exc)
+        logger.warning("Failed to snapshot SGLang spec-v2 verify positions: %s", exc)
         return None
 
 
@@ -4104,19 +4131,17 @@ def _select_sglang_v2_accepted_positions(positions, accepted_indices):
     if positions is None or accepted_indices is None:
         return None
     try:
-        positions_tensor = _clone_sglang_v2_verify_positions(positions)
+        positions_tensor = _snapshot_sglang_v2_verify_positions(positions)
         if positions_tensor is None:
             return None
         if int(positions_tensor.numel()) <= 0:
             return None
         index_tensor = (
-            accepted_indices.detach().to("cpu", dtype=torch.long).reshape(-1)
+            accepted_indices.detach().to(device=positions_tensor.device, dtype=torch.long).reshape(-1)
             if _is_torch_tensor(accepted_indices)
-            else torch.tensor(list(accepted_indices), dtype=torch.long).reshape(-1)
+            else torch.tensor(list(accepted_indices), device=positions_tensor.device, dtype=torch.long).reshape(-1)
         )
         if int(index_tensor.numel()) <= 0:
-            return None
-        if int(positions_tensor.numel()) <= int(index_tensor.max().item()):
             return None
         return positions_tensor[index_tensor].contiguous()
     except Exception as exc:  # noqa: BLE001
@@ -4124,88 +4149,21 @@ def _select_sglang_v2_accepted_positions(positions, accepted_indices):
         return None
 
 
-def _copy_sglang_rows_to_cpu(value, index):
-    if not (_is_torch_tensor(value) and _is_torch_tensor(index)):
-        return None
-    try:
-        index_tensor = index.detach().to(dtype=torch.long).reshape(-1)
-        if int(index_tensor.numel()) <= 0:
-            return value[:0].detach().to("cpu", copy=True).contiguous()
-        rows = int(value.shape[0]) if value.dim() > 0 else 0
-        max_index = int(index_tensor.max().detach().cpu().item())
-        if rows <= max_index:
-            return None
-        selected = value[index_tensor.to(device=value.device, dtype=torch.long)]
-        return selected.detach().to("cpu", copy=True).contiguous()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to copy SGLang accepted rows to CPU: %s", exc)
-        return None
-
-
-def _stabilize_sglang_v2_drafter_metadata(result, accepted_indices, accepted_positions) -> None:
-    logits_output = getattr(result, "logits_output", None)
-    if logits_output is None or not _is_torch_tensor(accepted_indices):
-        return
-
-    stabilized_any = False
-    last_hidden_states = getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, None)
-    if _is_torch_tensor(last_hidden_states):
-        filtered_last_hidden = _copy_sglang_rows_to_cpu(last_hidden_states, accepted_indices)
-        if filtered_last_hidden is not None:
-            setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, filtered_last_hidden)
-            stabilized_any = True
-            _set_sglang_last_hidden_filter_summary(
-                logits_output,
-                {
-                    "stage": "filtered_spec_v2_verify_metadata",
-                    "hidden_rows_before": _sglang_hidden_state_rows(last_hidden_states),
-                    "hidden_rows_after": int(filtered_last_hidden.shape[0]),
-                    "index_len": int(accepted_indices.numel()),
-                    "hidden_shape": tuple(last_hidden_states.shape),
-                    "filtered_shape": tuple(filtered_last_hidden.shape),
-                },
-            )
-
-    for attr_name in (
-        _VERL_DRAFTER_LH_CHECK_RECOMPUTED_TOP_IDS_ATTR,
-        _VERL_DRAFTER_LH_CHECK_RECOMPUTED_TOP_LOGPROBS_ATTR,
-        _VERL_DRAFTER_LH_CHECK_RECOMPUTED_AT_SGLANG_TOP_ATTR,
-        _VERL_DRAFTER_LH_CHECK_SGLANG_TOP_IDS_ATTR,
-        _VERL_DRAFTER_LH_CHECK_SGLANG_TOP_LOGPROBS_ATTR,
-        _VERL_DRAFTER_LH_CHECK_RAW_TOPK_IDS_ATTR,
-        _VERL_DRAFTER_LH_CHECK_RAW_TOPK_LOGPROBS_ATTR,
-        _VERL_DRAFTER_LH_CHECK_RAW_TOPK_POSITIONS_ATTR,
-    ):
-        value = getattr(logits_output, attr_name, None)
-        filtered_value = _copy_sglang_rows_to_cpu(value, accepted_indices)
-        if filtered_value is not None:
-            setattr(logits_output, attr_name, filtered_value)
-            stabilized_any = True
-
-    if stabilized_any and accepted_positions is not None:
-        setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_POSITIONS_ATTR, accepted_positions)
-        setattr(logits_output, _VERL_DRAFTER_LH_CHECK_RAW_TOPK_POSITIONS_ATTR, accepted_positions)
-
-    if stabilized_any:
-        setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTERED_ATTR, True)
-
-
-def _attach_sglang_v2_accepted_indices_to_result(result, accept_index, accept_lens, positions=None):
+def _attach_sglang_v2_accepted_indices_to_result(result, accept_index, accept_lens, positions=None, batch=None):
+    if batch is not None and not _sglang_batch_requests_hidden_states(batch):
+        return result
     accepted_indices = _compact_sglang_v2_accept_index(accept_index, accept_lens)
     if accepted_indices is None:
         return result
     setattr(result, "accepted_indices", accepted_indices)
     setattr(result, "accept_indices", accepted_indices)
     if positions is not None:
-        verify_positions = _clone_sglang_v2_verify_positions(positions)
+        verify_positions = _snapshot_sglang_v2_verify_positions(positions)
         if verify_positions is not None:
             setattr(result, "positions", verify_positions)
         accepted_positions = _select_sglang_v2_accepted_positions(verify_positions, accepted_indices)
         if accepted_positions is not None:
             setattr(result, "accepted_positions", accepted_positions)
-    else:
-        accepted_positions = None
-    _stabilize_sglang_v2_drafter_metadata(result, accepted_indices, accepted_positions)
     return result
 
 
@@ -4216,11 +4174,23 @@ _SGLANG_EAGLE_V2_VERIFY_RETURN_PATTERN = re.compile(
 _SGLANG_EAGLE_V2_ACCEPT_LENS_ARG_PATTERN = re.compile(
     r"(?m)^(?P<indent>[ \t]+)accept_lens=(?P<lens>[A-Za-z_][A-Za-z0-9_]*)\s*,\s*$"
 )
+_SGLANG_EAGLE_V2_ATTACH_POSITIONS_ARG_PATTERN = re.compile(
+    r"(?m)^(?P<indent>[ \t]+)positions=getattr\(verify_input, \"positions\", None\),\s*$"
+)
 
 
 def _patch_sglang_eagle_v2_verify_accept_indices_source(source: str) -> str | None:
     source = textwrap.dedent(source)
     if "_attach_sglang_v2_accepted_indices_to_result" in source:
+        if "batch=batch" not in source:
+            source, _ = _SGLANG_EAGLE_V2_ATTACH_POSITIONS_ARG_PATTERN.subn(
+                lambda match: (
+                    f"{match.group('indent')}positions=getattr(verify_input, \"positions\", None),\n"
+                    f"{match.group('indent')}batch=batch,"
+                ),
+                source,
+                count=1,
+            )
         return source
     match = _SGLANG_EAGLE_V2_VERIFY_RETURN_PATTERN.search(source)
     if match is None:
@@ -4240,6 +4210,7 @@ def _patch_sglang_eagle_v2_verify_accept_indices_source(source: str) -> str | No
         f"{indent}    accept_index,\n"
         f"{indent}    {lens_var},\n"
         f"{indent}    positions=getattr(verify_input, \"positions\", None),\n"
+        f"{indent}    batch=batch,\n"
         f"{indent})\n"
         f"{indent}return result\n"
     )
