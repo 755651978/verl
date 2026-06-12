@@ -4087,12 +4087,42 @@ def _compact_sglang_v2_accept_index(accept_index, accept_lens):
         return None
 
 
-def _attach_sglang_v2_accepted_indices_to_result(result, accept_index, accept_lens):
+def _select_sglang_v2_accepted_positions(positions, accepted_indices):
+    if positions is None or accepted_indices is None:
+        return None
+    try:
+        if _is_torch_tensor(positions):
+            positions_tensor = positions.detach().to("cpu", dtype=torch.long).reshape(-1)
+        else:
+            positions_tensor = torch.tensor(list(positions), dtype=torch.long).reshape(-1)
+        if int(positions_tensor.numel()) <= 0:
+            return None
+        index_tensor = (
+            accepted_indices.detach().to("cpu", dtype=torch.long).reshape(-1)
+            if _is_torch_tensor(accepted_indices)
+            else torch.tensor(list(accepted_indices), dtype=torch.long).reshape(-1)
+        )
+        if int(index_tensor.numel()) <= 0:
+            return None
+        if int(positions_tensor.numel()) <= int(index_tensor.max().item()):
+            return None
+        return positions_tensor[index_tensor].contiguous()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to select SGLang spec-v2 accepted positions: %s", exc)
+        return None
+
+
+def _attach_sglang_v2_accepted_indices_to_result(result, accept_index, accept_lens, positions=None):
     accepted_indices = _compact_sglang_v2_accept_index(accept_index, accept_lens)
     if accepted_indices is None:
         return result
     setattr(result, "accepted_indices", accepted_indices)
     setattr(result, "accept_indices", accepted_indices)
+    if positions is not None:
+        setattr(result, "positions", positions)
+        accepted_positions = _select_sglang_v2_accepted_positions(positions, accepted_indices)
+        if accepted_positions is not None:
+            setattr(result, "accepted_positions", accepted_positions)
     return result
 
 
@@ -4122,7 +4152,12 @@ def _patch_sglang_eagle_v2_verify_accept_indices_source(source: str) -> str | No
         f"{indent}result = GenerationBatchResult(\n"
         f"{body}"
         f"{indent})\n"
-        f"{indent}_attach_sglang_v2_accepted_indices_to_result(result, accept_index, {lens_var})\n"
+        f"{indent}_attach_sglang_v2_accepted_indices_to_result(\n"
+        f"{indent}    result,\n"
+        f"{indent}    accept_index,\n"
+        f"{indent}    {lens_var},\n"
+        f"{indent}    positions=getattr(verify_input, \"positions\", None),\n"
+        f"{indent})\n"
         f"{indent}return result\n"
     )
     return source[: match.start()] + replacement + source[match.end() :]
