@@ -2660,17 +2660,14 @@ def _sglang_accept_rows_from_verify_result(obj) -> list[int] | None:
     return None
 
 
-def _reconstruct_sglang_accepted_indices_from_lens(obj):
-    draft_tokens = _sglang_nested_attr(obj, ("speculative_num_draft_tokens",))
+def _build_sglang_accepted_indices_from_lens(accept_lens: list[int] | None, draft_tokens: int | None):
+    if not accept_lens:
+        return None
     try:
         draft_tokens = int(draft_tokens)
     except (TypeError, ValueError):
         return None
     if draft_tokens <= 0:
-        return None
-
-    accept_lens = _sglang_accept_rows_from_verify_result(obj)
-    if not accept_lens:
         return None
 
     accepted = []
@@ -2683,6 +2680,36 @@ def _reconstruct_sglang_accepted_indices_from_lens(obj):
     if not accepted:
         return None
     return torch.tensor(accepted, dtype=torch.long)
+
+
+def _reconstruct_sglang_accepted_indices_from_lens(obj):
+    return _build_sglang_accepted_indices_from_lens(
+        _sglang_accept_rows_from_verify_result(obj),
+        _sglang_nested_attr(obj, ("speculative_num_draft_tokens",)),
+    )
+
+
+def _reconstruct_sglang_accepted_indices_from_hidden_rows(logits_output, result):
+    accept_lens = _sglang_accept_rows_from_verify_result(result)
+    if not accept_lens:
+        return None
+    batch_size = len(accept_lens)
+    if batch_size <= 0:
+        return None
+
+    last_hidden_states = getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, None)
+    hidden_rows = _sglang_hidden_state_rows(last_hidden_states)
+    if hidden_rows <= 0 or hidden_rows % batch_size != 0:
+        return None
+
+    accepted_rows = sum(max(int(value), 1) for value in accept_lens)
+    if hidden_rows <= accepted_rows:
+        return None
+
+    return _build_sglang_accepted_indices_from_lens(
+        accept_lens,
+        hidden_rows // batch_size,
+    )
 
 
 def _find_sglang_verify_positions(*candidates):
@@ -3171,6 +3198,19 @@ def _filter_sglang_drafter_last_hidden_from_verify_result(logits_output, result,
                 batch=batch,
                 filtered_positions=filtered_positions,
                 accepted_rows_per_req=accepted_rows_per_req,
+            )
+            return
+        accepted_indices = _reconstruct_sglang_accepted_indices_from_hidden_rows(
+            logits_output,
+            result,
+        )
+        if accepted_indices is not None:
+            _filter_sglang_drafter_last_hidden_output(
+                logits_output,
+                accepted_indices,
+                positions=positions,
+                batch=batch,
+                verify_result=result,
             )
             return
         _mark_sglang_last_hidden_missing_filter(logits_output, result)
