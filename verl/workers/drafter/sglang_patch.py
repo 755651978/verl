@@ -68,6 +68,7 @@ _SGLANG_EAGLE_UPDATE_PATCHED = False
 _SGLANG_NPU_EAGLE_SAMPLING_PATCHED = False
 _SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED = False
 _SGLANG_EAGLE_VERIFY_HIDDEN_STATES_PATCHED = False
+_SGLANG_EAGLE_V2_ACCEPT_INDICES_PATCHED = False
 _SGLANG_DFLASH_VERIFY_HIDDEN_STATES_PATCHED = False
 _SGLANG_DRAFTER_LAST_HIDDEN_OUTPUT_PATCHED = False
 _SGLANG_RAW_TOP_LOGPROBS_REQUEST_GATE_PATCHED = False
@@ -2683,32 +2684,11 @@ def _build_sglang_accepted_indices_from_lens(accept_lens: list[int] | None, draf
 
 
 def _reconstruct_sglang_accepted_indices_from_lens(obj):
+    if _sglang_nested_attr(obj, ("accept_lens",)) is not None:
+        return None
     return _build_sglang_accepted_indices_from_lens(
         _sglang_accept_rows_from_verify_result(obj),
         _sglang_nested_attr(obj, ("speculative_num_draft_tokens",)),
-    )
-
-
-def _reconstruct_sglang_accepted_indices_from_hidden_rows(logits_output, result):
-    accept_lens = _sglang_accept_rows_from_verify_result(result)
-    if not accept_lens:
-        return None
-    batch_size = len(accept_lens)
-    if batch_size <= 0:
-        return None
-
-    last_hidden_states = getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, None)
-    hidden_rows = _sglang_hidden_state_rows(last_hidden_states)
-    if hidden_rows <= 0 or hidden_rows % batch_size != 0:
-        return None
-
-    accepted_rows = sum(max(int(value), 1) for value in accept_lens)
-    if hidden_rows <= accepted_rows:
-        return None
-
-    return _build_sglang_accepted_indices_from_lens(
-        accept_lens,
-        hidden_rows // batch_size,
     )
 
 
@@ -3198,19 +3178,6 @@ def _filter_sglang_drafter_last_hidden_from_verify_result(logits_output, result,
                 batch=batch,
                 filtered_positions=filtered_positions,
                 accepted_rows_per_req=accepted_rows_per_req,
-            )
-            return
-        accepted_indices = _reconstruct_sglang_accepted_indices_from_hidden_rows(
-            logits_output,
-            result,
-        )
-        if accepted_indices is not None:
-            _filter_sglang_drafter_last_hidden_output(
-                logits_output,
-                accepted_indices,
-                positions=positions,
-                batch=batch,
-                verify_result=result,
             )
             return
         _mark_sglang_last_hidden_missing_filter(logits_output, result)
@@ -4078,6 +4045,175 @@ def _validate_sglang_eagle_verify_last_hidden(batch, spec_info, logits_output) -
         f"select_summary={select_summary}. "
         "This would train EAGLE3 against logits computed from a different hidden stream."
     )
+
+
+def _compact_sglang_v2_accept_index(accept_index, accept_lens):
+    if accept_index is None or accept_lens is None:
+        return None
+    try:
+        if _is_torch_tensor(accept_lens):
+            lens_cpu = accept_lens.detach().to("cpu", dtype=torch.long).reshape(-1)
+        else:
+            lens_cpu = torch.tensor(list(accept_lens), dtype=torch.long)
+        if _is_torch_tensor(accept_index):
+            index_cpu = accept_index.detach().to("cpu", dtype=torch.long)
+        else:
+            index_cpu = torch.tensor(accept_index, dtype=torch.long)
+        if int(lens_cpu.numel()) <= 0 or int(index_cpu.numel()) <= 0:
+            return None
+        if index_cpu.dim() == 1:
+            compact = index_cpu.reshape(-1)
+        elif index_cpu.dim() >= 2:
+            max_slots = int(index_cpu.shape[1])
+            chunks = []
+            for req_idx, accept_len in enumerate(lens_cpu.tolist()):
+                if req_idx >= int(index_cpu.shape[0]):
+                    break
+                keep = min(max(int(accept_len), 0), max_slots)
+                if keep > 0:
+                    chunks.append(index_cpu[req_idx, :keep].reshape(-1))
+            if not chunks:
+                return None
+            compact = torch.cat(chunks, dim=0)
+        else:
+            return None
+        compact = compact.to(dtype=torch.long).reshape(-1)
+        compact = compact[compact >= 0]
+        if int(compact.numel()) <= 0:
+            return None
+        return compact.contiguous()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to compact SGLang spec-v2 accept_index: %s", exc)
+        return None
+
+
+def _attach_sglang_v2_accepted_indices_to_result(result, accept_index, accept_lens):
+    accepted_indices = _compact_sglang_v2_accept_index(accept_index, accept_lens)
+    if accepted_indices is None:
+        return result
+    setattr(result, "accepted_indices", accepted_indices)
+    setattr(result, "accept_indices", accepted_indices)
+    logits_output = getattr(result, "logits_output", None)
+    base_hidden_states = getattr(logits_output, "hidden_states", None)
+    if _is_torch_tensor(base_hidden_states) and not bool(
+        getattr(logits_output, "_verl_drafter_base_hidden_filtered_by_accept_indices", False)
+    ):
+        try:
+            base_index = accepted_indices.to(device=base_hidden_states.device, dtype=torch.long)
+            if base_hidden_states.dim() == 3:
+                base_hidden_states = base_hidden_states.reshape(-1, base_hidden_states.shape[-1])
+            if int(base_index.numel()) > 0 and int(base_hidden_states.shape[0]) > int(base_index.max().item()):
+                setattr(logits_output, "hidden_states", base_hidden_states[base_index])
+                setattr(logits_output, "_verl_drafter_base_hidden_filtered_by_accept_indices", True)
+            elif int(base_hidden_states.shape[0]) == int(base_index.numel()):
+                setattr(logits_output, "_verl_drafter_base_hidden_filtered_by_accept_indices", True)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to filter SGLang spec-v2 base hidden states by accepted indices: %s", exc)
+    return result
+
+
+_SGLANG_EAGLE_V2_VERIFY_RETURN_PATTERN = re.compile(
+    r"(?ms)^(?P<indent>[ \t]+)return\s+GenerationBatchResult\(\r?\n"
+    r"(?P<body>.*?)(?P=indent)\)\r?\n"
+)
+_SGLANG_EAGLE_V2_ACCEPT_LENS_ARG_PATTERN = re.compile(
+    r"(?m)^(?P<indent>[ \t]+)accept_lens=(?P<lens>[A-Za-z_][A-Za-z0-9_]*)\s*,\s*$"
+)
+
+
+def _patch_sglang_eagle_v2_verify_accept_indices_source(source: str) -> str | None:
+    source = textwrap.dedent(source)
+    if "_attach_sglang_v2_accepted_indices_to_result" in source:
+        return source
+    match = _SGLANG_EAGLE_V2_VERIFY_RETURN_PATTERN.search(source)
+    if match is None:
+        return None
+    body = match.group("body")
+    lens_match = _SGLANG_EAGLE_V2_ACCEPT_LENS_ARG_PATTERN.search(body)
+    if lens_match is None or "accept_index" not in source:
+        return None
+    indent = match.group("indent")
+    lens_var = lens_match.group("lens")
+    replacement = (
+        f"{indent}result = GenerationBatchResult(\n"
+        f"{body}"
+        f"{indent})\n"
+        f"{indent}_attach_sglang_v2_accepted_indices_to_result(result, accept_index, {lens_var})\n"
+        f"{indent}return result\n"
+    )
+    return source[: match.start()] + replacement + source[match.end() :]
+
+
+def _make_sglang_eagle_v2_verify_accept_indices_patch(original_method):
+    try:
+        source = inspect.getsource(original_method)
+    except (OSError, TypeError):
+        return None
+
+    patched_source = _patch_sglang_eagle_v2_verify_accept_indices_source(source)
+    if patched_source is None:
+        return None
+
+    globals_dict = original_method.__globals__
+    globals_dict["_attach_sglang_v2_accepted_indices_to_result"] = _attach_sglang_v2_accepted_indices_to_result
+    namespace = {}
+    exec(  # noqa: S102
+        "from __future__ import annotations\n" + patched_source,
+        globals_dict,
+        namespace,
+    )
+    patched_method = namespace[original_method.__name__]
+    patched_method = wraps(original_method)(patched_method)
+    patched_method._verl_patched_eagle_v2_accept_indices = True
+    return _wrap_sglang_eagle_verify_last_hidden_filter(patched_method)
+
+
+def patch_sglang_eagle_v2_accept_indices() -> None:
+    """Expose real spec-v2 accepted row indices so drafter hidden states follow the accepted tree path."""
+    global _SGLANG_EAGLE_V2_ACCEPT_INDICES_PATCHED
+    if _SGLANG_EAGLE_V2_ACCEPT_INDICES_PATCHED:
+        return
+
+    patched_targets = []
+    targets = (
+        ("sglang.srt.speculative.eagle_worker_v2", "EagleDraftWorker"),
+        ("sglang.srt.speculative.multi_layer_eagle_worker_v2", "MultiLayerEagleDraftWorker"),
+    )
+    for module_name, class_name in targets:
+        try:
+            module = importlib.import_module(module_name)
+            worker_cls = getattr(module, class_name)
+            original_method = getattr(worker_cls, "verify", None)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Skip SGLang EAGLE v2 accepted-index patch for %s.%s: %s", module_name, class_name, exc)
+            continue
+        if original_method is None:
+            continue
+        if getattr(original_method, "_verl_patched_eagle_v2_accept_indices", False):
+            wrapped_method = _wrap_sglang_eagle_verify_last_hidden_filter(original_method)
+            if wrapped_method is not original_method:
+                setattr(worker_cls, "verify", wrapped_method)
+            patched_targets.append(f"{module_name}.{class_name}.verify")
+            continue
+        patched_method = _make_sglang_eagle_v2_verify_accept_indices_patch(original_method)
+        if patched_method is None:
+            wrapped_method = _wrap_sglang_eagle_verify_last_hidden_filter(original_method)
+            if wrapped_method is not original_method:
+                setattr(worker_cls, "verify", wrapped_method)
+                patched_targets.append(f"{module_name}.{class_name}.verify[last-hidden-filter]")
+            logger.warning(
+                "SGLang EAGLE v2 accepted-index source patch skipped for %s.%s; "
+                "spec-v2 drafter training will fail closed if accepted indices are missing.",
+                module_name,
+                class_name,
+            )
+            continue
+        setattr(worker_cls, "verify", patched_method)
+        patched_targets.append(f"{module_name}.{class_name}.verify")
+
+    if patched_targets:
+        _SGLANG_EAGLE_V2_ACCEPT_INDICES_PATCHED = True
+        logger.warning("Patched SGLang EAGLE v2 accepted indices for %s", ", ".join(patched_targets))
 
 
 def _wrap_sglang_eagle_verify_last_hidden_filter(method):
@@ -4962,6 +5098,7 @@ def patch_sglang_hidden_states_tensor_output() -> None:
     """Return SGLang hidden-state chunks as CPU tensors instead of Python lists."""
     global _SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED
     patch_sglang_eagle_legacy_alignment_compat()
+    patch_sglang_eagle_v2_accept_indices()
     patch_sglang_eagle_verify_hidden_states_full()
     patch_sglang_dflash_verify_hidden_states()
     patch_sglang_drafter_last_hidden_output()
