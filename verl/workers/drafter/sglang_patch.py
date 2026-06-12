@@ -4176,7 +4176,9 @@ def patch_sglang_eagle_v2_accept_indices() -> None:
 
     patched_targets = []
     targets = (
+        ("sglang.srt.speculative.eagle_worker_v2", "EAGLEWorkerV2"),
         ("sglang.srt.speculative.eagle_worker_v2", "EagleDraftWorker"),
+        ("sglang.srt.speculative.multi_layer_eagle_worker_v2", "MultiLayerEagleWorkerV2"),
         ("sglang.srt.speculative.multi_layer_eagle_worker_v2", "MultiLayerEagleDraftWorker"),
     )
     for module_name, class_name in targets:
