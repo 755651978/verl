@@ -4093,22 +4093,6 @@ def _attach_sglang_v2_accepted_indices_to_result(result, accept_index, accept_le
         return result
     setattr(result, "accepted_indices", accepted_indices)
     setattr(result, "accept_indices", accepted_indices)
-    logits_output = getattr(result, "logits_output", None)
-    base_hidden_states = getattr(logits_output, "hidden_states", None)
-    if _is_torch_tensor(base_hidden_states) and not bool(
-        getattr(logits_output, "_verl_drafter_base_hidden_filtered_by_accept_indices", False)
-    ):
-        try:
-            base_index = accepted_indices.to(device=base_hidden_states.device, dtype=torch.long)
-            if base_hidden_states.dim() == 3:
-                base_hidden_states = base_hidden_states.reshape(-1, base_hidden_states.shape[-1])
-            if int(base_index.numel()) > 0 and int(base_hidden_states.shape[0]) > int(base_index.max().item()):
-                setattr(logits_output, "hidden_states", base_hidden_states[base_index])
-                setattr(logits_output, "_verl_drafter_base_hidden_filtered_by_accept_indices", True)
-            elif int(base_hidden_states.shape[0]) == int(base_index.numel()):
-                setattr(logits_output, "_verl_drafter_base_hidden_filtered_by_accept_indices", True)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to filter SGLang spec-v2 base hidden states by accepted indices: %s", exc)
     return result
 
 
@@ -4165,7 +4149,7 @@ def _make_sglang_eagle_v2_verify_accept_indices_patch(original_method):
     patched_method = namespace[original_method.__name__]
     patched_method = wraps(original_method)(patched_method)
     patched_method._verl_patched_eagle_v2_accept_indices = True
-    return _wrap_sglang_eagle_verify_last_hidden_filter(patched_method)
+    return patched_method
 
 
 def patch_sglang_eagle_v2_accept_indices() -> None:
@@ -4192,17 +4176,10 @@ def patch_sglang_eagle_v2_accept_indices() -> None:
         if original_method is None:
             continue
         if getattr(original_method, "_verl_patched_eagle_v2_accept_indices", False):
-            wrapped_method = _wrap_sglang_eagle_verify_last_hidden_filter(original_method)
-            if wrapped_method is not original_method:
-                setattr(worker_cls, "verify", wrapped_method)
             patched_targets.append(f"{module_name}.{class_name}.verify")
             continue
         patched_method = _make_sglang_eagle_v2_verify_accept_indices_patch(original_method)
         if patched_method is None:
-            wrapped_method = _wrap_sglang_eagle_verify_last_hidden_filter(original_method)
-            if wrapped_method is not original_method:
-                setattr(worker_cls, "verify", wrapped_method)
-                patched_targets.append(f"{module_name}.{class_name}.verify[last-hidden-filter]")
             logger.warning(
                 "SGLang EAGLE v2 accepted-index source patch skipped for %s.%s; "
                 "spec-v2 drafter training will fail closed if accepted indices are missing.",
