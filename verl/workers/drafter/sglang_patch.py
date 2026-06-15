@@ -65,7 +65,7 @@ _draft_weight_loader: str | None = os.environ.get(_DRAFT_WEIGHT_LOADER_ENV)
 _ORIGINAL_SGLANG_RUN_SCHEDULER_PROCESS = sglang.srt.entrypoints.engine.run_scheduler_process
 _ORIGINAL_SGLANG_DIRECT_RUN_SCHEDULER_PROCESS = None
 _SGLANG_EAGLE_UPDATE_PATCHED = False
-_SGLANG_NPU_EAGLE_SAMPLING_PATCHED = False
+_SGLANG_NPU_EAGLE_SAMPLING_PATCHED: set[str] = set()
 _SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED = False
 _SGLANG_EAGLE_VERIFY_HIDDEN_STATES_PATCHED = False
 _SGLANG_EAGLE_V2_ACCEPT_INDICES_PATCHED = False
@@ -854,6 +854,10 @@ def _sglang_npu_eagle_verify_mode(version_env: str | None = None) -> str:
 
 def _sglang_npu_eagle_v1_verify_mode() -> str:
     return _sglang_npu_eagle_verify_mode(_EAGLE_V1_VERIFY_MODE_ENV)
+
+
+def _sglang_npu_eagle_v2_verify_mode() -> str:
+    return _sglang_npu_eagle_verify_mode(None)
 
 
 def _as_sglang_npu_eagle_sampling_float(tensor: torch.Tensor) -> torch.Tensor:
@@ -1645,24 +1649,63 @@ def _patch_sglang_npu_eagle_triton_bool_compat() -> None:
         logger.warning("Skip SGLang NPU EAGLE Triton bool compatibility patch: %s", exc)
 
 
+def _make_sglang_eagle_v2_npu_target_sampling_patch(original_method):
+    try:
+        source = textwrap.dedent(inspect.getsource(original_method))
+    except (OSError, TypeError):
+        return None
+
+    replacements = (
+        (
+            "if sampling_info.is_all_greedy or _is_npu or _is_hip:",
+            "if sampling_info.is_all_greedy or _is_hip:",
+        ),
+        (
+            "if sampling_info.is_all_greedy or _is_hip or _is_npu:",
+            "if sampling_info.is_all_greedy or _is_hip:",
+        ),
+    )
+    patched_source = source
+    replacement_count = 0
+    for old, new in replacements:
+        if old in patched_source:
+            patched_source = patched_source.replace(old, new, 1)
+            replacement_count += 1
+            break
+    if replacement_count <= 0 or patched_source == source:
+        return None
+
+    namespace = {}
+    exec(  # noqa: S102
+        "from __future__ import annotations\n" + patched_source,
+        original_method.__globals__,
+        namespace,
+    )
+    patched_method = namespace[original_method.__name__]
+    patched_method = wraps(original_method)(patched_method)
+    patched_method._verl_patched_npu_target_sampling = True
+    return patched_method
+
+
 def patch_sglang_npu_eagle_target_sampling() -> None:
-    """Patch SGLang NPU EAGLE v1 verification to use target-only sampling."""
+    """Patch SGLang NPU EAGLE verification to use target-only sampling."""
     global _SGLANG_NPU_EAGLE_SAMPLING_PATCHED
 
     _patch_sglang_npu_eagle_triton_bool_compat()
-    if _SGLANG_NPU_EAGLE_SAMPLING_PATCHED or not _is_sglang_npu_backend():
+    if not _is_sglang_npu_backend():
         return
 
     patched_targets = []
 
     v1_verify_mode = _sglang_npu_eagle_v1_verify_mode()
-    if v1_verify_mode != "greedy":
+    if v1_verify_mode != "greedy" and "v1" not in _SGLANG_NPU_EAGLE_SAMPLING_PATCHED:
         try:
             eagle_info = importlib.import_module("sglang.srt.speculative.eagle_info")
             eagle_info.top_k_renorm_prob = _top_k_renorm_prob_torch
             eagle_info.top_p_renorm_prob = _top_p_renorm_prob_torch
             eagle_info.tree_speculative_sampling_target_only = _tree_speculative_sampling_target_only_torch
             eagle_info.TREE_SPEC_KERNEL_AVAILABLE = True
+            _SGLANG_NPU_EAGLE_SAMPLING_PATCHED.add("v1")
             patched_targets.append("sglang.srt.speculative.eagle_info(target_only)")
         except Exception as exc:  # noqa: BLE001
             logger.debug("Skip SGLang EAGLE v1 target sampling patch: %s", exc)
@@ -1672,8 +1715,40 @@ def patch_sglang_npu_eagle_target_sampling() -> None:
             _EAGLE_V1_VERIFY_MODE_ENV,
         )
 
+    v2_verify_mode = _sglang_npu_eagle_v2_verify_mode()
+    if v2_verify_mode != "greedy" and "v2" not in _SGLANG_NPU_EAGLE_SAMPLING_PATCHED:
+        try:
+            eagle_info_v2 = importlib.import_module("sglang.srt.speculative.eagle_info_v2")
+            eagle_info_v2.top_k_renorm_prob = _top_k_renorm_prob_torch
+            eagle_info_v2.top_p_renorm_prob = _top_p_renorm_prob_torch
+            eagle_info_v2.tree_speculative_sampling_target_only = _tree_speculative_sampling_target_only_torch
+            mixin_cls = getattr(eagle_info_v2, "EagleVerifyInputV2Mixin", None)
+            original_sample = getattr(mixin_cls, "sample", None) if mixin_cls is not None else None
+            if original_sample is None:
+                logger.debug("Skip SGLang EAGLE v2 target sampling patch: sample method missing.")
+            elif getattr(original_sample, "_verl_patched_npu_target_sampling", False):
+                _SGLANG_NPU_EAGLE_SAMPLING_PATCHED.add("v2")
+                patched_targets.append("sglang.srt.speculative.eagle_info_v2(target_only)")
+            else:
+                patched_sample = _make_sglang_eagle_v2_npu_target_sampling_patch(original_sample)
+                if patched_sample is None:
+                    logger.warning(
+                        "Skip SGLang EAGLE v2 target sampling patch: "
+                        "NPU greedy condition not found."
+                    )
+                else:
+                    setattr(mixin_cls, "sample", patched_sample)
+                    _SGLANG_NPU_EAGLE_SAMPLING_PATCHED.add("v2")
+                    patched_targets.append("sglang.srt.speculative.eagle_info_v2(target_only)")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Skip SGLang EAGLE v2 target sampling patch: %s", exc)
+    else:
+        logger.info(
+            "Skip SGLang EAGLE v2 target sampling patch. Set %s=target_only to enable it.",
+            _EAGLE_VERIFY_MODE_ENV,
+        )
+
     if patched_targets:
-        _SGLANG_NPU_EAGLE_SAMPLING_PATCHED = True
         logger.warning("Patched SGLang NPU EAGLE sampling for %s", ", ".join(patched_targets))
 
 
