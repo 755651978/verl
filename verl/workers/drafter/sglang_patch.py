@@ -75,6 +75,8 @@ _SGLANG_RAW_TOP_LOGPROBS_REQUEST_GATE_PATCHED = False
 _SGLANG_QWEN3_ROPE_COMPAT_PATCHED = False
 _SGLANG_SCHEDULER_PROCESS_PATCHED = False
 _SGLANG_EAGLE_LEGACY_ALIGNMENT_PATCHED = False
+_SGLANG_DRAFTER_DECOUPLED_FORWARD_LOG_COUNT = 0
+_SGLANG_DRAFTER_DECOUPLED_REPLAY_LOG_COUNT = 0
 _SGLANG_LAST_HIDDEN_LOGPROB_CHECK_LOG_COUNT = 0
 _SGLANG_LAST_HIDDEN_LOGPROB_CHECK_SKIP_LOG_COUNT = 0
 _SGLANG_LAST_HIDDEN_FILTER_DEBUG_LOG_COUNT = 0
@@ -1835,6 +1837,16 @@ def _sglang_forward_batch_requests_last_hidden_for_drafter(forward_batch) -> boo
     return False
 
 
+def _sglang_should_filter_eagle_verify_last_hidden(batch) -> bool:
+    """Only filter verify rows for explicit drafter hidden-state collection.
+
+    EAGLE3 also uses ``logits_output.hidden_states`` on the normal inference path.
+    Filtering those rows when no drafter training sample requested last hidden can
+    make draft token embeddings and hidden states have different sequence lengths.
+    """
+    return _sglang_forward_batch_requests_last_hidden_for_drafter(batch)
+
+
 def _sglang_req_requests_dflash_aux_hidden(req) -> bool:
     return _custom_flag_enabled(
         _sglang_req_custom_params(req).get(_VERL_DFLASH_RETURN_AUX_HIDDEN_PARAM, False)
@@ -1912,7 +1924,17 @@ def _sglang_concat_last_hidden_for_drafter(req, logits_output, hidden_chunk, las
     if bool(getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_MATERIALIZED_ATTR, False)):
         return hidden_chunk
     if last_hidden_chunk is None:
-        raise RuntimeError("SGLang did not return final target hidden states for drafter training.")
+        request_custom_params = _sglang_req_custom_params(req)
+        raise RuntimeError(
+            "SGLang did not return final target hidden states for drafter training. "
+            f"hidden_shape={tuple(hidden_chunk.shape) if _is_torch_tensor(hidden_chunk) else None}, "
+            f"logits_output_type={type(logits_output).__name__}, "
+            f"dynamic_last_hidden_type={type(getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, None)).__name__}, "
+            f"materialized={bool(getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_MATERIALIZED_ATTR, False))}, "
+            f"select_summary={getattr(logits_output, '_verl_drafter_last_hidden_select_summary', None)}, "
+            f"filter_summary={getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTER_SUMMARY_ATTR, None)}, "
+            f"request_custom_params={request_custom_params}."
+        )
     if not (_is_torch_tensor(hidden_chunk) and _is_torch_tensor(last_hidden_chunk)):
         raise RuntimeError(
             "SGLang drafter last-hidden output requires tensor hidden chunks: "
@@ -2978,10 +3000,11 @@ def _filter_sglang_drafter_last_hidden_output(
                 base_hidden_states = base_hidden_states.reshape(-1, base_hidden_states.shape[-1])
             if index_len > 0 and int(base_hidden_states.shape[0]) > int(base_index.max().item()):
                 base_hidden_filtered = base_hidden_states[base_index]
-                setattr(logits_output, "hidden_states", base_hidden_filtered)
+                setattr(logits_output, "_verl_drafter_base_hidden_filtered_by_accept_indices_tensor", base_hidden_filtered)
                 setattr(logits_output, "_verl_drafter_base_hidden_filtered_by_accept_indices", True)
             elif int(base_hidden_states.shape[0]) == index_len:
                 base_hidden_filtered = base_hidden_states
+                setattr(logits_output, "_verl_drafter_base_hidden_filtered_by_accept_indices_tensor", base_hidden_filtered)
                 setattr(logits_output, "_verl_drafter_base_hidden_filtered_by_accept_indices", True)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to filter SGLang drafter base hidden states by accepted indices: %s", exc)
@@ -4242,9 +4265,11 @@ def _copy_sglang_rows_to_cpu(value, index):
         return None
 
 
-def _stabilize_sglang_v2_drafter_metadata(result, accepted_indices, accepted_positions) -> None:
+def _stabilize_sglang_v2_drafter_metadata(result, accepted_indices, accepted_positions, batch=None) -> None:
     logits_output = getattr(result, "logits_output", None)
     if logits_output is None or not _is_torch_tensor(accepted_indices):
+        return
+    if batch is not None and not _sglang_forward_batch_requests_last_hidden_for_drafter(batch):
         return
 
     stabilized_any = False
@@ -4272,9 +4297,6 @@ def _stabilize_sglang_v2_drafter_metadata(result, accepted_indices, accepted_pos
         _VERL_DRAFTER_LH_CHECK_RECOMPUTED_AT_SGLANG_TOP_ATTR,
         _VERL_DRAFTER_LH_CHECK_SGLANG_TOP_IDS_ATTR,
         _VERL_DRAFTER_LH_CHECK_SGLANG_TOP_LOGPROBS_ATTR,
-        _VERL_DRAFTER_LH_CHECK_RAW_TOPK_IDS_ATTR,
-        _VERL_DRAFTER_LH_CHECK_RAW_TOPK_LOGPROBS_ATTR,
-        _VERL_DRAFTER_LH_CHECK_RAW_TOPK_POSITIONS_ATTR,
     ):
         value = getattr(logits_output, attr_name, None)
         filtered_value = _copy_sglang_rows_to_cpu(value, accepted_indices)
@@ -4284,7 +4306,6 @@ def _stabilize_sglang_v2_drafter_metadata(result, accepted_indices, accepted_pos
 
     if stabilized_any and accepted_positions is not None:
         setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_POSITIONS_ATTR, accepted_positions)
-        setattr(logits_output, _VERL_DRAFTER_LH_CHECK_RAW_TOPK_POSITIONS_ATTR, accepted_positions)
 
     if stabilized_any:
         setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTERED_ATTR, True)
@@ -4307,7 +4328,7 @@ def _attach_sglang_v2_accepted_indices_to_result(result, accept_index, accept_le
             setattr(result, "accepted_positions", accepted_positions)
     else:
         accepted_positions = None
-    _stabilize_sglang_v2_drafter_metadata(result, accepted_indices, accepted_positions)
+    _stabilize_sglang_v2_drafter_metadata(result, accepted_indices, accepted_positions, batch=batch)
     return result
 
 
@@ -4440,6 +4461,9 @@ def _wrap_sglang_eagle_verify_last_hidden_filter(method):
             logits_output = result[0] if isinstance(result, (list, tuple)) else getattr(result, "logits_output", None)
             if logits_output is None:
                 return result
+            should_filter_last_hidden = _sglang_should_filter_eagle_verify_last_hidden(batch)
+            if not should_filter_last_hidden:
+                return result
             verify_output = result[1] if isinstance(result, (list, tuple)) and len(result) > 1 else result
             spec_info = getattr(self, "spec_info", None)
             accepted_indices = _find_sglang_accepted_indices(verify_output, result, spec_info, self)
@@ -4451,7 +4475,9 @@ def _wrap_sglang_eagle_verify_last_hidden_filter(method):
                     positions=positions,
                     batch=batch,
                     verify_result=verify_output,
-                    filter_base_hidden_states=not _sglang_needs_eagle_legacy_alignment_patch(),
+                    filter_base_hidden_states=(
+                        should_filter_last_hidden and not _sglang_needs_eagle_legacy_alignment_patch()
+                    ),
                 )
             else:
                 _filter_sglang_drafter_last_hidden_from_verify_result(
@@ -4476,6 +4502,9 @@ def _wrap_sglang_eagle_verify_input_last_hidden_filter(method):
     def patched_verify_input_last_hidden_filter(self, batch, logits_output, *args, **kwargs):
         result = method(self, batch, logits_output, *args, **kwargs)
         try:
+            should_filter_last_hidden = _sglang_should_filter_eagle_verify_last_hidden(batch)
+            if not should_filter_last_hidden:
+                return result
             accepted_indices = _find_sglang_accepted_indices(result, self, batch)
             positions = _find_sglang_verify_positions(self, result, batch)
             if accepted_indices is not None:
@@ -4485,7 +4514,9 @@ def _wrap_sglang_eagle_verify_input_last_hidden_filter(method):
                     positions=positions,
                     batch=batch,
                     verify_result=result,
-                    filter_base_hidden_states=not _sglang_needs_eagle_legacy_alignment_patch(),
+                    filter_base_hidden_states=(
+                        should_filter_last_hidden and not _sglang_needs_eagle_legacy_alignment_patch()
+                    ),
                 )
             else:
                 _filter_sglang_drafter_last_hidden_from_verify_result(
@@ -4508,15 +4539,12 @@ def _wrap_sglang_eagle_forward_generation_last_hidden_materialize(method):
 
     @wraps(method)
     def patched_forward_generation_last_hidden_materialize(self, *args, **kwargs):
-        result = method(self, *args, **kwargs)
-        try:
-            _materialize_sglang_drafter_last_hidden_output(
-                getattr(result, "logits_output", None),
-                stage="eagle_forward_generation_result",
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to materialize SGLang drafter final hidden at EAGLE output boundary: %s", exc)
-        return result
+        # Keep SGLang's native EAGLE hidden_states untouched on the inference
+        # path. Drafter training appends the final target hidden via
+        # _sglang_concat_last_hidden_for_drafter() when serializing hidden chunks;
+        # materializing it back into logits_output.hidden_states here can shorten
+        # or widen the tensor seen by the next draft decode step.
+        return method(self, *args, **kwargs)
 
     patched_forward_generation_last_hidden_materialize._verl_patched_drafter_last_hidden_materialize = True
     return patched_forward_generation_last_hidden_materialize
@@ -4581,14 +4609,15 @@ def _patch_sglang_eagle_verify_full_hidden_source(source: str) -> str | None:
             """            logits_output.hidden_states = logits_output.hidden_states[
                 res.accept_indices
             ]
-            _filter_sglang_drafter_last_hidden_output(
-                logits_output,
-                res.accept_indices,
-                positions=getattr(spec_info, "positions", None),
-                batch=batch,
-                verify_result=res,
-                filter_base_hidden_states=not _sglang_needs_eagle_legacy_alignment_patch(),
-            )
+            if _sglang_should_filter_eagle_verify_last_hidden(batch):
+                _filter_sglang_drafter_last_hidden_output(
+                    logits_output,
+                    res.accept_indices,
+                    positions=getattr(spec_info, "positions", None),
+                    batch=batch,
+                    verify_result=res,
+                    filter_base_hidden_states=not _sglang_needs_eagle_legacy_alignment_patch(),
+                )
 """,
         ),
         (
@@ -4599,42 +4628,45 @@ def _patch_sglang_eagle_verify_full_hidden_source(source: str) -> str | None:
             """            logits_output.hidden_states = logits_output.hidden_states[
                 res.accepted_indices
             ]
-            _filter_sglang_drafter_last_hidden_output(
-                logits_output,
-                res.accepted_indices,
-                positions=getattr(spec_info, "positions", None),
-                batch=batch,
-                verify_result=res,
-                filter_base_hidden_states=not _sglang_needs_eagle_legacy_alignment_patch(),
-            )
+            if _sglang_should_filter_eagle_verify_last_hidden(batch):
+                _filter_sglang_drafter_last_hidden_output(
+                    logits_output,
+                    res.accepted_indices,
+                    positions=getattr(spec_info, "positions", None),
+                    batch=batch,
+                    verify_result=res,
+                    filter_base_hidden_states=not _sglang_needs_eagle_legacy_alignment_patch(),
+                )
 """,
         ),
         (
             "        logits_output.hidden_states = logits_output.hidden_states[res.accept_indices]\n",
             (
                 "        logits_output.hidden_states = logits_output.hidden_states[res.accept_indices]\n"
-                "        _filter_sglang_drafter_last_hidden_output(\n"
-                "            logits_output,\n"
-                "            res.accept_indices,\n"
-                "            positions=getattr(spec_info, \"positions\", None),\n"
-                "            batch=batch,\n"
-                "            verify_result=res,\n"
-                "            filter_base_hidden_states=not _sglang_needs_eagle_legacy_alignment_patch(),\n"
-                "        )\n"
+                "        if _sglang_should_filter_eagle_verify_last_hidden(batch):\n"
+                "            _filter_sglang_drafter_last_hidden_output(\n"
+                "                logits_output,\n"
+                "                res.accept_indices,\n"
+                "                positions=getattr(spec_info, \"positions\", None),\n"
+                "                batch=batch,\n"
+                "                verify_result=res,\n"
+                "                filter_base_hidden_states=not _sglang_needs_eagle_legacy_alignment_patch(),\n"
+                "            )\n"
             ),
         ),
         (
             "        logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]\n",
             (
                 "        logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]\n"
-                "        _filter_sglang_drafter_last_hidden_output(\n"
-                "            logits_output,\n"
-                "            res.accepted_indices,\n"
-                "            positions=getattr(spec_info, \"positions\", None),\n"
-                "            batch=batch,\n"
-                "            verify_result=res,\n"
-                "            filter_base_hidden_states=not _sglang_needs_eagle_legacy_alignment_patch(),\n"
-                "        )\n"
+                "        if _sglang_should_filter_eagle_verify_last_hidden(batch):\n"
+                "            _filter_sglang_drafter_last_hidden_output(\n"
+                "                logits_output,\n"
+                "                res.accepted_indices,\n"
+                "                positions=getattr(spec_info, \"positions\", None),\n"
+                "                batch=batch,\n"
+                "                verify_result=res,\n"
+                "                filter_base_hidden_states=not _sglang_needs_eagle_legacy_alignment_patch(),\n"
+                "            )\n"
             ),
         ),
     )
@@ -4666,6 +4698,7 @@ def _make_sglang_eagle_verify_full_hidden_patch(original_method):
     globals_dict["_validate_sglang_eagle_verify_last_hidden"] = _validate_sglang_eagle_verify_last_hidden
     globals_dict["_filter_sglang_drafter_last_hidden_output"] = _filter_sglang_drafter_last_hidden_output
     globals_dict["_sglang_needs_eagle_legacy_alignment_patch"] = _sglang_needs_eagle_legacy_alignment_patch
+    globals_dict["_sglang_should_filter_eagle_verify_last_hidden"] = _sglang_should_filter_eagle_verify_last_hidden
     namespace = {}
     exec(  # noqa: S102
         "from __future__ import annotations\n" + patched_source,
@@ -4699,7 +4732,9 @@ def patch_sglang_eagle_verify_hidden_states_full() -> None:
 
     targets = (
         ("sglang.srt.speculative.eagle_worker", "EAGLEWorker"),
+        ("sglang.srt.speculative.eagle_worker_v2", "EAGLEWorkerV2"),
         ("sglang.srt.speculative.multi_layer_eagle_worker", "MultiLayerEagleWorker"),
+        ("sglang.srt.speculative.multi_layer_eagle_worker_v2", "MultiLayerEagleWorkerV2"),
     )
     patched_targets = []
     for module_name, class_name in targets:
@@ -4990,7 +5025,16 @@ def _make_sglang_drafter_last_hidden_forward_patch(original_method):
             else:
                 output.hidden_states = dflash_hidden_states
                 setattr(output, "_verl_dflash_aux_hidden_states", True)
-        if _sglang_raw_top_logprobs_enabled(logits_metadata):
+        raw_top_logprobs_requested = _sglang_raw_top_logprobs_enabled(logits_metadata)
+        if raw_top_logprobs_requested and return_last_hidden:
+            global _SGLANG_DRAFTER_DECOUPLED_FORWARD_LOG_COUNT
+            if _SGLANG_DRAFTER_DECOUPLED_FORWARD_LOG_COUNT < 8:
+                _SGLANG_DRAFTER_DECOUPLED_FORWARD_LOG_COUNT += 1
+                logger.warning(
+                    "SGLang drafter output requested both raw top-logprobs and last hidden; "
+                    "metadata paths are decoupled and raw teacher rows will not be copied by last-hidden replay."
+                )
+        if raw_top_logprobs_requested:
             _attach_sglang_raw_top_logprobs(output, logits_metadata)
         if return_last_hidden and hidden_states is not None:
             if getattr(output, "hidden_states", None) is not None:
@@ -5033,9 +5077,6 @@ def _copy_sglang_drafter_last_hidden_output(src, dst, index) -> None:
         _VERL_DRAFTER_LH_CHECK_RECOMPUTED_AT_SGLANG_TOP_ATTR,
         _VERL_DRAFTER_LH_CHECK_SGLANG_TOP_IDS_ATTR,
         _VERL_DRAFTER_LH_CHECK_SGLANG_TOP_LOGPROBS_ATTR,
-        _VERL_DRAFTER_LH_CHECK_RAW_TOPK_IDS_ATTR,
-        _VERL_DRAFTER_LH_CHECK_RAW_TOPK_LOGPROBS_ATTR,
-        _VERL_DRAFTER_LH_CHECK_RAW_TOPK_POSITIONS_ATTR,
     ):
         value = getattr(src, attr_name, None)
         if _is_torch_tensor(value):
@@ -5054,6 +5095,44 @@ def _copy_sglang_drafter_last_hidden_output(src, dst, index) -> None:
             setattr(dst, attr_name, getattr(src, attr_name))
 
 
+def _copy_sglang_raw_top_logprobs_output(src, dst, index) -> None:
+    """Copy raw top-k teacher metadata without touching last-hidden fields."""
+    if dst is None:
+        return
+    for attr_name in (
+        _VERL_DRAFTER_LH_CHECK_RAW_TOPK_IDS_ATTR,
+        _VERL_DRAFTER_LH_CHECK_RAW_TOPK_LOGPROBS_ATTR,
+        _VERL_DRAFTER_LH_CHECK_RAW_TOPK_POSITIONS_ATTR,
+    ):
+        value = getattr(src, attr_name, None)
+        if _is_torch_tensor(value):
+            try:
+                setattr(dst, attr_name, value[index])
+            except Exception:  # noqa: BLE001
+                setattr(dst, attr_name, value)
+
+
+def _log_sglang_drafter_decoupled_replay(stage: str, forward_batch, logits_output, copied_last_hidden: bool) -> None:
+    global _SGLANG_DRAFTER_DECOUPLED_REPLAY_LOG_COUNT
+    if _SGLANG_DRAFTER_DECOUPLED_REPLAY_LOG_COUNT >= 8:
+        return
+    raw_requested = _sglang_raw_top_logprobs_enabled(forward_batch)
+    last_hidden_requested = _sglang_forward_batch_requests_last_hidden_for_drafter(forward_batch)
+    if not (raw_requested or last_hidden_requested):
+        return
+    _SGLANG_DRAFTER_DECOUPLED_REPLAY_LOG_COUNT += 1
+    logger.warning(
+        "[SGLang drafter replay decoupled] stage=%s raw_requested=%s raw_complete=%s "
+        "last_hidden_requested=%s last_hidden_copied=%s has_last_hidden=%s",
+        stage,
+        raw_requested,
+        _raw_top_logprobs_metadata_complete(logits_output),
+        last_hidden_requested,
+        copied_last_hidden,
+        getattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, None) is not None,
+    )
+
+
 def _clear_sglang_raw_top_logprobs(logits_output) -> None:
     if logits_output is None:
         return
@@ -5067,6 +5146,45 @@ def _clear_sglang_raw_top_logprobs(logits_output) -> None:
                 delattr(logits_output, attr_name)
         except Exception:  # noqa: BLE001
             setattr(logits_output, attr_name, None)
+
+
+def _raw_top_logprobs_metadata_complete(logits_output) -> bool:
+    next_token_logits = getattr(logits_output, "next_token_logits", None)
+    raw_topk_ids = getattr(logits_output, _VERL_DRAFTER_LH_CHECK_RAW_TOPK_IDS_ATTR, None)
+    raw_topk_logprobs = getattr(logits_output, _VERL_DRAFTER_LH_CHECK_RAW_TOPK_LOGPROBS_ATTR, None)
+    raw_positions = getattr(logits_output, _VERL_DRAFTER_LH_CHECK_RAW_TOPK_POSITIONS_ATTR, None)
+    if not (
+        _is_torch_tensor(next_token_logits)
+        and next_token_logits.dim() >= 2
+        and _is_torch_tensor(raw_topk_ids)
+        and _is_torch_tensor(raw_topk_logprobs)
+        and _is_torch_tensor(raw_positions)
+    ):
+        return False
+    rows = int(next_token_logits.shape[0])
+    return (
+        raw_topk_ids.dim() == 2
+        and raw_topk_logprobs.dim() == 2
+        and int(raw_topk_ids.shape[0]) == rows
+        and int(raw_topk_logprobs.shape[0]) == rows
+        and int(raw_positions.numel()) == rows
+    )
+
+
+def _ensure_sglang_raw_top_logprobs_for_replay(logits_output, forward_batch, source_output=None) -> bool:
+    if logits_output is None or not _sglang_raw_top_logprobs_enabled(forward_batch):
+        return False
+    if _raw_top_logprobs_metadata_complete(logits_output):
+        return True
+    if source_output is not None and source_output is not logits_output:
+        try:
+            rows = int(getattr(logits_output, "next_token_logits").shape[0])
+            _copy_sglang_raw_top_logprobs_output(source_output, logits_output, slice(0, rows))
+        except Exception:  # noqa: BLE001
+            pass
+        if _raw_top_logprobs_metadata_complete(logits_output):
+            return True
+    return _attach_sglang_raw_top_logprobs(logits_output, forward_batch)
 
 
 def _sglang_graph_replay_output_buffer(runner, original_method, forward_batch=None):
@@ -5113,24 +5231,107 @@ def _sglang_graph_replay_output_buffer(runner, original_method, forward_batch=No
     return None
 
 
+def _sglang_graph_replay_raw_num_tokens(runner) -> int:
+    for attr_name in ("raw_num_token", "raw_num_tokens"):
+        raw_num_tokens = getattr(runner, attr_name, None)
+        if raw_num_tokens is not None:
+            try:
+                return int(raw_num_tokens)
+            except (TypeError, ValueError):
+                continue
+    return 0
+
+
 def _make_sglang_drafter_last_hidden_graph_replay_patch(original_method):
     @wraps(original_method)
     def patched_graph_replay(self, *args, **kwargs):
         result = original_method(self, *args, **kwargs)
         forward_batch = args[0] if args else kwargs.get("forward_batch")
         output = _sglang_graph_replay_output_buffer(self, original_method, forward_batch)
-        if output is not None:
-            _copy_sglang_drafter_last_hidden_output(output, result, slice(0, self.raw_num_token))
-            if _sglang_forward_mode_is_target_verify(forward_batch):
-                _clear_sglang_raw_top_logprobs(result)
-        if _sglang_raw_top_logprobs_enabled(forward_batch):
-            _attach_sglang_raw_top_logprobs(result, forward_batch)
-        if output is not None:
+        raw_num_tokens = _sglang_graph_replay_raw_num_tokens(self)
+        copy_last_hidden = output is not None and _sglang_forward_batch_requests_last_hidden_for_drafter(forward_batch)
+        if copy_last_hidden:
+            _copy_sglang_drafter_last_hidden_output(output, result, slice(0, raw_num_tokens))
+        _ensure_sglang_raw_top_logprobs_for_replay(result, forward_batch, output)
+        if copy_last_hidden:
             _attach_sglang_last_hidden_logprob_check_from_graph_runner(self, result, forward_batch)
+        _log_sglang_drafter_decoupled_replay(
+            type(self).__name__,
+            forward_batch,
+            result,
+            copied_last_hidden=copy_last_hidden,
+        )
         return result
 
     patched_graph_replay._verl_patched_drafter_last_hidden_output = True
     return patched_graph_replay
+
+
+def _make_sglang_drafter_last_hidden_inline_graph_replay_patch(original_method):
+    source = textwrap.dedent(inspect.getsource(original_method))
+    marker = "return LogitsProcessorOutput("
+    marker_index = source.find(marker)
+    while marker_index >= 0:
+        block_start = marker_index
+        paren_depth = 0
+        block_end = None
+        for offset, char in enumerate(source[block_start:]):
+            if char == "(":
+                paren_depth += 1
+            elif char == ")":
+                paren_depth -= 1
+                if paren_depth == 0:
+                    block_end = block_start + offset + 1
+                    break
+        if block_end is None:
+            break
+        old_block = source[block_start:block_end]
+        if "output.next_token_logits" in old_block and "output.hidden_states" in old_block:
+            indent = source[source.rfind("\n", 0, block_start) + 1 : block_start]
+            body = old_block.replace(marker, "_verl_replay_logits_output = LogitsProcessorOutput(", 1)
+            new_block = (
+                body
+                + "\n"
+                + f"{indent}if _sglang_forward_batch_requests_last_hidden_for_drafter(forward_batch):\n"
+                + f"{indent}    _copy_sglang_drafter_last_hidden_output(\n"
+                + f"{indent}        output,\n"
+                + f"{indent}        _verl_replay_logits_output,\n"
+                + f"{indent}        slice(0, self.raw_num_tokens),\n"
+                + f"{indent}    )\n"
+                + f"{indent}_ensure_sglang_raw_top_logprobs_for_replay(\n"
+                + f"{indent}    _verl_replay_logits_output,\n"
+                + f"{indent}    forward_batch,\n"
+                + f"{indent}    output,\n"
+                + f"{indent})\n"
+                + f"{indent}return _verl_replay_logits_output"
+            )
+            source = source[:block_start] + new_block + source[block_end:]
+            break
+        marker_index = source.find(marker, block_end)
+    else:
+        block_end = None
+
+    if block_end is None:
+        raise RuntimeError(
+            f"Could not locate LogitsProcessorOutput replay return in {original_method.__qualname__}."
+        )
+
+    globals_dict = original_method.__globals__
+    globals_dict["_copy_sglang_drafter_last_hidden_output"] = _copy_sglang_drafter_last_hidden_output
+    globals_dict["_ensure_sglang_raw_top_logprobs_for_replay"] = _ensure_sglang_raw_top_logprobs_for_replay
+    globals_dict["_sglang_forward_batch_requests_last_hidden_for_drafter"] = (
+        _sglang_forward_batch_requests_last_hidden_for_drafter
+    )
+    namespace = {}
+    exec(  # noqa: S102
+        "from __future__ import annotations\n" + source,
+        globals_dict,
+        namespace,
+    )
+    patched_method = namespace[original_method.__name__]
+    patched_method = wraps(original_method)(patched_method)
+    patched_method._verl_patched_drafter_last_hidden_output = True
+    return patched_method
 
 
 def _make_sglang_forward_batch_init_new_raw_top_logprobs_patch(original_method):
@@ -5235,12 +5436,50 @@ def patch_sglang_drafter_last_hidden_output() -> None:
         )
         active_parts.append(f"{class_name}.replay")
 
+    inline_graph_targets = (
+        ("sglang.srt.model_executor.piecewise_cuda_graph_runner", "PiecewiseCudaGraphRunner"),
+        ("sglang.srt.model_executor.breakable_cuda_graph_runner", "BreakableCudaGraphRunner"),
+    )
+    for module_name, class_name in inline_graph_targets:
+        try:
+            graph_module = importlib.import_module(module_name)
+            graph_runner_cls = getattr(graph_module, class_name)
+        except Exception as exc:  # noqa: BLE001
+            log_fn = logger.warning if _sglang_drafter_return_last_hidden_enabled() else logger.debug
+            log_fn(
+                "Skip SGLang inline graph replay last-hidden patch for %s.%s: %s",
+                module_name,
+                class_name,
+                exc,
+            )
+            continue
+        original_replay = getattr(graph_runner_cls, "replay", None)
+        if original_replay is None or getattr(original_replay, "_verl_patched_drafter_last_hidden_output", False):
+            if original_replay is not None:
+                active_parts.append(f"{class_name}.replay")
+            continue
+        try:
+            patched_replay = _make_sglang_drafter_last_hidden_inline_graph_replay_patch(original_replay)
+        except Exception as exc:  # noqa: BLE001
+            log_fn = logger.warning if _sglang_drafter_return_last_hidden_enabled() else logger.debug
+            log_fn(
+                "Skip SGLang inline graph replay last-hidden patch for %s.%s: %s",
+                module_name,
+                class_name,
+                exc,
+            )
+            continue
+        setattr(graph_runner_cls, "replay", patched_replay)
+        active_parts.append(f"{class_name}.replay")
+
     if active_parts:
         _SGLANG_DRAFTER_LAST_HIDDEN_OUTPUT_PATCHED = True
         logger.warning(
-            "SGLang drafter last-hidden output patch active for %s; return_last_hidden=%s",
+            "SGLang drafter output patch active for %s; return_last_hidden_env=%s "
+            "raw_top_logprobs_env=%s; replay metadata paths are decoupled",
             ", ".join(active_parts),
             _sglang_drafter_return_last_hidden_enabled(),
+            _env_flag_enabled(_DRAFTER_RAW_TOP_LOGPROBS_ENV, default=False),
         )
 
 

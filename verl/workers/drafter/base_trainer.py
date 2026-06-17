@@ -448,7 +448,7 @@ class DrafterBaseTrainer:
         self._training_timing_steps = 0
         self._training_metric_sums = {}
         self._training_metric_steps = 0
-        self._frozen_param_names = {"model.embed_tokens.weight"}
+        self._frozen_param_names = {"embed_tokens.weight", "model.embed_tokens.weight"}
 
         # Ulysses Sequence Parallelism configuration. EAGLE/EAGLE3 can slice
         # token-wise training tensors by the rollout TP size, but DFlash anchor
@@ -736,7 +736,24 @@ class DrafterBaseTrainer:
 
         return drafter_train_config
 
-    
+    @staticmethod
+    def _normalize_state_dict_name(name: str) -> str:
+        """Normalize wrapper prefixes so state_dict and named_parameters can be compared."""
+        normalized = name
+        for prefix in ("module.", "_fsdp_wrapped_module."):
+            while normalized.startswith(prefix):
+                normalized = normalized[len(prefix) :]
+        return normalized
+
+    def _get_trainable_parameter_names_for_publish(self) -> set[str]:
+        if self.model is None:
+            return set()
+        trainable_names: set[str] = set()
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                trainable_names.add(self._normalize_state_dict_name(name))
+        return trainable_names
+
     def _get_trainable_state_dict(self) -> dict[str, torch.Tensor]:
         """Get floating state dict entries excluding weights shared with the target model."""
         if isinstance(self.model, FSDP) or (self.training_device_mesh is not None and dist.is_initialized()):
@@ -745,12 +762,25 @@ class DrafterBaseTrainer:
             full_state_dict = self.model.state_dict()
         if not full_state_dict:
             return {}
+        trainable_param_names = self._get_trainable_parameter_names_for_publish()
+        state_names = {self._normalize_state_dict_name(name) for name in full_state_dict.keys()}
+        use_trainable_name_filter = bool(trainable_param_names and state_names.intersection(trainable_param_names))
+        if trainable_param_names and not use_trainable_name_filter:
+            logger.debug(
+                "[Rank %s] Skip requires_grad-based drafter publish filtering because state_dict names "
+                "do not match named_parameters; falling back to static frozen-name filters.",
+                self.rank,
+            )
         trainable_state_dict = {}
 
         for name, param in full_state_dict.items():
+            normalized_name = self._normalize_state_dict_name(name)
             # EAGLE3 vocab mapping buffers are static and can break SGLang hot update device assumptions.
             if isinstance(param, torch.Tensor) and not torch.is_floating_point(param):
                 logger.debug(f"Skipping non-floating drafter state: {name}, dtype={param.dtype}")
+                continue
+            if use_trainable_name_filter and normalized_name not in trainable_param_names:
+                logger.debug(f"Skipping non-trainable drafter state for hot publish: {name}")
                 continue
             # EAGLE shares target lm_head, while EAGLE3 trains and publishes its own lm_head.
             if any(frozen_name in name for frozen_name in self._frozen_param_names) or (
@@ -1342,6 +1372,12 @@ class DrafterBaseTrainer:
         pad_id = int(getattr(model_config, "pad_token_id", self.pad_token_id) or self.pad_token_id)
         for i in range(batch_size):
             expected_hidden_rows = max(input_seq_length - 1, 0)
+            raw_positions_item_for_alignment = None
+            if cpu_hidden_raw_target_logprobs is not None and cpu_hidden_raw_target_logprobs_positions is not None:
+                raw_rows_for_alignment = int(cpu_hidden_raw_target_logprobs[i].size(0))
+                candidate_raw_positions = cpu_hidden_raw_target_logprobs_positions[i].reshape(-1).long()
+                if int(candidate_raw_positions.numel()) >= raw_rows_for_alignment:
+                    raw_positions_item_for_alignment = candidate_raw_positions[:raw_rows_for_alignment]
             hidden_positions_item = None
             if cpu_hidden_positions is not None:
                 hidden_positions_item = cpu_hidden_positions[i].reshape(-1)[:hidden_seq_length].long()
@@ -1350,31 +1386,57 @@ class DrafterBaseTrainer:
             hidden_position_start = _batch_item_int(batch.get("hidden_position_start"), i)
             uses_hidden_positions = hidden_positions_item is not None
             if hidden_positions_item is not None:
+                hidden_row_offset = 0
+                selected_hidden_row_end = int(hidden_positions_item.numel())
                 contiguous_mask = hidden_positions_item[1:] == hidden_positions_item[:-1] + 1
                 if contiguous_mask.numel() > 0 and not bool(contiguous_mask.all()):
-                    first_break = int(torch.nonzero(~contiguous_mask, as_tuple=False)[0].item()) + 1
+                    break_points = (torch.nonzero(~contiguous_mask, as_tuple=False).reshape(-1) + 1).tolist()
+                    segment_starts = [0] + [int(x) for x in break_points]
+                    segment_ends = [int(x) for x in break_points] + [int(hidden_positions_item.numel())]
+                    raw_position_set = None
+                    if raw_positions_item_for_alignment is not None and int(raw_positions_item_for_alignment.numel()) > 0:
+                        raw_position_set = {int(x) for x in raw_positions_item_for_alignment.tolist() if int(x) >= 0}
+                    best_segment = (0, segment_ends[0])
+                    best_score = (-1, -1)
+                    for seg_start, seg_end in zip(segment_starts, segment_ends):
+                        seg_len = max(int(seg_end) - int(seg_start), 0)
+                        if seg_len <= 0:
+                            continue
+                        if raw_position_set is None:
+                            score = (seg_len, seg_len)
+                        else:
+                            seg_positions = hidden_positions_item[seg_start:seg_end].tolist()
+                            covered = sum(1 for position in seg_positions if int(position) in raw_position_set)
+                            score = (covered, seg_len)
+                        if score > best_score:
+                            best_score = score
+                            best_segment = (int(seg_start), int(seg_end))
+                    segment_start, segment_end = best_segment
                     logger.warning(
-                        "[Rank %s] Non-contiguous SGLang hidden positions; keeping first run rows=%s/%s "
-                        "start=%s break_at=%s",
+                        "[Rank %s] Non-contiguous SGLang hidden positions; keeping best run rows=%s/%s "
+                        "offset=%s start=%s break_at=%s raw_covered=%s",
                         self.rank,
-                        first_break,
+                        segment_end - segment_start,
                         int(hidden_positions_item.numel()),
-                        int(hidden_positions_item[0].item()),
-                        int(hidden_positions_item[first_break].item()),
+                        segment_start,
+                        int(hidden_positions_item[segment_start].item()),
+                        int(hidden_positions_item[segment_end].item()) if segment_end < int(hidden_positions_item.numel()) else None,
+                        best_score[0] if raw_position_set is not None else None,
                     )
-                    hidden_positions_item = hidden_positions_item[:first_break]
-                hidden_position_start = max(int(hidden_positions_item[0].item()), 0)
+                    hidden_row_offset = segment_start
+                    selected_hidden_row_end = segment_end
+                hidden_position_start = max(int(hidden_positions_item[hidden_row_offset].item()), 0)
                 # Phase 3: SGLang hidden_positions is the source of truth.
                 # Hidden row p supervises token p+1 and target row p+1, and
                 # the loss row is p+2, so keep only rows with that token window.
                 max_hidden_rows = min(
-                    int(hidden_positions_item.numel()),
-                    hidden_seq_length,
+                    max(selected_hidden_row_end - hidden_row_offset, 0),
+                    max(hidden_seq_length - hidden_row_offset, 0),
                     max(input_seq_length - hidden_position_start - 1, 0),
                 )
-                hidden_start = 0
+                hidden_start = hidden_row_offset
                 hidden_feature_length = max_hidden_rows
-                hidden_end = hidden_feature_length
+                hidden_end = hidden_start + hidden_feature_length
                 feature_start = hidden_position_start
                 feature_end = min(input_seq_length, feature_start + hidden_feature_length + 1)
             else:
